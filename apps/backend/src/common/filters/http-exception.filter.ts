@@ -23,7 +23,7 @@ export class AllExceptionsFilter implements ExceptionFilter {
         : HttpStatus.INTERNAL_SERVER_ERROR;
 
     let message = 'Internal server error';
-    let errorCode = 'INTERNAL_SERVER_ERROR';
+    let errorCode = this.getDefaultErrorCode(status);
     let errors: unknown[] = [];
 
     if (exception instanceof HttpException) {
@@ -33,10 +33,15 @@ export class AllExceptionsFilter implements ExceptionFilter {
       } else if (typeof res === 'object' && res !== null) {
         const resObj = res as Record<string, unknown>;
         message = (resObj['message'] as string) || message;
-        errorCode = (resObj['error'] as string) || errorCode;
+        if (resObj['errorCode']) {
+          errorCode = resObj['errorCode'] as string;
+        } else if (resObj['error']) {
+          errorCode = (resObj['error'] as string).toUpperCase().replace(/\s+/g, '_');
+        }
         if (Array.isArray(resObj['message'])) {
           errors = resObj['message'];
           message = 'Validation failed';
+          errorCode = 'VALIDATION_ERROR';
         }
       }
     } else if (exception instanceof Error) {
@@ -49,7 +54,9 @@ export class AllExceptionsFilter implements ExceptionFilter {
         exception instanceof Error ? exception.stack : String(exception),
       );
     } else {
-      this.logger.warn(`[${request.method}] ${request.url} - Status: ${status} - Message: ${message}`);
+      this.logger.warn(
+        `[${request.method}] ${request.url} - Status: ${status} - Message: ${message}`,
+      );
     }
 
     response.status(status).json({
@@ -61,5 +68,24 @@ export class AllExceptionsFilter implements ExceptionFilter {
       timestamp: new Date().toISOString(),
       path: request.url,
     });
+  }
+
+  private getDefaultErrorCode(status: number): string {
+    switch (status) {
+      case HttpStatus.UNAUTHORIZED:
+        return 'UNAUTHORIZED';
+      case HttpStatus.FORBIDDEN:
+        return 'FORBIDDEN';
+      case HttpStatus.NOT_FOUND:
+        return 'NOT_FOUND';
+      case HttpStatus.CONFLICT:
+        return 'CONFLICT';
+      case HttpStatus.BAD_REQUEST:
+        return 'BAD_REQUEST';
+      case HttpStatus.TOO_MANY_REQUESTS:
+        return 'TOO_MANY_REQUESTS';
+      default:
+        return 'INTERNAL_SERVER_ERROR';
+    }
   }
 }

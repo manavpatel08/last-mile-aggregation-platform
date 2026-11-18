@@ -1,0 +1,25 @@
+# Compiled output
+dist/
+build/
+*.tsbuildinfo
+
+# Dependency directories
+node_modules/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Coverage directory used by testing tools
+coverage/
+
+# OS metadata
+.DS_Store
+Thumbs.db

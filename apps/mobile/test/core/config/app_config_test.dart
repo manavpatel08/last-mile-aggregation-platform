@@ -28,6 +28,9 @@ void main() {
       expect(config.appEnv, 'development');
       expect(config.isDevelopment, isTrue);
       expect(config.initialMode, AppMode.unselected);
+      expect(config.googleClientIdIos, isNull);
+      expect(config.googleServerClientId, isNull);
+      expect(config.adminPortalUrl, isNull);
     });
 
     test('uses 10.0.2.2 defaults on Android when env defines are absent', () {

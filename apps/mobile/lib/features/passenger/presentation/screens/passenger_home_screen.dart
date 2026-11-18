@@ -8,9 +8,10 @@ import '../../../../core/config/app_config.dart';
 import '../../../../core/theme/app_colors.dart';
 import '../../../../core/widgets/mode_badge.dart';
 import '../../../../core/widgets/placeholder_section_card.dart';
+import '../../../auth/state/auth_provider.dart';
 import '../../state/passenger_home_provider.dart';
 
-/// Basic Passenger Home placeholder screen established by TASK-002.
+/// Basic Passenger Home placeholder screen established by TASK-002 and updated for TASK-003.
 class PassengerHomeScreen extends StatelessWidget {
   const PassengerHomeScreen({super.key});
 
@@ -31,19 +32,30 @@ class PassengerHomeScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     final textTheme = Theme.of(context).textTheme;
     final passengerProvider = context.watch<PassengerHomeProvider>();
+    final authProvider = context.watch<AuthProvider>();
+    final user = authProvider.user;
 
     return Scaffold(
       appBar: AppBar(
         title: const Text('Passenger Home'),
         actions: [
-          TextButton.icon(
-            key: const Key('switch_mode_button'),
-            onPressed: () {
-              context.read<AppModeProvider>().clearMode();
-              context.go(AppRoutes.roleSelection);
-            },
-            icon: const Icon(Icons.swap_horiz, size: 18),
-            label: const Text('Switch'),
+          if (user?.isDualRole == true) ...[
+            TextButton.icon(
+              key: const Key('switch_mode_button'),
+              onPressed: () {
+                context.read<AppModeProvider>().clearMode();
+                context.go(AppRoutes.roleSelection);
+              },
+              icon: const Icon(Icons.swap_horiz, size: 18),
+              label: const Text('Switch'),
+            ),
+            const SizedBox(width: 4),
+          ],
+          IconButton(
+            key: const Key('logout_button'),
+            icon: const Icon(Icons.logout),
+            tooltip: 'Sign out',
+            onPressed: () => context.read<AuthProvider>().logout(),
           ),
           const SizedBox(width: 8),
         ],
@@ -59,7 +71,22 @@ class PassengerHomeScreen extends StatelessWidget {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const ModeBadge(mode: AppMode.passenger),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const ModeBadge(mode: AppMode.passenger),
+                        if (user != null)
+                          Text(
+                            user.fullName.isNotEmpty
+                                ? user.fullName
+                                : user.email,
+                            style: textTheme.bodySmall?.copyWith(
+                              color: AppColors.onPrimaryContainer,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                      ],
+                    ),
                     const SizedBox(height: 12),
                     Text(
                       'Passenger Workspace',

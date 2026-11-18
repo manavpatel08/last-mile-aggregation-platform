@@ -12,14 +12,18 @@ Cross-platform Flutter mobile application (**iOS** and **Android**) built with *
 A single Flutter codebase hosts both **Passenger** and **Driver** interfaces (ADR-002):
 
 - **Shared Infrastructure (`lib/core/`, `lib/app/`):**
-  - Runtime environment configuration (`AppConfig`) supporting simulator and LAN overrides.
+  - Runtime environment configuration (`AppConfig`) supporting simulator, LAN, and Google OAuth Client ID placeholders.
   - Material 3 design tokens and theme (`AppTheme`, `AppColors`).
-  - Reusable Dio HTTP client (`ApiClient`) with extensible auth/idempotency interceptors and standardized `ApiException` error envelope mapping.
-  - Declarative `go_router` navigation (`AppRouter`, `AppRoutes`) and application-level UI mode state (`AppModeProvider`).
+  - In-memory JWT access token store (`AuthTokenStore`) keeping access tokens strictly in RAM.
+  - Persistent secure refresh token storage (`SecureTokenStorage`) backed by `flutter_secure_storage` (iOS Keychain / Android KeyStore).
+  - Reusable Dio HTTP client (`ApiClient`) with single-flight mutex/completer token refresh (`AuthRefreshInterceptor`) preventing concurrent token family revocation.
+  - Standardized `ApiException` error envelope mapping.
+  - Declarative `go_router` navigation (`AppRouter`, `AppRoutes`) with authentication and RBAC route guards.
 - **Feature-First Modules (`lib/features/`):**
-  - `role_selection/`: Entry point for switching between Passenger and Driver UI modes.
+  - `auth/`: Authentication state management (`AuthProvider`), Google Sign-In abstraction (`GoogleSignInService`), API repository (`AuthRepository`), and presentation screens (`SplashScreen`, `LoginScreen`, `AdminInfoScreen`).
+  - `role_selection/`: Entry point for dual-role users switching between Passenger and Driver UI modes.
   - `passenger/`: Passenger-scoped state and presentation screens.
-  - `driver/`: Driver-scoped state and presentation screens.
+  - `driver/`: Driver-scoped state and presentation screens, reflecting administrative verification status (`PENDING`, `APPROVED`, etc.).
 
 > [!NOTE]
 > Per `AGENTS.md` §1.3, selecting Passenger or Driver mode in the Flutter client is **strictly a UI presentation state**, never a security boundary. Role authorization and driver approval (`verification_status = 'APPROVED'`) are enforced exclusively by the backend.
@@ -36,7 +40,7 @@ apps/mobile/
 │   ├── app/
 │   │   ├── app.dart                  # Root LastMileApp (MultiProvider + MaterialApp.router)
 │   │   ├── router/
-│   │   │   ├── app_router.dart       # go_router route table and fallback error screen
+│   │   │   ├── app_router.dart       # go_router route table, RBAC redirects, and error screen
 │   │   │   └── app_routes.dart       # Route paths, names, and initial-route resolver
 │   │   └── state/
 │   │       └── app_mode_provider.dart # UI interface mode ChangeNotifier
@@ -46,7 +50,11 @@ apps/mobile/
 │   │   ├── network/
 │   │   │   ├── api_client.dart       # Reusable Dio HTTP client wrapper
 │   │   │   ├── api_exception.dart    # Standardized API error envelope exception
+│   │   │   ├── auth_refresh_interceptor.dart # Single-flight 401 refresh interceptor
+│   │   │   ├── auth_token_store.dart # In-memory RAM JWT access token storage
 │   │   │   └── dio_interceptors.dart # Auth header, Idempotency-Key, and safe debug logger
+│   │   ├── storage/
+│   │   │   └── secure_token_storage.dart # Persistent refresh token in Keychain / KeyStore
 │   │   ├── theme/
 │   │   │   ├── app_colors.dart       # Color palette tokens
 │   │   │   └── app_theme.dart        # Material 3 ThemeData
@@ -54,6 +62,11 @@ apps/mobile/
 │   │       ├── mode_badge.dart       # Active UI mode indicator pill
 │   │       └── placeholder_section_card.dart # Placeholder card for planned modules
 │   ├── features/
+│   │   ├── auth/                     # Authentication module (TASK-003)
+│   │   │   ├── data/                 # ApiAuthRepository & GoogleSignInService
+│   │   │   ├── models/               # AuthUser, AuthSession, DriverProfile
+│   │   │   ├── presentation/screens/ # SplashScreen, LoginScreen, AdminInfoScreen
+│   │   │   └── state/                # AuthProvider (session restoration & Google OAuth)
 │   │   ├── role_selection/
 │   │   │   └── presentation/screens/role_selection_screen.dart
 │   │   ├── passenger/
@@ -63,7 +76,7 @@ apps/mobile/
 │   │       ├── state/driver_home_provider.dart
 │   │       └── presentation/screens/driver_home_screen.dart
 │   └── main.dart                     # Application entrypoint
-├── test/                             # Unit and widget tests
+├── test/                             # Unit, widget, and interceptor test suite
 ├── .env.example                      # Template environment configuration
 ├── analysis_options.yaml             # Static analysis lint configuration
 ├── pubspec.yaml                      # Dependencies and project metadata
@@ -104,7 +117,9 @@ Never commit `.env` to Git (it is ignored by `apps/mobile/.gitignore`).
 | `API_BASE_URL` | `http://localhost:3000/api/v1` | `http://10.0.2.2:3000/api/v1` | `http://192.168.1.50:3000/api/v1` |
 | `SOCKET_BASE_URL` | `ws://localhost:3000/realtime` | `ws://10.0.2.2:3000/realtime` | `ws://192.168.1.50:3000/realtime` |
 | `APP_ENV` | `development` | `development` | `development` |
-| `APP_MODE` | *(empty — opens Role Selection)* | *(empty)* | `PASSENGER` or `DRIVER` |
+| `APP_MODE` | *(empty — opens Role Selection for dual-role)* | *(empty)* | `PASSENGER` or `DRIVER` |
+| `GOOGLE_CLIENT_ID_IOS` | *(empty placeholder)* | *(empty placeholder)* | `xxxx.apps.googleusercontent.com` |
+| `GOOGLE_SERVER_CLIENT_ID` | *(empty placeholder)* | *(empty placeholder)* | `xxxx.apps.googleusercontent.com` |
 
 ### 3. Run the Application
 

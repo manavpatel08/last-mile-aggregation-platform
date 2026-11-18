@@ -6,6 +6,7 @@ import '../../../../app/router/app_routes.dart';
 import '../../../../app/state/app_mode_provider.dart';
 import '../../../../core/config/app_config.dart';
 import '../../../../core/theme/app_colors.dart';
+import '../../../auth/state/auth_provider.dart';
 
 /// Entry point allowing the user to select the Passenger or Driver UI mode.
 ///
@@ -18,8 +19,22 @@ class RoleSelectionScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     final textTheme = Theme.of(context).textTheme;
     final config = context.read<AppConfig>();
+    final authProvider = context.watch<AuthProvider>();
+    final user = authProvider.user;
 
     return Scaffold(
+      appBar: AppBar(
+        title: const Text('Select Mode'),
+        actions: [
+          IconButton(
+            key: const Key('logout_button'),
+            icon: const Icon(Icons.logout),
+            tooltip: 'Sign out',
+            onPressed: () => context.read<AuthProvider>().logout(),
+          ),
+          const SizedBox(width: 8),
+        ],
+      ),
       body: SafeArea(
         child: SingleChildScrollView(
           padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 28),
@@ -51,7 +66,9 @@ class RoleSelectionScreen extends StatelessWidget {
                           children: [
                             Text('LastMile', style: textTheme.headlineMedium),
                             Text(
-                              'Shared Micro-Mobility Platform',
+                              user != null
+                                  ? 'Signed in as ${user.email}'
+                                  : 'Shared Micro-Mobility Platform',
                               style: textTheme.bodyMedium,
                             ),
                           ],

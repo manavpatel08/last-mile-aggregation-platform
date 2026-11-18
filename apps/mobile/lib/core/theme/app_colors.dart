@@ -22,4 +22,6 @@ abstract final class AppColors {
   static const Color textPrimary = Color(0xFF0F172A);
   static const Color textSecondary = Color(0xFF475569);
   static const Color error = Color(0xFFDC2626);
+  static const Color warning = Color(0xFFD97706);
+  static const Color success = Color(0xFF16A34A);
 }

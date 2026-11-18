@@ -30,6 +30,9 @@ class AppConfig {
     required this.socketBaseUrl,
     required this.appEnv,
     this.initialMode = AppMode.unselected,
+    this.googleClientIdIos,
+    this.googleServerClientId,
+    this.adminPortalUrl,
     this.connectTimeout = const Duration(seconds: 15),
     this.receiveTimeout = const Duration(seconds: 15),
     this.sendTimeout = const Duration(seconds: 15),
@@ -46,6 +49,9 @@ class AppConfig {
       defaultValue: 'development',
     );
     const rawAppMode = String.fromEnvironment('APP_MODE');
+    const rawGoogleClientIdIos = String.fromEnvironment('GOOGLE_CLIENT_ID_IOS');
+    const rawGoogleServerClientId = String.fromEnvironment('GOOGLE_SERVER_CLIENT_ID');
+    const rawAdminPortalUrl = String.fromEnvironment('ADMIN_PORTAL_URL');
 
     final platform = platformOverride ?? defaultTargetPlatform;
     final defaultHost = platform == TargetPlatform.android
@@ -65,6 +71,15 @@ class AppConfig {
       socketBaseUrl: resolvedSocketUrl,
       appEnv: rawAppEnv.trim().isNotEmpty ? rawAppEnv.trim() : 'development',
       initialMode: AppMode.fromString(rawAppMode),
+      googleClientIdIos: rawGoogleClientIdIos.trim().isNotEmpty
+          ? rawGoogleClientIdIos.trim()
+          : null,
+      googleServerClientId: rawGoogleServerClientId.trim().isNotEmpty
+          ? rawGoogleServerClientId.trim()
+          : null,
+      adminPortalUrl: rawAdminPortalUrl.trim().isNotEmpty
+          ? rawAdminPortalUrl.trim()
+          : null,
     );
   }
 
@@ -72,6 +87,9 @@ class AppConfig {
   final String socketBaseUrl;
   final String appEnv;
   final AppMode initialMode;
+  final String? googleClientIdIos;
+  final String? googleServerClientId;
+  final String? adminPortalUrl;
   final Duration connectTimeout;
   final Duration receiveTimeout;
   final Duration sendTimeout;

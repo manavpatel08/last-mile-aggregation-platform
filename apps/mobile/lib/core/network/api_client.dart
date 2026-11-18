@@ -13,6 +13,7 @@ class ApiClient {
   ApiClient({
     required AppConfig config,
     AuthTokenProvider? tokenProvider,
+    Interceptor? refreshInterceptor,
     HttpClientAdapter? httpClientAdapter,
     bool enableDebugLogging = kDebugMode,
   }) : _dio = Dio(
@@ -33,6 +34,10 @@ class ApiClient {
 
     _dio.interceptors.add(ApiHeadersInterceptor(tokenProvider: tokenProvider));
 
+    if (refreshInterceptor != null) {
+      _dio.interceptors.add(refreshInterceptor);
+    }
+
     if (enableDebugLogging) {
       _dio.interceptors.add(SafeNetworkLogInterceptor());
     }
@@ -42,6 +47,11 @@ class ApiClient {
 
   /// Exposes the configured [Dio] instance for advanced usage or testing.
   Dio get dio => _dio;
+
+  /// Adds a custom interceptor to the underlying [Dio] instance.
+  void addInterceptor(Interceptor interceptor) {
+    _dio.interceptors.add(interceptor);
+  }
 
   Future<Response<T>> get<T>(
     String path, {

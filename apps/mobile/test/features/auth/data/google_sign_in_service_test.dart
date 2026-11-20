@@ -191,6 +191,94 @@ void main() {
     );
 
     test(
+      'NativeGoogleSignInService signOut before any sign-in initializes exactly once before signing out',
+      () async {
+        final adapter = FakeGoogleSignInAdapter();
+        final service = NativeGoogleSignInService(
+          config: testConfig,
+          adapter: adapter,
+        );
+
+        await service.signOut();
+
+        expect(adapter.initializeCount, 1);
+        expect(adapter.signOutCount, 1);
+        expect(adapter.authenticateCount, 0);
+
+        // A second signOut call does not reinitialize
+        await service.signOut();
+        expect(adapter.initializeCount, 1);
+        expect(adapter.signOutCount, 2);
+      },
+    );
+
+    test(
+      'NativeGoogleSignInService disconnect before any sign-in initializes exactly once before disconnecting',
+      () async {
+        final adapter = FakeGoogleSignInAdapter();
+        final service = NativeGoogleSignInService(
+          config: testConfig,
+          adapter: adapter,
+        );
+
+        await service.disconnect();
+
+        expect(adapter.initializeCount, 1);
+        expect(adapter.disconnectCount, 1);
+        expect(adapter.authenticateCount, 0);
+
+        // A second disconnect call does not reinitialize
+        await service.disconnect();
+        expect(adapter.initializeCount, 1);
+        expect(adapter.disconnectCount, 2);
+      },
+    );
+
+    test(
+      'NativeGoogleSignInService signOut and disconnect after successful signIn do not initialize again',
+      () async {
+        final adapter = FakeGoogleSignInAdapter(idToken: 'valid-id-token');
+        final service = NativeGoogleSignInService(
+          config: testConfig,
+          adapter: adapter,
+        );
+
+        await service.signIn();
+        expect(adapter.initializeCount, 1);
+        expect(adapter.authenticateCount, 1);
+
+        await service.signOut();
+        expect(adapter.initializeCount, 1);
+        expect(adapter.signOutCount, 1);
+
+        await service.disconnect();
+        expect(adapter.initializeCount, 1);
+        expect(adapter.disconnectCount, 1);
+      },
+    );
+
+    test(
+      'NativeGoogleSignInService signOut and disconnect do not invoke adapter methods if initialization fails',
+      () async {
+        final adapter = FakeGoogleSignInAdapter(shouldFailInit: true);
+        final service = NativeGoogleSignInService(
+          config: testConfig,
+          adapter: adapter,
+        );
+
+        // Attempting signOut does not throw (non-fatal) and does not call adapter.signOut
+        await service.signOut();
+        expect(adapter.initializeCount, 1);
+        expect(adapter.signOutCount, 0);
+
+        // Attempting disconnect does not call initialize again and does not call adapter.disconnect
+        await service.disconnect();
+        expect(adapter.initializeCount, 1);
+        expect(adapter.disconnectCount, 0);
+      },
+    );
+
+    test(
       'Throws explicit GOOGLE_CONFIG_MISSING when client id is placeholder or empty',
       () async {
         const placeholderConfig = AppConfig(

@@ -192,6 +192,7 @@ class NativeGoogleSignInService implements GoogleSignInService {
   @override
   Future<void> signOut() async {
     try {
+      await _ensureInitialized();
       await _adapter.signOut();
     } catch (e) {
       if (kDebugMode) {
@@ -203,6 +204,7 @@ class NativeGoogleSignInService implements GoogleSignInService {
   @override
   Future<void> disconnect() async {
     try {
+      await _ensureInitialized();
       await _adapter.disconnect();
     } catch (e) {
       if (kDebugMode) {

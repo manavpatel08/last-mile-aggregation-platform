@@ -1,5 +1,8 @@
-import { describe, it, expect, beforeEach } from 'vitest';
-import { UnprocessableEntityException } from '@nestjs/common';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import {
+  UnprocessableEntityException,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { FaresService } from './fares.service.js';
 import { PrismaService } from '../../infrastructure/prisma/prisma.service.js';
@@ -151,6 +154,190 @@ describe('FaresService (Tariff Arithmetic & Allocation Formula)', () => {
       expect(() =>
         faresService.allocateSharedFares(members, 4000, 2000, 1000),
       ).toThrow(UnprocessableEntityException);
+    });
+  });
+
+  describe('generateQuote (Fallback Safety)', () => {
+    it('should throw ServiceUnavailableException (503 ROUTING_UNAVAILABLE) in production when route is fallback', async () => {
+      const prodConfig = {
+        get: (key: string) => (key === 'demoMode' ? false : undefined),
+      } as unknown as ConfigService;
+
+      const mockLocations = {
+        validateDestination: vi
+          .fn()
+          .mockResolvedValue({ isInsideServiceRegion: true }),
+      } as unknown as LocationsService;
+
+      const mockRouting = new RoutingService(prodConfig);
+      vi.spyOn(mockRouting, 'getRoute').mockResolvedValue({
+        distanceMeters: 4000,
+        durationSec: 500,
+        source: 'FALLBACK',
+        isFallback: true,
+      });
+
+      const mockPrisma = {
+        $queryRaw: vi.fn().mockResolvedValue([
+          {
+            id: 'point-1',
+            name: 'PDEU Gate',
+            latitude: 23.155,
+            longitude: 72.6668,
+          },
+        ]),
+        fareConfig: {
+          findFirst: vi.fn().mockResolvedValue({
+            baseFarePaise: 2000,
+            perKmRatePaise: 1000,
+            minFarePaise: 2000,
+            version: 1,
+          }),
+        },
+      } as unknown as PrismaService;
+
+      const service = new FaresService(
+        mockPrisma,
+        mockLocations,
+        mockRouting,
+        prodConfig,
+      );
+
+      const originalEnv = process.env.NODE_ENV;
+      process.env.NODE_ENV = 'production';
+
+      try {
+        await expect(
+          service.generateQuote('user-1', {
+            pickupPointId: '00000000-0000-0000-0000-000000000001',
+            destination: { latitude: 23.16, longitude: 72.67 },
+          }),
+        ).rejects.toThrow(ServiceUnavailableException);
+      } finally {
+        process.env.NODE_ENV = originalEnv;
+      }
+    });
+
+    it('should allow quote generation when demoMode is enabled, even if route is fallback', async () => {
+      const demoConfig = {
+        get: (key: string) => (key === 'demoMode' ? true : undefined),
+      } as unknown as ConfigService;
+
+      const mockLocations = {
+        validateDestination: vi
+          .fn()
+          .mockResolvedValue({ isInsideServiceRegion: true }),
+      } as unknown as LocationsService;
+
+      const mockRouting = new RoutingService(demoConfig);
+      vi.spyOn(mockRouting, 'getRoute').mockResolvedValue({
+        distanceMeters: 4000,
+        durationSec: 500,
+        source: 'FALLBACK',
+        isFallback: true,
+      });
+
+      const mockPrisma = {
+        $queryRaw: vi
+          .fn()
+          .mockResolvedValueOnce([
+            {
+              id: 'point-1',
+              name: 'PDEU Gate',
+              latitude: 23.155,
+              longitude: 72.6668,
+            },
+          ])
+          .mockResolvedValueOnce([
+            {
+              id: 'quote-123',
+              expires_at: new Date(Date.now() + 120000),
+            },
+          ]),
+        fareConfig: {
+          findFirst: vi.fn().mockResolvedValue({
+            baseFarePaise: 2000,
+            perKmRatePaise: 1000,
+            minFarePaise: 2000,
+            version: 1,
+          }),
+        },
+      } as unknown as PrismaService;
+
+      const service = new FaresService(
+        mockPrisma,
+        mockLocations,
+        mockRouting,
+        demoConfig,
+      );
+
+      const quote = await service.generateQuote('user-1', {
+        pickupPointId: '00000000-0000-0000-0000-000000000001',
+        destination: { latitude: 23.16, longitude: 72.67 },
+      });
+
+      expect(quote).toBeDefined();
+      expect(quote.quoteId).toBe('quote-123');
+    });
+
+    it('should reject fallback in non-test, non-demo mode (e.g. development without demo flag)', async () => {
+      const devConfig = {
+        get: (key: string) => (key === 'demoMode' ? false : undefined),
+      } as unknown as ConfigService;
+
+      const mockLocations = {
+        validateDestination: vi
+          .fn()
+          .mockResolvedValue({ isInsideServiceRegion: true }),
+      } as unknown as LocationsService;
+
+      const mockRouting = new RoutingService(devConfig);
+      vi.spyOn(mockRouting, 'getRoute').mockResolvedValue({
+        distanceMeters: 4000,
+        durationSec: 500,
+        source: 'FALLBACK',
+        isFallback: true,
+      });
+
+      const mockPrisma = {
+        $queryRaw: vi.fn().mockResolvedValue([
+          {
+            id: 'point-1',
+            name: 'PDEU Gate',
+            latitude: 23.155,
+            longitude: 72.6668,
+          },
+        ]),
+        fareConfig: {
+          findFirst: vi.fn().mockResolvedValue({
+            baseFarePaise: 2000,
+            perKmRatePaise: 1000,
+            minFarePaise: 2000,
+            version: 1,
+          }),
+        },
+      } as unknown as PrismaService;
+
+      const service = new FaresService(
+        mockPrisma,
+        mockLocations,
+        mockRouting,
+        devConfig,
+      );
+
+      const originalEnv = process.env.NODE_ENV;
+      process.env.NODE_ENV = 'development';
+
+      try {
+        await expect(
+          service.generateQuote('user-1', {
+            pickupPointId: '00000000-0000-0000-0000-000000000001',
+            destination: { latitude: 23.16, longitude: 72.67 },
+          }),
+        ).rejects.toThrow(ServiceUnavailableException);
+      } finally {
+        process.env.NODE_ENV = originalEnv;
+      }
     });
   });
 });

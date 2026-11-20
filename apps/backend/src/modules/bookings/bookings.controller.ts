@@ -14,6 +14,8 @@ import { CancelBookingDto } from './dto/cancel-booking.dto.js';
 import { Roles } from '../../common/decorators/roles.decorator.js';
 import { CurrentUser } from '../../common/decorators/current-user.decorator.js';
 import { Idempotent } from '../../common/decorators/idempotent.decorator.js';
+import { CurrentIdempotencyClaim } from '../../common/decorators/idempotency-claim.decorator.js';
+import type { IdempotencyClaimContext } from '../../common/interceptors/idempotency.interceptor.js';
 
 @Controller()
 export class BookingsController {
@@ -26,8 +28,13 @@ export class BookingsController {
   async createBooking(
     @CurrentUser() user: { id: string },
     @Body() dto: CreateBookingDto,
+    @CurrentIdempotencyClaim() claim?: IdempotencyClaimContext,
   ) {
-    const booking = await this.bookingsService.createBooking(user.id, dto);
+    const booking = await this.bookingsService.createBooking(
+      user.id,
+      dto,
+      claim,
+    );
     return {
       success: true,
       data: booking,
@@ -63,11 +70,13 @@ export class BookingsController {
     @CurrentUser() user: { id: string; role: string },
     @Param('id', new ParseUUIDPipe()) bookingId: string,
     @Body() dto: CancelBookingDto,
+    @CurrentIdempotencyClaim() claim?: IdempotencyClaimContext,
   ) {
     const result = await this.bookingsService.cancelBooking(
       user,
       bookingId,
       dto,
+      claim,
     );
     return {
       success: true,

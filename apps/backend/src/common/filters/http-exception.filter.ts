@@ -25,6 +25,7 @@ export class AllExceptionsFilter implements ExceptionFilter {
     let message = 'Internal server error';
     let errorCode = this.getDefaultErrorCode(status);
     let errors: unknown[] = [];
+    let customTimestamp: string | null = null;
 
     if (exception instanceof HttpException) {
       const res = exception.getResponse();
@@ -42,6 +43,9 @@ export class AllExceptionsFilter implements ExceptionFilter {
           errors = resObj['message'];
           message = 'Validation failed';
           errorCode = 'VALIDATION_ERROR';
+        }
+        if (typeof resObj['timestamp'] === 'string') {
+          customTimestamp = resObj['timestamp'];
         }
       }
     } else if (exception instanceof Error) {
@@ -65,7 +69,7 @@ export class AllExceptionsFilter implements ExceptionFilter {
       errorCode,
       message,
       errors,
-      timestamp: new Date().toISOString(),
+      timestamp: customTimestamp || new Date().toISOString(),
       path: request.url,
     });
   }

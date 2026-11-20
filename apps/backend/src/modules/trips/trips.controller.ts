@@ -14,6 +14,8 @@ import { Roles } from '../../common/decorators/roles.decorator.js';
 import { CurrentUser } from '../../common/decorators/current-user.decorator.js';
 import { RequireDriverApproval } from '../../common/decorators/driver-approval.decorator.js';
 import { Idempotent } from '../../common/decorators/idempotent.decorator.js';
+import { CurrentIdempotencyClaim } from '../../common/decorators/idempotency-claim.decorator.js';
+import type { IdempotencyClaimContext } from '../../common/interceptors/idempotency.interceptor.js';
 
 @Controller('trips')
 export class TripsController {
@@ -27,8 +29,13 @@ export class TripsController {
   async reportArrival(
     @CurrentUser() user: { id: string },
     @Param('id', new ParseUUIDPipe()) tripId: string,
+    @CurrentIdempotencyClaim() claim?: IdempotencyClaimContext,
   ) {
-    const result = await this.tripsService.reportArrival(user.id, tripId);
+    const result = await this.tripsService.reportArrival(
+      user.id,
+      tripId,
+      claim,
+    );
     return {
       success: true,
       message: 'Driver arrival confirmed',
@@ -45,11 +52,13 @@ export class TripsController {
     @CurrentUser() user: { id: string },
     @Param('id', new ParseUUIDPipe()) tripId: string,
     @Body() dto: VerifyBoardingDto,
+    @CurrentIdempotencyClaim() claim?: IdempotencyClaimContext,
   ) {
     const result = await this.tripsService.verifyBoarding(
       user.id,
       tripId,
       dto,
+      claim,
     );
     return {
       success: true,
@@ -66,8 +75,9 @@ export class TripsController {
   async startTrip(
     @CurrentUser() user: { id: string },
     @Param('id', new ParseUUIDPipe()) tripId: string,
+    @CurrentIdempotencyClaim() claim?: IdempotencyClaimContext,
   ) {
-    const result = await this.tripsService.startTrip(user.id, tripId);
+    const result = await this.tripsService.startTrip(user.id, tripId, claim);
     return {
       success: true,
       message: 'Trip started successfully',
@@ -84,11 +94,13 @@ export class TripsController {
     @CurrentUser() user: { id: string },
     @Param('id', new ParseUUIDPipe()) tripId: string,
     @Param('passengerId', new ParseUUIDPipe()) passengerId: string,
+    @CurrentIdempotencyClaim() claim?: IdempotencyClaimContext,
   ) {
     const result = await this.tripsService.completePassenger(
       user.id,
       tripId,
       passengerId,
+      claim,
     );
     return {
       success: true,
@@ -105,11 +117,13 @@ export class TripsController {
     @CurrentUser() user: { id: string },
     @Param('id', new ParseUUIDPipe()) tripId: string,
     @Param('passengerId', new ParseUUIDPipe()) passengerId: string,
+    @CurrentIdempotencyClaim() claim?: IdempotencyClaimContext,
   ) {
     const result = await this.tripsService.declareNoShow(
       user.id,
       tripId,
       passengerId,
+      claim,
     );
     return {
       success: true,
@@ -126,8 +140,13 @@ export class TripsController {
   async completeTrip(
     @CurrentUser() user: { id: string },
     @Param('id', new ParseUUIDPipe()) tripId: string,
+    @CurrentIdempotencyClaim() claim?: IdempotencyClaimContext,
   ) {
-    const result = await this.tripsService.completeTrip(user.id, tripId);
+    const result = await this.tripsService.completeTrip(
+      user.id,
+      tripId,
+      claim,
+    );
     return {
       success: true,
       message: 'Trip completed successfully',

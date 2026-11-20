@@ -4,12 +4,19 @@ import {
   BadRequestException,
   ConflictException,
   ForbiddenException,
+  HttpStatus,
   Logger,
 } from '@nestjs/common';
 import { PrismaService } from '../../infrastructure/prisma/prisma.service.js';
 import { LocationsService } from '../locations/locations.service.js';
 import { CreateBookingDto } from './dto/create-booking.dto.js';
 import { CancelBookingDto } from './dto/cancel-booking.dto.js';
+import { CANONICAL_ACTIVE_BOOKING_STATUSES } from './bookings.constants.js';
+import {
+  IdempotencyClaimContext,
+  verifyIdempotencyClaim,
+  fenceAndCompleteIdempotentTransaction,
+} from '../../common/interceptors/idempotency.interceptor.js';
 
 export interface BookingResponse {
   bookingId: string;
@@ -51,6 +58,7 @@ export class BookingsService {
   async createBooking(
     passengerId: string,
     dto: CreateBookingDto,
+    claim?: IdempotencyClaimContext,
   ): Promise<{
     bookingId: string;
     status: string;
@@ -72,17 +80,7 @@ export class BookingsService {
       where: {
         passengerId,
         status: {
-          in: [
-            'REQUESTED',
-            'MATCHING',
-            'MATCHED',
-            'DISPATCHING',
-            'CONFIRMED',
-            'DRIVER_ASSIGNED',
-            'DRIVER_ARRIVED',
-            'BOARDED',
-            'IN_PROGRESS',
-          ],
+          in: [...CANONICAL_ACTIVE_BOOKING_STATUSES],
         },
       },
     });
@@ -139,6 +137,9 @@ export class BookingsService {
 
     try {
       const result = await this.prisma.$transaction(async (tx) => {
+        // Verify claim ownership and lock idempotency record
+        await verifyIdempotencyClaim(tx, claim);
+
         // Raw SQL insert for PostGIS Point geometry columns
         const [insertedBooking] = await tx.$queryRaw<
           Array<{
@@ -203,20 +204,45 @@ export class BookingsService {
           },
         });
 
-        return insertedBooking;
+        const bookingResponse = {
+          bookingId: insertedBooking.id,
+          status: insertedBooking.status,
+          maxWaitDeadline: insertedBooking.max_wait_deadline.toISOString(),
+          agreedFareCeiling: (
+            insertedBooking.agreed_fare_ceiling_paise / 100
+          ).toFixed(2),
+          agreedFareCeilingPaise: insertedBooking.agreed_fare_ceiling_paise,
+        };
+
+        const responsePayload = {
+          success: true,
+          data: bookingResponse,
+        };
+
+        // Fencing check and atomic completion within this same transaction
+        await fenceAndCompleteIdempotentTransaction(
+          tx,
+          claim,
+          responsePayload,
+          HttpStatus.CREATED,
+        );
+
+        return bookingResponse;
       });
 
-      return {
-        bookingId: result.id,
-        status: result.status,
-        maxWaitDeadline: result.max_wait_deadline.toISOString(),
-        agreedFareCeiling: (result.agreed_fare_ceiling_paise / 100).toFixed(2),
-        agreedFareCeilingPaise: result.agreed_fare_ceiling_paise,
-      };
+      return result;
     } catch (err: any) {
       // Catch Invariant 1 unique constraint violation on idx_unique_active_passenger_booking
-      if (err?.code === '23505' || err?.message?.includes('idx_unique_active_passenger_booking')) {
+      if (
+        err?.code === '23505' ||
+        err?.code === 'P2002' ||
+        err?.meta?.code === '23505' ||
+        err?.message?.includes('23505') ||
+        err?.message?.includes('idx_unique_active_passenger_booking') ||
+        (err?.code === 'P2010' && err?.message?.includes('already exists'))
+      ) {
         throw new ConflictException({
+          statusCode: HttpStatus.CONFLICT,
           errorCode: 'ACTIVE_BOOKING_EXISTS',
           message:
             'Passenger already has an active booking in progress (enforced by DB unique invariant).',
@@ -483,6 +509,7 @@ export class BookingsService {
     user: { id: string; role: string },
     bookingId: string,
     dto: CancelBookingDto,
+    claim?: IdempotencyClaimContext,
   ): Promise<{
     bookingId: string;
     status: string;
@@ -490,6 +517,9 @@ export class BookingsService {
     cancellationFeeStatus: 'NONE' | 'OUTSTANDING';
   }> {
     return this.prisma.$transaction(async (tx) => {
+      // Verify claim ownership and lock idempotency record
+      await verifyIdempotencyClaim(tx, claim);
+
       // 1. Lock booking row with SELECT FOR UPDATE to coordinate concurrency
       const bookings = await tx.$queryRaw<
         Array<{
@@ -562,9 +592,8 @@ export class BookingsService {
       ].includes(currentStatus);
 
       const feePaise = isAfterDriverAssignment ? 3000 : 0;
-      const cancellationFeeStatus = isAfterDriverAssignment
-        ? 'OUTSTANDING'
-        : 'NONE';
+      const cancellationFeeStatus: 'NONE' | 'OUTSTANDING' =
+        isAfterDriverAssignment ? 'OUTSTANDING' : 'NONE';
 
       // 5. Update booking status
       const now = new Date();
@@ -676,12 +705,26 @@ export class BookingsService {
         },
       });
 
-      return {
+      const cancellationResult = {
         bookingId: booking.id,
         status: 'CANCELLED',
         cancellationFeeAssessedPaise: feePaise,
         cancellationFeeStatus,
       };
+
+      const responsePayload = {
+        success: true,
+        data: cancellationResult,
+      };
+
+      await fenceAndCompleteIdempotentTransaction(
+        tx,
+        claim,
+        responsePayload,
+        HttpStatus.OK,
+      );
+
+      return cancellationResult;
     });
   }
 

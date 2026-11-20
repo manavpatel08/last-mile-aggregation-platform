@@ -1,5 +1,12 @@
-import { Injectable, Logger } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  Optional,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import * as crypto from 'crypto';
+import { RedisService } from '../../infrastructure/redis/redis.service.js';
 
 export interface RouteResult {
   distanceMeters: number;
@@ -16,57 +23,527 @@ export interface TableMatrixResult {
   isFallback: boolean;
 }
 
+export interface BreakerDecision {
+  allowed: boolean;
+  isProbe: boolean;
+  probeToken?: string;
+  generation: number;
+  reason?: string;
+}
+
+const REDIS_KEY_CB_STATE = 'cb:osrm:state';
+const REDIS_KEY_CB_FAILURES = 'cb:osrm:failures';
+const REDIS_KEY_CB_FIRST_FAILURE_AT = 'cb:osrm:first_failure_at';
+const REDIS_KEY_CB_OPENED_AT = 'cb:osrm:opened_at';
+const REDIS_KEY_CB_PROBE_LOCK = 'cb:osrm:probe_lock';
+const REDIS_KEY_CB_GENERATION = 'cb:osrm:generation';
+
+const CB_COOLDOWN_MS = 30000;
+const CB_FAILURE_THRESHOLD = 3;
+const CB_FAILURE_WINDOW_MS = 60000;
+const CB_PROBE_LOCK_TTL_MS = 10000;
+
 @Injectable()
 export class RoutingService {
   private readonly logger = new Logger(RoutingService.name);
   private readonly osrmUrl: string;
 
-  // Circuit Breaker state
-  private cbState: 'CLOSED' | 'OPEN' | 'HALF_OPEN' = 'CLOSED';
-  private cbFailureCount = 0;
-  private cbLastFailureTime = 0;
-  private readonly cbCooldownMs = 30000;
-  private readonly cbFailureThreshold = 3;
+  // Local fallback circuit breaker state if Redis is unconfigured or degraded
+  private localCbState: 'CLOSED' | 'OPEN' | 'HALF_OPEN' = 'CLOSED';
+  private localCbGeneration = 1;
+  private localCbFailures = 0;
+  private localCbFirstFailureAt = 0;
+  private localCbOpenedAt = 0;
+  private localCbProbeInFlight = false;
+  private localCbProbeToken: string | null = null;
 
-  constructor(private readonly configService: ConfigService) {
+  constructor(
+    private readonly configService: ConfigService,
+    @Optional() private readonly redisService?: RedisService,
+  ) {
     this.osrmUrl =
       this.configService.get<string>('routing.osrmBackendUrl') ||
       this.configService.get<string>('osrm.backendUrl') ||
       'http://127.0.0.1:5000';
   }
 
-  getCircuitBreakerState(): 'CLOSED' | 'OPEN' | 'HALF_OPEN' {
-    return this.cbState;
+  async getCircuitBreakerState(): Promise<'CLOSED' | 'OPEN' | 'HALF_OPEN'> {
+    if (this.redisService) {
+      try {
+        const client = this.redisService.getClient();
+        const state = await client.get(REDIS_KEY_CB_STATE);
+        if (state === 'OPEN' || state === 'HALF_OPEN' || state === 'CLOSED') {
+          this.localCbState = state;
+          return state;
+        }
+        this.localCbState = 'CLOSED';
+        return 'CLOSED';
+      } catch (err: any) {
+        this.logger.warn(
+          `Redis error in getCircuitBreakerState; returning local state: ${this.localCbState} (${err?.message})`,
+        );
+      }
+    }
+    return this.localCbState;
   }
 
-  setCircuitBreakerState(state: 'CLOSED' | 'OPEN' | 'HALF_OPEN'): void {
-    this.cbState = state;
+  async setCircuitBreakerState(
+    state: 'CLOSED' | 'OPEN' | 'HALF_OPEN',
+  ): Promise<void> {
+    const now = Date.now();
+    this.localCbState = state;
+    this.localCbGeneration++;
+    this.localCbProbeInFlight = false;
+    this.localCbProbeToken = null;
+
     if (state === 'OPEN') {
-      this.cbLastFailureTime = Date.now();
-      this.cbFailureCount = this.cbFailureThreshold;
+      this.localCbOpenedAt = now;
+      this.localCbFailures = CB_FAILURE_THRESHOLD;
     } else if (state === 'CLOSED') {
-      this.cbFailureCount = 0;
-      this.cbLastFailureTime = 0;
+      this.localCbFailures = 0;
+      this.localCbFirstFailureAt = 0;
+      this.localCbOpenedAt = 0;
+    }
+
+    if (this.redisService) {
+      try {
+        const client = this.redisService.getClient();
+        const luaScript = `
+          local state = ARGV[1]
+          local now = ARGV[2]
+          local threshold = ARGV[3]
+
+          redis.call('SET', KEYS[1], state)
+          local gen = redis.call('INCR', KEYS[5])
+
+          if state == 'OPEN' then
+            redis.call('SET', KEYS[2], threshold)
+            redis.call('SET', KEYS[3], now)
+            redis.call('DEL', KEYS[4], KEYS[6])
+          elseif state == 'CLOSED' then
+            redis.call('SET', KEYS[2], '0')
+            redis.call('DEL', KEYS[3], KEYS[4], KEYS[6])
+          elseif state == 'HALF_OPEN' then
+            redis.call('DEL', KEYS[4])
+          end
+
+          return tostring(gen)
+        `;
+
+        await client.eval(
+          luaScript,
+          6,
+          REDIS_KEY_CB_STATE,
+          REDIS_KEY_CB_FAILURES,
+          REDIS_KEY_CB_OPENED_AT,
+          REDIS_KEY_CB_PROBE_LOCK,
+          REDIS_KEY_CB_GENERATION,
+          REDIS_KEY_CB_FIRST_FAILURE_AT,
+          state,
+          String(now),
+          String(CB_FAILURE_THRESHOLD),
+        );
+      } catch (err: any) {
+        this.logger.warn(`Failed to set circuit breaker state in Redis: ${err?.message}`);
+      }
     }
   }
 
-  resetCircuitBreaker(): void {
-    this.cbState = 'CLOSED';
-    this.cbFailureCount = 0;
-    this.cbLastFailureTime = 0;
+  async resetCircuitBreaker(): Promise<void> {
+    await this.setCircuitBreakerState('CLOSED');
   }
 
-  private recordFailure(): void {
-    this.cbFailureCount++;
-    this.cbLastFailureTime = Date.now();
-    if (
-      this.cbFailureCount >= this.cbFailureThreshold ||
-      this.cbState === 'HALF_OPEN'
-    ) {
-      this.cbState = 'OPEN';
-      this.logger.warn(
-        `OSRM routing failures exceeded threshold (${this.cbFailureCount}). Circuit breaker moved to OPEN state.`,
-      );
+  /**
+   * Asserts that a route or matrix result was generated by the authoritative
+   * road-network routing engine (OSRM) and not an approximate geodesic fallback.
+   * In non-demo production environments, throws ServiceUnavailableException
+   * if the result is a fallback.
+   */
+  assertAuthoritativeRoute(
+    result: { isFallback: boolean; source: string },
+    context = 'Operation',
+  ): void {
+    if (result.isFallback) {
+      const isDemoOrTest =
+        this.configService.get<boolean>('demoMode') ||
+        process.env.NODE_ENV === 'test';
+
+      if (!isDemoOrTest) {
+        throw new ServiceUnavailableException({
+          errorCode: 'ROUTING_UNAVAILABLE',
+          message: `${context} requires authoritative road-network routing, but routing service is currently unavailable.`,
+        });
+      }
+    }
+  }
+
+  private isValidCoordinate(
+    coord?: { latitude?: number; longitude?: number } | null,
+  ): boolean {
+    return (
+      coord != null &&
+      typeof coord.latitude === 'number' &&
+      Number.isFinite(coord.latitude) &&
+      coord.latitude >= -90 &&
+      coord.latitude <= 90 &&
+      typeof coord.longitude === 'number' &&
+      Number.isFinite(coord.longitude) &&
+      coord.longitude >= -180 &&
+      coord.longitude <= 180
+    );
+  }
+
+  private async evaluateBreaker(): Promise<BreakerDecision> {
+    const now = Date.now();
+    const newProbeToken = crypto.randomUUID();
+
+    if (this.redisService) {
+      try {
+        const client = this.redisService.getClient();
+        const luaScript = `
+          local state = redis.call('GET', KEYS[1]) or 'CLOSED'
+          local gen = tonumber(redis.call('GET', KEYS[4]) or '1')
+
+          if state == 'OPEN' then
+            local openedAt = tonumber(redis.call('GET', KEYS[2]) or '0')
+            local now = tonumber(ARGV[1])
+            local cooldown = tonumber(ARGV[2])
+
+            if (now - openedAt) >= cooldown then
+              -- Cooldown elapsed. Attempt atomic lock for the single controlled probe
+              local acquired = redis.call('SET', KEYS[3], ARGV[3], 'PX', tonumber(ARGV[4]), 'NX')
+              if acquired then
+                gen = gen + 1
+                redis.call('SET', KEYS[4], tostring(gen))
+                redis.call('SET', KEYS[1], 'HALF_OPEN')
+                return {'PROBE_ALLOWED', ARGV[3], tostring(gen)}
+              else
+                return {'PROBE_BLOCKED', '', tostring(gen)}
+              end
+            else
+              return {'COOLDOWN_ACTIVE', '', tostring(gen)}
+            end
+          elseif state == 'HALF_OPEN' then
+            -- Attempt atomic lock if not held (e.g. previous probe expired)
+            local acquired = redis.call('SET', KEYS[3], ARGV[3], 'PX', tonumber(ARGV[4]), 'NX')
+            if acquired then
+              gen = gen + 1
+              redis.call('SET', KEYS[4], tostring(gen))
+              return {'PROBE_ALLOWED', ARGV[3], tostring(gen)}
+            else
+              return {'PROBE_BLOCKED', '', tostring(gen)}
+            end
+          else
+            return {'ATTEMPT_ALLOWED', '', tostring(gen)}
+          end
+        `;
+
+        const evalResult = (await client.eval(
+          luaScript,
+          4,
+          REDIS_KEY_CB_STATE,
+          REDIS_KEY_CB_OPENED_AT,
+          REDIS_KEY_CB_PROBE_LOCK,
+          REDIS_KEY_CB_GENERATION,
+          String(now),
+          String(CB_COOLDOWN_MS),
+          newProbeToken,
+          String(CB_PROBE_LOCK_TTL_MS),
+        )) as [string, string, string];
+
+        const [action, probeToken, genStr] = evalResult;
+        const generation = parseInt(genStr, 10) || 1;
+
+        if (action === 'ATTEMPT_ALLOWED') {
+          this.localCbState = 'CLOSED';
+          this.localCbFailures = 0;
+          this.localCbProbeInFlight = false;
+          return { allowed: true, isProbe: false, generation };
+        }
+        if (action === 'PROBE_ALLOWED') {
+          this.localCbState = 'HALF_OPEN';
+          this.localCbProbeInFlight = true;
+          this.logger.log(
+            `Circuit breaker entering HALF_OPEN probe state across processes (token: ${probeToken}, gen: ${generation})`,
+          );
+          return { allowed: true, isProbe: true, probeToken, generation };
+        }
+        if (action === 'PROBE_BLOCKED') {
+          this.localCbState = 'HALF_OPEN';
+          this.localCbProbeInFlight = true;
+          this.logger.warn(
+            'Circuit breaker probe already in flight by another process; fast-falling back',
+          );
+          return { allowed: false, isProbe: false, reason: 'PROBE_IN_FLIGHT', generation };
+        }
+        if (action === 'COOLDOWN_ACTIVE') {
+          this.localCbState = 'OPEN';
+          this.localCbProbeInFlight = false;
+          this.logger.warn(
+            'OSRM circuit breaker is OPEN; fast-falling back to geodesic approximation',
+          );
+          return { allowed: false, isProbe: false, reason: 'COOLDOWN_ACTIVE', generation };
+        }
+      } catch (err) {
+        this.logger.warn(
+          `Redis error during circuit breaker evaluation; operating in degraded mode: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
+    // Local in-memory fallback if Redis is unconfigured or degraded
+    if (this.localCbState === 'OPEN') {
+      if (now - this.localCbOpenedAt >= CB_COOLDOWN_MS) {
+        if (this.localCbProbeInFlight) {
+          return {
+            allowed: false,
+            isProbe: false,
+            reason: 'PROBE_IN_FLIGHT',
+            generation: this.localCbGeneration,
+          };
+        }
+        this.localCbState = 'HALF_OPEN';
+        this.localCbProbeInFlight = true;
+        this.localCbProbeToken = newProbeToken;
+        this.localCbGeneration++;
+        return {
+          allowed: true,
+          isProbe: true,
+          probeToken: newProbeToken,
+          generation: this.localCbGeneration,
+        };
+      }
+      return {
+        allowed: false,
+        isProbe: false,
+        reason: 'COOLDOWN_ACTIVE',
+        generation: this.localCbGeneration,
+      };
+    }
+
+    if (this.localCbState === 'HALF_OPEN') {
+      if (this.localCbProbeInFlight) {
+        return {
+          allowed: false,
+          isProbe: false,
+          reason: 'PROBE_IN_FLIGHT',
+          generation: this.localCbGeneration,
+        };
+      }
+      this.localCbProbeInFlight = true;
+      this.localCbProbeToken = newProbeToken;
+      this.localCbGeneration++;
+      return {
+        allowed: true,
+        isProbe: true,
+        probeToken: newProbeToken,
+        generation: this.localCbGeneration,
+      };
+    }
+
+    return { allowed: true, isProbe: false, generation: this.localCbGeneration };
+  }
+
+  private async recordSuccess(decision: BreakerDecision): Promise<void> {
+    // Update local state conditionally based on generation and probe ownership
+    if (decision.isProbe) {
+      if (
+        this.localCbState === 'HALF_OPEN' &&
+        this.localCbProbeToken === decision.probeToken &&
+        this.localCbGeneration === decision.generation
+      ) {
+        this.localCbState = 'CLOSED';
+        this.localCbFailures = 0;
+        this.localCbFirstFailureAt = 0;
+        this.localCbProbeInFlight = false;
+        this.localCbProbeToken = null;
+        this.localCbGeneration++;
+      }
+    } else {
+      if (
+        this.localCbState === 'CLOSED' &&
+        this.localCbGeneration === decision.generation
+      ) {
+        this.localCbFailures = 0;
+        this.localCbFirstFailureAt = 0;
+      }
+    }
+
+    if (this.redisService) {
+      try {
+        const client = this.redisService.getClient();
+        const luaScript = `
+          local state = redis.call('GET', KEYS[1]) or 'CLOSED'
+          local currentGen = tonumber(redis.call('GET', KEYS[5]) or '1')
+          local expectedGen = tonumber(ARGV[3])
+          local isProbe = ARGV[1] == '1'
+
+          if isProbe then
+            local currentLock = redis.call('GET', KEYS[4])
+            if state == 'HALF_OPEN' and currentLock == ARGV[2] and currentGen == expectedGen then
+              currentGen = currentGen + 1
+              redis.call('SET', KEYS[1], 'CLOSED')
+              redis.call('SET', KEYS[2], '0')
+              redis.call('SET', KEYS[5], tostring(currentGen))
+              redis.call('DEL', KEYS[3], KEYS[4], KEYS[6])
+              return 'CLOSED'
+            else
+              return 'STALE_PROBE'
+            end
+          else
+            if state == 'CLOSED' and currentGen == expectedGen then
+              redis.call('SET', KEYS[2], '0')
+              redis.call('DEL', KEYS[6])
+              return 'CLOSED'
+            else
+              return 'IGNORED_LATE_SUCCESS'
+            end
+          end
+        `;
+
+        await client.eval(
+          luaScript,
+          6,
+          REDIS_KEY_CB_STATE,
+          REDIS_KEY_CB_FAILURES,
+          REDIS_KEY_CB_OPENED_AT,
+          REDIS_KEY_CB_PROBE_LOCK,
+          REDIS_KEY_CB_GENERATION,
+          REDIS_KEY_CB_FIRST_FAILURE_AT,
+          decision.isProbe ? '1' : '0',
+          decision.probeToken ?? '',
+          String(decision.generation),
+        );
+      } catch (err: any) {
+        this.logger.warn(`Failed to record circuit breaker success in Redis: ${err?.message}`);
+      }
+    }
+  }
+
+  private async recordFailure(decision: BreakerDecision): Promise<void> {
+    const now = Date.now();
+
+    // Update local state
+    if (decision.isProbe) {
+      if (
+        this.localCbState === 'HALF_OPEN' &&
+        this.localCbProbeToken === decision.probeToken &&
+        this.localCbGeneration === decision.generation
+      ) {
+        this.localCbState = 'OPEN';
+        this.localCbOpenedAt = now;
+        this.localCbProbeInFlight = false;
+        this.localCbProbeToken = null;
+        this.localCbFailures = CB_FAILURE_THRESHOLD;
+        this.localCbGeneration++;
+        this.logger.warn(
+          'HALF_OPEN probe failed in local state. Circuit breaker moved back to OPEN state.',
+        );
+      }
+    } else {
+      if (this.localCbState === 'CLOSED' && this.localCbGeneration === decision.generation) {
+        if (
+          this.localCbFirstFailureAt === 0 ||
+          now - this.localCbFirstFailureAt > CB_FAILURE_WINDOW_MS
+        ) {
+          this.localCbFailures = 1;
+          this.localCbFirstFailureAt = now;
+        } else {
+          this.localCbFailures++;
+        }
+
+        if (this.localCbFailures >= CB_FAILURE_THRESHOLD) {
+          this.localCbState = 'OPEN';
+          this.localCbOpenedAt = now;
+          this.localCbGeneration++;
+          this.logger.warn(
+            `OSRM routing failures exceeded threshold (${this.localCbFailures}) within window. Circuit breaker moved to OPEN state.`,
+          );
+        }
+      }
+      // If local state is already OPEN or HALF_OPEN, regular failures are ignored (cooldown is NOT reset!)
+    }
+
+    if (this.redisService) {
+      try {
+        const client = this.redisService.getClient();
+        const luaScript = `
+          local state = redis.call('GET', KEYS[1]) or 'CLOSED'
+          local currentGen = tonumber(redis.call('GET', KEYS[5]) or '1')
+          local expectedGen = tonumber(ARGV[6])
+          local isProbe = ARGV[4] == '1'
+          local now = tonumber(ARGV[1])
+          local threshold = tonumber(ARGV[2])
+          local windowMs = tonumber(ARGV[3])
+
+          if isProbe then
+            local currentLock = redis.call('GET', KEYS[4])
+            if state == 'HALF_OPEN' and currentLock == ARGV[5] and currentGen == expectedGen then
+              currentGen = currentGen + 1
+              redis.call('SET', KEYS[1], 'OPEN')
+              redis.call('SET', KEYS[3], tostring(now))
+              redis.call('SET', KEYS[5], tostring(currentGen))
+              redis.call('SET', KEYS[2], tostring(threshold))
+              redis.call('DEL', KEYS[4], KEYS[6])
+              return 'REOPENED'
+            else
+              return 'STALE_PROBE'
+            end
+          else
+            if state == 'OPEN' then
+              return 'ALREADY_OPEN'
+            elseif state == 'HALF_OPEN' then
+              return 'IGNORED_DURING_HALF_OPEN'
+            else
+              if currentGen ~= expectedGen then
+                return 'STALE_GENERATION'
+              end
+
+              local firstAt = tonumber(redis.call('GET', KEYS[6]) or '0')
+              local failures = tonumber(redis.call('GET', KEYS[2]) or '0')
+
+              if firstAt == 0 or (now - firstAt) > windowMs then
+                failures = 1
+                redis.call('SET', KEYS[2], '1', 'EX', 120)
+                redis.call('SET', KEYS[6], tostring(now), 'EX', 120)
+              else
+                failures = failures + 1
+                redis.call('SET', KEYS[2], tostring(failures), 'EX', 120)
+              end
+
+              if failures >= threshold then
+                currentGen = currentGen + 1
+                redis.call('SET', KEYS[1], 'OPEN')
+                redis.call('SET', KEYS[3], tostring(now))
+                redis.call('SET', KEYS[5], tostring(currentGen))
+                redis.call('DEL', KEYS[4], KEYS[6])
+                return 'OPENED'
+              else
+                return 'RECORDED'
+              end
+            end
+          end
+        `;
+
+        await client.eval(
+          luaScript,
+          6,
+          REDIS_KEY_CB_STATE,
+          REDIS_KEY_CB_FAILURES,
+          REDIS_KEY_CB_OPENED_AT,
+          REDIS_KEY_CB_PROBE_LOCK,
+          REDIS_KEY_CB_GENERATION,
+          REDIS_KEY_CB_FIRST_FAILURE_AT,
+          String(now),
+          String(CB_FAILURE_THRESHOLD),
+          String(CB_FAILURE_WINDOW_MS),
+          decision.isProbe ? '1' : '0',
+          decision.probeToken ?? '',
+          String(decision.generation),
+        );
+      } catch (err: any) {
+        this.logger.warn(`Failed to record circuit breaker failure in Redis: ${err?.message}`);
+      }
     }
   }
 
@@ -79,58 +556,69 @@ export class RoutingService {
     origin: { latitude: number; longitude: number },
     destination: { latitude: number; longitude: number },
   ): Promise<RouteResult> {
-    if (this.cbState === 'OPEN') {
-      const now = Date.now();
-      if (now - this.cbLastFailureTime >= this.cbCooldownMs) {
-        this.logger.log('Circuit breaker entering HALF_OPEN probe state');
-        this.cbState = 'HALF_OPEN';
-      } else {
-        this.logger.warn(
-          'OSRM circuit breaker is OPEN; fast-falling back to geodesic approximation',
-        );
-        return this.calculateGeodesicFallback(origin, destination);
-      }
+    if (!this.isValidCoordinate(origin) || !this.isValidCoordinate(destination)) {
+      this.logger.warn('Invalid coordinates provided to getRoute; returning fallback');
+      return this.calculateGeodesicFallback(origin, destination);
+    }
+
+    const decision = await this.evaluateBreaker();
+    if (!decision.allowed) {
+      return this.calculateGeodesicFallback(origin, destination);
     }
 
     const coords = `${origin.longitude},${origin.latitude};${destination.longitude},${destination.latitude}`;
     const url = `${this.osrmUrl}/route/v1/driving/${coords}?overview=full&geometries=geojson`;
 
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 1500);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 1500);
 
+    try {
       const response = await fetch(url, {
         signal: controller.signal,
         headers: { Accept: 'application/json' },
       });
-      clearTimeout(timeoutId);
 
       if (response.ok) {
         const data = (await response.json()) as {
           code: string;
-          routes: Array<{
-            distance: number;
-            duration: number;
-            geometry: unknown;
+          routes?: Array<{
+            distance?: number;
+            duration?: number;
+            geometry?: unknown;
           }>;
         };
 
-        if (data.code === 'Ok' && data.routes && data.routes.length > 0) {
-          this.cbFailureCount = 0;
-          this.cbState = 'CLOSED';
+        if (
+          data &&
+          data.code === 'Ok' &&
+          Array.isArray(data.routes) &&
+          data.routes.length > 0
+        ) {
           const route = data.routes[0];
-          return {
-            distanceMeters: Math.round(route.distance),
-            durationSec: Math.round(route.duration),
-            geometry: route.geometry,
-            source: 'OSRM',
-            isFallback: false,
-          };
+          if (
+            typeof route.distance === 'number' &&
+            Number.isFinite(route.distance) &&
+            route.distance >= 0 &&
+            typeof route.duration === 'number' &&
+            Number.isFinite(route.duration) &&
+            route.duration >= 0
+          ) {
+            await this.recordSuccess(decision);
+            return {
+              distanceMeters: Math.round(route.distance),
+              durationSec: Math.round(route.duration),
+              geometry: route.geometry ?? null,
+              source: 'OSRM',
+              isFallback: false,
+            };
+          }
         }
       }
-      this.recordFailure();
+      await this.recordFailure(decision);
     } catch {
-      this.recordFailure();
+      await this.recordFailure(decision);
+    } finally {
+      clearTimeout(timeoutId);
     }
 
     this.logger.warn(
@@ -146,17 +634,20 @@ export class RoutingService {
   async getTravelTimeMatrix(
     coordinates: Array<{ latitude: number; longitude: number }>,
   ): Promise<TableMatrixResult> {
-    if (this.cbState === 'OPEN') {
-      const now = Date.now();
-      if (now - this.cbLastFailureTime >= this.cbCooldownMs) {
-        this.logger.log('Circuit breaker entering HALF_OPEN probe state');
-        this.cbState = 'HALF_OPEN';
-      } else {
-        this.logger.warn(
-          'OSRM circuit breaker is OPEN; fast-falling back to pairwise geodesic approximation',
-        );
-        return this.calculatePairwiseFallback(coordinates);
-      }
+    if (
+      !Array.isArray(coordinates) ||
+      coordinates.length === 0 ||
+      !coordinates.every((c) => this.isValidCoordinate(c))
+    ) {
+      this.logger.warn(
+        'Invalid coordinates provided to getTravelTimeMatrix; returning fallback',
+      );
+      return this.calculatePairwiseFallback(coordinates ?? []);
+    }
+
+    const decision = await this.evaluateBreaker();
+    if (!decision.allowed) {
+      return this.calculatePairwiseFallback(coordinates);
     }
 
     const coordsStr = coordinates
@@ -164,41 +655,77 @@ export class RoutingService {
       .join(';');
     const url = `${this.osrmUrl}/table/v1/driving/${coordsStr}?annotations=duration,distance`;
 
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 2000);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 2000);
 
+    try {
       const response = await fetch(url, {
         signal: controller.signal,
         headers: { Accept: 'application/json' },
       });
-      clearTimeout(timeoutId);
 
       if (response.ok) {
         const data = (await response.json()) as {
           code: string;
-          durations: number[][];
-          distances?: number[][];
+          durations?: (number | null)[][];
+          distances?: (number | null)[][];
         };
 
-        if (data.code === 'Ok' && data.durations) {
-          this.cbFailureCount = 0;
-          this.cbState = 'CLOSED';
-          return {
-            durations: data.durations.map((row) =>
-              row.map((val) => Math.round(val)),
-            ),
-            distances: data.distances?.map((row) =>
-              row.map((val) => Math.round(val)),
-            ),
-            source: 'OSRM',
-            isFallback: false,
-          };
+        if (
+          data &&
+          data.code === 'Ok' &&
+          Array.isArray(data.durations) &&
+          data.durations.length === coordinates.length
+        ) {
+          const isValidDurations = data.durations.every(
+            (row) =>
+              Array.isArray(row) &&
+              row.length === coordinates.length &&
+              row.every(
+                (val) =>
+                  typeof val === 'number' &&
+                  Number.isFinite(val) &&
+                  val >= 0,
+              ),
+          );
+
+          if (isValidDurations) {
+            const hasDistances =
+              Array.isArray(data.distances) &&
+              data.distances.length === coordinates.length &&
+              data.distances.every(
+                (row) =>
+                  Array.isArray(row) &&
+                  row.length === coordinates.length &&
+                  row.every(
+                    (val) =>
+                      typeof val === 'number' &&
+                      Number.isFinite(val) &&
+                      val >= 0,
+                  ),
+              );
+
+            await this.recordSuccess(decision);
+            return {
+              durations: data.durations.map((row) =>
+                row.map((val) => Math.round(val as number)),
+              ),
+              distances: hasDistances
+                ? data.distances!.map((row) =>
+                    row.map((val) => Math.round(val as number)),
+                  )
+                : undefined,
+              source: 'OSRM',
+              isFallback: false,
+            };
+          }
         }
       }
-      this.recordFailure();
+      await this.recordFailure(decision);
     } catch {
-      this.recordFailure();
+      await this.recordFailure(decision);
+    } finally {
+      clearTimeout(timeoutId);
     }
 
     this.logger.warn(
@@ -210,6 +737,10 @@ export class RoutingService {
   private calculatePairwiseFallback(
     coordinates: Array<{ latitude: number; longitude: number }>,
   ): TableMatrixResult {
+    if (!Array.isArray(coordinates) || coordinates.length === 0) {
+      return { durations: [], distances: [], source: 'FALLBACK', isFallback: true };
+    }
+
     const n = coordinates.length;
     const durations: number[][] = Array.from({ length: n }, () =>
       Array.from({ length: n }, () => 0),
@@ -245,6 +776,16 @@ export class RoutingService {
     origin: { latitude: number; longitude: number },
     destination: { latitude: number; longitude: number },
   ): RouteResult {
+    if (!this.isValidCoordinate(origin) || !this.isValidCoordinate(destination)) {
+      return {
+        distanceMeters: 100,
+        durationSec: 30,
+        geometry: null,
+        source: 'FALLBACK',
+        isFallback: true,
+      };
+    }
+
     const earthRadiusMeters = 6371000;
     const toRadians = (deg: number) => (deg * Math.PI) / 180;
 

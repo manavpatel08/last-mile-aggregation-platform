@@ -3,11 +3,17 @@ import {
   NotFoundException,
   BadRequestException,
   ForbiddenException,
+  HttpStatus,
   Logger,
 } from '@nestjs/common';
 import * as crypto from 'crypto';
 import { PrismaService } from '../../infrastructure/prisma/prisma.service.js';
 import { VerifyBoardingDto } from './dto/verify-boarding.dto.js';
+import {
+  IdempotencyClaimContext,
+  verifyIdempotencyClaim,
+  fenceAndCompleteIdempotentTransaction,
+} from '../../common/interceptors/idempotency.interceptor.js';
 
 export interface TripPassengerResponse {
   id: string;
@@ -66,10 +72,17 @@ export class TripsService {
    * Driver reports arrival at pickup hub (PDEU Main Gate).
    * Starts individual 5-minute free waiting timer.
    */
-  async reportArrival(driverUserId: string, tripId: string) {
+  async reportArrival(
+    driverUserId: string,
+    tripId: string,
+    claim?: IdempotencyClaimContext,
+  ) {
     const driver = await this.getVerifiedDriverProfile(driverUserId);
 
     return this.prisma.$transaction(async (tx) => {
+      // Verify claim ownership and lock idempotency record
+      await verifyIdempotencyClaim(tx, claim);
+
       // Pessimistic lock on trip row using SELECT ... FOR UPDATE
       const trips = await tx.$queryRaw<
         Array<{
@@ -171,26 +184,46 @@ export class TripsService {
         },
       });
 
-      return {
+      const arrivalResult = {
         tripId: updatedTrip.id,
         status: updatedTrip.status,
         driverArrivedAt: updatedTrip.driverArrivedAt?.toISOString(),
       };
+
+      const responsePayload = {
+        success: true,
+        message: 'Driver arrival confirmed',
+        data: arrivalResult,
+      };
+
+      await fenceAndCompleteIdempotentTransaction(
+        tx,
+        claim,
+        responsePayload,
+        HttpStatus.OK,
+      );
+
+      return arrivalResult;
     });
   }
 
   /**
    * Verify passenger boarding via secure 4-digit hashed OTP.
    * Calculates waiting charges: first 5m free, ₹5/started min thereafter.
+   * Atomic attempt tracking commits failed attempts to prevent rollback bypass.
    */
   async verifyBoarding(
     driverUserId: string,
     tripId: string,
     dto: VerifyBoardingDto,
+    claim?: IdempotencyClaimContext,
   ) {
     const driver = await this.getVerifiedDriverProfile(driverUserId);
 
-    return this.prisma.$transaction(async (tx) => {
+    const result = await this.prisma.$transaction(async (tx) => {
+      // Verify claim ownership and lock idempotency record
+      await verifyIdempotencyClaim(tx, claim);
+
       // Lock trip row with SELECT ... FOR UPDATE
       const trips = await tx.$queryRaw<
         Array<{
@@ -219,6 +252,14 @@ export class TripsService {
         throw new ForbiddenException({
           errorCode: 'DRIVER_NOT_ASSIGNED_TO_TRIP',
           message: 'Caller is not the assigned driver for this trip.',
+        });
+      }
+
+      // Review Finding 6.1: Verify trip state is in pickup state (AT_PICKUP)
+      if (trip.status !== 'AT_PICKUP') {
+        throw new BadRequestException({
+          errorCode: 'INVALID_TRIP_STATUS_FOR_BOARDING',
+          message: `Trip must be in status 'AT_PICKUP' to verify boarding (current: '${trip.status}').`,
         });
       }
 
@@ -276,20 +317,65 @@ export class TripsService {
       const verification = verifications[0];
 
       if (verification.is_verified && passenger.status === 'BOARDED') {
-        return {
+        const alreadyBoardedResult = {
           tripPassengerId: passenger.id,
           passengerStatus: passenger.status,
           waitingChargePaise: passenger.waiting_charge_paise,
           boardedAt: passenger.boarded_at?.toISOString(),
         };
+
+        const responsePayload = {
+          success: true,
+          message: 'Passenger boarding verified',
+          data: alreadyBoardedResult,
+        };
+
+        await fenceAndCompleteIdempotentTransaction(
+          tx,
+          claim,
+          responsePayload,
+          HttpStatus.OK,
+        );
+
+        return {
+          outcome: 'ALREADY_BOARDED',
+          data: alreadyBoardedResult,
+        };
+      }
+
+      // Check passenger status: Must be WAITING if not already BOARDED
+      if (passenger.status !== 'WAITING') {
+        throw new BadRequestException({
+          errorCode: 'INVALID_PASSENGER_STATUS_FOR_BOARDING',
+          message: `Cannot verify boarding for passenger in status '${passenger.status}'. Must be 'WAITING'.`,
+        });
       }
 
       // Enforce maximum 3 attempts
       if (verification.attempts_count >= verification.max_attempts) {
-        throw new BadRequestException({
+        const now = new Date();
+        const timestamp = now.toISOString();
+        const path =
+          claim?.requestUrl || `/api/v1/trips/${tripId}/verify-boarding`;
+
+        const errorPayload = {
+          success: false,
+          statusCode: HttpStatus.BAD_REQUEST,
           errorCode: 'OTP_MAX_ATTEMPTS_EXCEEDED',
           message: 'Maximum OTP verification attempts (3) exceeded.',
-        });
+          errors: [],
+          timestamp,
+          path,
+        };
+
+        await fenceAndCompleteIdempotentTransaction(
+          tx,
+          claim,
+          errorPayload,
+          HttpStatus.BAD_REQUEST,
+        );
+
+        return { outcome: 'MAX_ATTEMPTS_EXCEEDED', timestamp };
       }
 
       // Compare SHA-256 hash
@@ -299,7 +385,7 @@ export class TripsService {
         .digest('hex');
 
       if (inputHash !== verification.otp_hash) {
-        // Increment attempts count
+        // Increment attempts count inside transaction
         await tx.boardingVerification.update({
           where: { id: verification.id },
           data: {
@@ -307,10 +393,30 @@ export class TripsService {
           },
         });
 
-        throw new BadRequestException({
+        const now = new Date();
+        const timestamp = now.toISOString();
+        const path =
+          claim?.requestUrl || `/api/v1/trips/${tripId}/verify-boarding`;
+
+        const errorPayload = {
+          success: false,
+          statusCode: HttpStatus.BAD_REQUEST,
           errorCode: 'INVALID_OTP',
           message: 'Invalid boarding OTP provided.',
-        });
+          errors: [],
+          timestamp,
+          path,
+        };
+
+        // Complete the idempotency record atomically within this SAME transaction
+        await fenceAndCompleteIdempotentTransaction(
+          tx,
+          claim,
+          errorPayload,
+          HttpStatus.BAD_REQUEST,
+        );
+
+        return { outcome: 'INVALID_OTP', timestamp };
       }
 
       // OTP matched: Calculate waiting charges
@@ -378,23 +484,66 @@ export class TripsService {
         },
       });
 
-      return {
+      const boardingResult = {
         tripPassengerId: updatedPassenger.id,
         passengerStatus: updatedPassenger.status,
         waitingChargePaise,
         boardedAt: updatedPassenger.boardedAt?.toISOString(),
       };
+
+      const responsePayload = {
+        success: true,
+        message: 'Passenger boarding verified',
+        data: boardingResult,
+      };
+
+      await fenceAndCompleteIdempotentTransaction(
+        tx,
+        claim,
+        responsePayload,
+        HttpStatus.OK,
+      );
+
+      return {
+        outcome: 'SUCCESS',
+        data: boardingResult,
+      };
     });
+
+    if (result.outcome === 'MAX_ATTEMPTS_EXCEEDED') {
+      throw new BadRequestException({
+        errorCode: 'OTP_MAX_ATTEMPTS_EXCEEDED',
+        message: 'Maximum OTP verification attempts (3) exceeded.',
+        timestamp: result.timestamp,
+      });
+    }
+
+    if (result.outcome === 'INVALID_OTP') {
+      throw new BadRequestException({
+        errorCode: 'INVALID_OTP',
+        message: 'Invalid boarding OTP provided.',
+        timestamp: result.timestamp,
+      });
+    }
+
+    return result.data;
   }
 
   /**
    * Driver departs pickup hub: transitions vehicle trip from AT_PICKUP to IN_PROGRESS.
    * Requires all active passengers to be BOARDED.
    */
-  async startTrip(driverUserId: string, tripId: string) {
+  async startTrip(
+    driverUserId: string,
+    tripId: string,
+    claim?: IdempotencyClaimContext,
+  ) {
     const driver = await this.getVerifiedDriverProfile(driverUserId);
 
     return this.prisma.$transaction(async (tx) => {
+      // Verify claim ownership and lock idempotency record
+      await verifyIdempotencyClaim(tx, claim);
+
       // Lock trip row with SELECT ... FOR UPDATE
       const trips = await tx.$queryRaw<
         Array<{
@@ -504,26 +653,45 @@ export class TripsService {
         },
       });
 
-      return {
+      const startResult = {
         tripId: updatedTrip.id,
         status: updatedTrip.status,
         startedAt: updatedTrip.startedAt?.toISOString(),
       };
+
+      const responsePayload = {
+        success: true,
+        message: 'Trip started successfully',
+        data: startResult,
+      };
+
+      await fenceAndCompleteIdempotentTransaction(
+        tx,
+        claim,
+        responsePayload,
+        HttpStatus.OK,
+      );
+
+      return startResult;
     });
   }
 
   /**
    * Complete individual passenger drop-off.
-   * Calculates cash to collect: ride fare + waiting charges + outstanding cancellation fee surcharge.
+   * Atomically claims and settles outstanding cancellation fees with CAS lock.
    */
   async completePassenger(
     driverUserId: string,
     tripId: string,
     passengerId: string,
+    claim?: IdempotencyClaimContext,
   ) {
     const driver = await this.getVerifiedDriverProfile(driverUserId);
 
     return this.prisma.$transaction(async (tx) => {
+      // Verify claim ownership and lock idempotency record
+      await verifyIdempotencyClaim(tx, claim);
+
       // Lock trip row with SELECT ... FOR UPDATE
       const trips = await tx.$queryRaw<
         Array<{
@@ -625,16 +793,21 @@ export class TripsService {
         },
       });
 
-      // Query outstanding cancellation fee surcharge
-      const outstandingFees = await tx.cancellationFee.findMany({
-        where: {
-          passengerId,
-          status: 'OUTSTANDING',
-        },
-      });
+      // Review Finding 2: Atomically claim and collect outstanding cancellation fees with CAS lock
+      const claimedFees = await tx.$queryRaw<
+        Array<{ id: string; amount_paise: number }>
+      >`
+        UPDATE cancellation_fees
+        SET
+          status = 'COLLECTED',
+          collected_booking_id = ${passenger.booking_id}::uuid,
+          collected_at = ${now}
+        WHERE passenger_id = ${passengerId}::uuid AND status = 'OUTSTANDING'
+        RETURNING id, amount_paise;
+      `;
 
-      const outstandingLateFeeSurchargePaise = outstandingFees.reduce(
-        (sum, f) => sum + f.amountPaise,
+      const outstandingLateFeeSurchargePaise = claimedFees.reduce(
+        (sum, f) => sum + f.amount_paise,
         0,
       );
 
@@ -651,15 +824,17 @@ export class TripsService {
           payload: {
             tripId,
             passengerId,
+            bookingId: passenger.booking_id,
             rideFarePaise: passenger.final_ride_fare_paise,
             waitingChargePaise: passenger.waiting_charge_paise,
             outstandingLateFeeSurchargePaise,
+            collectedFeeIds: claimedFees.map((f) => f.id),
             totalCashToCollectPaise,
           },
         },
       });
 
-      return {
+      const completionResult = {
         passengerId,
         rideFarePaise: passenger.final_ride_fare_paise,
         rideFare: (passenger.final_ride_fare_paise / 100).toFixed(2),
@@ -671,7 +846,22 @@ export class TripsService {
         ).toFixed(2),
         totalCashToCollectPaise,
         totalCashToCollect: (totalCashToCollectPaise / 100).toFixed(2),
+        collectedFeeIds: claimedFees.map((f) => f.id),
       };
+
+      const responsePayload = {
+        success: true,
+        data: completionResult,
+      };
+
+      await fenceAndCompleteIdempotentTransaction(
+        tx,
+        claim,
+        responsePayload,
+        HttpStatus.OK,
+      );
+
+      return completionResult;
     });
   }
 
@@ -683,10 +873,14 @@ export class TripsService {
     driverUserId: string,
     tripId: string,
     passengerId: string,
+    claim?: IdempotencyClaimContext,
   ) {
     const driver = await this.getVerifiedDriverProfile(driverUserId);
 
     return this.prisma.$transaction(async (tx) => {
+      // Verify claim ownership and lock idempotency record
+      await verifyIdempotencyClaim(tx, claim);
+
       // Lock trip row with SELECT ... FOR UPDATE
       const trips = await tx.$queryRaw<
         Array<{
@@ -820,12 +1014,27 @@ export class TripsService {
         },
       });
 
-      return {
+      const noShowResult = {
         passengerId,
         status: 'NO_SHOW',
         penaltyAssessedPaise: 3000,
         penaltyAssessed: '30.00',
       };
+
+      const responsePayload = {
+        success: true,
+        message: 'Passenger declared no-show',
+        data: noShowResult,
+      };
+
+      await fenceAndCompleteIdempotentTransaction(
+        tx,
+        claim,
+        responsePayload,
+        HttpStatus.OK,
+      );
+
+      return noShowResult;
     });
   }
 
@@ -833,10 +1042,17 @@ export class TripsService {
    * Finalize vehicle trip after all drop-offs or no-shows are resolved.
    * Releases driver operational status back to AVAILABLE.
    */
-  async completeTrip(driverUserId: string, tripId: string) {
+  async completeTrip(
+    driverUserId: string,
+    tripId: string,
+    claim?: IdempotencyClaimContext,
+  ) {
     const driver = await this.getVerifiedDriverProfile(driverUserId);
 
     return this.prisma.$transaction(async (tx) => {
+      // Verify claim ownership and lock idempotency record
+      await verifyIdempotencyClaim(tx, claim);
+
       // Lock trip row with SELECT ... FOR UPDATE
       const trips = await tx.$queryRaw<
         Array<{
@@ -876,8 +1092,8 @@ export class TripsService {
         });
       }
 
-      // Lock driver profile row for atomic operational status release
-      await tx.$executeRaw`
+      // Review Finding 6.2: Use $queryRaw for row-returning SELECT ... FOR UPDATE
+      await tx.$queryRaw`
         SELECT id FROM driver_profiles WHERE id = ${driver.id}::uuid FOR UPDATE;
       `;
 
@@ -953,11 +1169,26 @@ export class TripsService {
         },
       });
 
-      return {
+      const tripResult = {
         tripId: updatedTrip.id,
         status: updatedTrip.status,
         completedAt: updatedTrip.completedAt?.toISOString(),
       };
+
+      const responsePayload = {
+        success: true,
+        message: 'Trip completed successfully',
+        data: tripResult,
+      };
+
+      await fenceAndCompleteIdempotentTransaction(
+        tx,
+        claim,
+        responsePayload,
+        HttpStatus.OK,
+      );
+
+      return tripResult;
     });
   }
 
@@ -1027,8 +1258,9 @@ export class TripsService {
   }
 
   /**
-   * Testing & lifecycle helper: materializes a trip from a ride group,
+   * @internal Internal orchestration and testing helper: materializes a trip from a ride group,
    * driver assignment, and passenger bookings with 4-digit hashed OTPs.
+   * This method is NOT exposed via any public HTTP controller endpoint.
    */
   async createTripManifest(data: {
     driverId: string;

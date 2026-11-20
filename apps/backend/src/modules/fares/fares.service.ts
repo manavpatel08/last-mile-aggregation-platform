@@ -2,7 +2,6 @@ import {
   Injectable,
   NotFoundException,
   BadRequestException,
-  ServiceUnavailableException,
   UnprocessableEntityException,
   Logger,
 } from '@nestjs/common';
@@ -102,19 +101,12 @@ export class FaresService {
       dto.destination,
     );
 
+    this.routingService.assertAuthoritativeRoute(
+      route,
+      'Fare quote generation',
+    );
+
     if (route.isFallback) {
-      const isDemoOrTest =
-        this.configService.get<boolean>('demoMode') ||
-        process.env.NODE_ENV === 'test';
-
-      if (!isDemoOrTest) {
-        throw new ServiceUnavailableException({
-          errorCode: 'ROUTING_UNAVAILABLE',
-          message:
-            'Authoritative road-network routing service is temporarily unavailable. Cannot generate binding fare quote.',
-        });
-      }
-
       this.logger.warn(
         'Binding quote generated using geodesic fallback in demo/test mode.',
       );

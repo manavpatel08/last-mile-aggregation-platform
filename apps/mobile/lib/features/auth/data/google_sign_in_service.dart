@@ -28,17 +28,44 @@ class NativeGoogleSignInService implements GoogleSignInService {
   final AppConfig config;
   final GoogleSignIn _googleSignIn;
   bool _initialized = false;
+  Object? _initError;
   Future<void>? _initFuture;
 
   Future<void> _ensureInitialized() async {
     if (_initialized) return;
+    if (_initError != null) {
+      throw const ApiException(
+        errorCode: 'GOOGLE_INIT_FAILED',
+        message:
+            'Google Sign-In initialization failed. Please restart the app or try again.',
+      );
+    }
     if (_initFuture != null) {
       await _initFuture;
+      if (!_initialized) {
+        throw const ApiException(
+          errorCode: 'GOOGLE_INIT_FAILED',
+          message:
+              'Google Sign-In initialization failed. Please restart the app or try again.',
+        );
+      }
       return;
     }
 
     _initFuture = _runInitialization();
-    await _initFuture;
+    try {
+      await _initFuture;
+    } finally {
+      _initFuture = null;
+    }
+
+    if (!_initialized) {
+      throw const ApiException(
+        errorCode: 'GOOGLE_INIT_FAILED',
+        message:
+            'Google Sign-In initialization failed. Please restart the app or try again.',
+      );
+    }
   }
 
   Future<void> _runInitialization() async {
@@ -48,18 +75,27 @@ class NativeGoogleSignInService implements GoogleSignInService {
         serverClientId: config.googleServerClientId,
       );
       _initialized = true;
+      _initError = null;
     } catch (e) {
-      _initFuture = null;
+      _initialized = false;
+      _initError = e;
       if (kDebugMode) {
         debugPrint('[GoogleSignInService] Initialize error: $e');
       }
+      throw const ApiException(
+        errorCode: 'GOOGLE_INIT_FAILED',
+        message:
+            'Google Sign-In initialization failed. Please restart the app or try again.',
+      );
     }
   }
 
   @override
   Future<String?> signIn() async {
     final clientId = config.googleClientIdIos;
-    if (clientId == null || clientId.trim().isEmpty) {
+    if (clientId == null ||
+        clientId.trim().isEmpty ||
+        clientId == 'YOUR_IOS_GOOGLE_CLIENT_ID.apps.googleusercontent.com') {
       throw const ApiException(
         errorCode: 'GOOGLE_CONFIG_MISSING',
         message:
@@ -88,12 +124,20 @@ class NativeGoogleSignInService implements GoogleSignInService {
           '[GoogleSignInService] GoogleSignInException: ${e.code} ${e.description}',
         );
       }
+      throw const ApiException(
+        errorCode: 'GOOGLE_SIGN_IN_ERROR',
+        message: 'Google Sign-In was not completed. Please try again.',
+      );
+    } on ApiException {
       rethrow;
     } catch (e) {
       if (kDebugMode) {
         debugPrint('[GoogleSignInService] Interactive sign-in error: $e');
       }
-      rethrow;
+      throw const ApiException(
+        errorCode: 'GOOGLE_SIGN_IN_ERROR',
+        message: 'An unexpected error occurred during Google Sign-In.',
+      );
     }
   }
 

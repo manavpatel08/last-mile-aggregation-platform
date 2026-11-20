@@ -53,6 +53,31 @@ class ApiException implements Exception {
   final String? path;
   final String? timestamp;
 
+  /// Whether the error represents an HTTP 401 Unauthorized response.
+  bool get isUnauthorized => statusCode == 401;
+
+  /// Whether the error represents an HTTP 403 Forbidden response (insufficient permission).
+  bool get isForbidden => statusCode == 403;
+
+  /// Whether this error from a refresh-token operation confirms that the refresh
+  /// token is invalid or revoked (HTTP 401 Unauthorized).
+  ///
+  /// Per architecture specifications: HTTP 403 Forbidden indicates an authorization/permission
+  /// error, NOT session expiration, and must NEVER clear stored refresh credentials.
+  bool get isInvalidRefreshTokenResponse => statusCode == 401;
+
+  /// Whether the error represents a definitive authentication rejection (HTTP 401 Unauthorized).
+  ///
+  /// Note: HTTP 403 Forbidden is intentionally excluded as it indicates permission denial.
+  bool get isDefinitiveAuthFailure => statusCode == 401;
+
+  /// Whether the error represents a transient network, timeout, or temporary server issue (5xx).
+  bool get isTransient =>
+      statusCode == null ||
+      (statusCode != null && statusCode! >= 500) ||
+      errorCode == 'REQUEST_TIMEOUT' ||
+      errorCode == 'NETWORK_UNAVAILABLE';
+
   static String _defaultCodeForType(DioExceptionType type, int? statusCode) {
     switch (type) {
       case DioExceptionType.connectionTimeout:

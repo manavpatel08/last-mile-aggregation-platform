@@ -1,3 +1,4 @@
+import 'package:lastmile_mobile/core/network/api_exception.dart';
 import 'package:lastmile_mobile/core/network/auth_token_store.dart';
 import 'package:lastmile_mobile/core/storage/secure_token_storage.dart';
 import 'package:lastmile_mobile/features/auth/data/auth_repository.dart';
@@ -12,16 +13,27 @@ class FakeGoogleSignInService implements GoogleSignInService {
     this.fakeIdToken = 'fake-valid-google-id-token',
     this.shouldCancel = false,
     this.shouldThrow = false,
+    this.shouldFailInit = false,
   });
 
   String? fakeIdToken;
   bool shouldCancel;
   bool shouldThrow;
+  bool shouldFailInit;
   bool signedOut = false;
   bool disconnected = false;
+  int authenticateCallCount = 0;
 
   @override
   Future<String?> signIn() async {
+    if (shouldFailInit) {
+      throw const ApiException(
+        errorCode: 'GOOGLE_INIT_FAILED',
+        message:
+            'Google Sign-In initialization failed. Please restart the app or try again.',
+      );
+    }
+    authenticateCallCount++;
     if (shouldThrow) {
       throw Exception('Google sign-in service failure');
     }
@@ -51,6 +63,9 @@ class FakeAuthRepository implements AuthRepository {
     this.shouldThrowOnGoogle = false,
     this.shouldThrowOnRefresh = false,
     this.shouldThrowOnUser = false,
+    this.refreshException,
+    this.userException,
+    this.onRefreshSession,
   });
 
   AuthUser? currentUser;
@@ -59,8 +74,12 @@ class FakeAuthRepository implements AuthRepository {
   bool shouldThrowOnGoogle;
   bool shouldThrowOnRefresh;
   bool shouldThrowOnUser;
+  Exception? refreshException;
+  Exception? userException;
+  Future<void> Function()? onRefreshSession;
   bool logoutCalled = false;
   int refreshCallCount = 0;
+  int currentUserCallCount = 0;
 
   @override
   Future<AuthSession> authenticateWithGoogle({
@@ -92,6 +111,12 @@ class FakeAuthRepository implements AuthRepository {
     String? deviceFingerprint,
   }) async {
     refreshCallCount++;
+    if (onRefreshSession != null) {
+      await onRefreshSession!();
+    }
+    if (refreshException != null) {
+      throw refreshException!;
+    }
     if (shouldThrowOnRefresh) {
       throw Exception('Refresh token expired or invalid');
     }
@@ -110,6 +135,10 @@ class FakeAuthRepository implements AuthRepository {
 
   @override
   Future<AuthUser> getCurrentUser() async {
+    currentUserCallCount++;
+    if (userException != null) {
+      throw userException!;
+    }
     if (shouldThrowOnUser) {
       throw Exception('User profile not found');
     }
@@ -121,6 +150,34 @@ class FakeAuthRepository implements AuthRepository {
           role: 'PASSENGER',
           roles: ['PASSENGER'],
         );
+  }
+}
+
+/// Test double for [SecureTokenStorage] that can simulate write or delete failures.
+class FailingSecureTokenStorage extends SecureTokenStorage {
+  FailingSecureTokenStorage({
+    this.failOnSave = true,
+    this.failOnDelete = false,
+    Map<String, String>? initialData,
+  }) : super.inMemory(initialData);
+
+  final bool failOnSave;
+  final bool failOnDelete;
+
+  @override
+  Future<void> saveRefreshToken(String token) async {
+    if (failOnSave) {
+      throw Exception('Secure storage write operation failed');
+    }
+    return super.saveRefreshToken(token);
+  }
+
+  @override
+  Future<void> deleteRefreshToken() async {
+    if (failOnDelete) {
+      throw Exception('Secure storage delete operation failed');
+    }
+    return super.deleteRefreshToken();
   }
 }
 

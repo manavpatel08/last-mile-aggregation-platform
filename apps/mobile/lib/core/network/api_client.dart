@@ -58,12 +58,13 @@ class ApiClient {
     Map<String, dynamic>? queryParameters,
     Options? options,
     CancelToken? cancelToken,
+    bool? requiresAuth,
   }) async {
     try {
       return await _dio.get<T>(
         path,
         queryParameters: queryParameters,
-        options: options,
+        options: _mergeOptions(options, requiresAuth: requiresAuth),
         cancelToken: cancelToken,
       );
     } on DioException catch (exception) {
@@ -78,13 +79,18 @@ class ApiClient {
     String? idempotencyKey,
     Options? options,
     CancelToken? cancelToken,
+    bool? requiresAuth,
   }) async {
     try {
       return await _dio.post<T>(
         path,
         data: data,
         queryParameters: queryParameters,
-        options: _mergeIdempotencyOption(options, idempotencyKey),
+        options: _mergeOptions(
+          options,
+          idempotencyKey: idempotencyKey,
+          requiresAuth: requiresAuth,
+        ),
         cancelToken: cancelToken,
       );
     } on DioException catch (exception) {
@@ -99,13 +105,18 @@ class ApiClient {
     String? idempotencyKey,
     Options? options,
     CancelToken? cancelToken,
+    bool? requiresAuth,
   }) async {
     try {
       return await _dio.put<T>(
         path,
         data: data,
         queryParameters: queryParameters,
-        options: _mergeIdempotencyOption(options, idempotencyKey),
+        options: _mergeOptions(
+          options,
+          idempotencyKey: idempotencyKey,
+          requiresAuth: requiresAuth,
+        ),
         cancelToken: cancelToken,
       );
     } on DioException catch (exception) {
@@ -120,13 +131,18 @@ class ApiClient {
     String? idempotencyKey,
     Options? options,
     CancelToken? cancelToken,
+    bool? requiresAuth,
   }) async {
     try {
       return await _dio.patch<T>(
         path,
         data: data,
         queryParameters: queryParameters,
-        options: _mergeIdempotencyOption(options, idempotencyKey),
+        options: _mergeOptions(
+          options,
+          idempotencyKey: idempotencyKey,
+          requiresAuth: requiresAuth,
+        ),
         cancelToken: cancelToken,
       );
     } on DioException catch (exception) {
@@ -141,13 +157,18 @@ class ApiClient {
     String? idempotencyKey,
     Options? options,
     CancelToken? cancelToken,
+    bool? requiresAuth,
   }) async {
     try {
       return await _dio.delete<T>(
         path,
         data: data,
         queryParameters: queryParameters,
-        options: _mergeIdempotencyOption(options, idempotencyKey),
+        options: _mergeOptions(
+          options,
+          idempotencyKey: idempotencyKey,
+          requiresAuth: requiresAuth,
+        ),
         cancelToken: cancelToken,
       );
     } on DioException catch (exception) {
@@ -155,14 +176,19 @@ class ApiClient {
     }
   }
 
-  Options? _mergeIdempotencyOption(Options? options, String? idempotencyKey) {
-    if (idempotencyKey == null || idempotencyKey.trim().isEmpty) {
-      return options;
+  Options _mergeOptions(
+    Options? options, {
+    String? idempotencyKey,
+    bool? requiresAuth,
+  }) {
+    final effective = options ?? Options();
+    final mergedExtra = Map<String, dynamic>.from(effective.extra ?? const {});
+    if (idempotencyKey != null && idempotencyKey.trim().isNotEmpty) {
+      mergedExtra[RequestMetadata.idempotencyKey] = idempotencyKey.trim();
     }
-
-    final mergedExtra = Map<String, dynamic>.from(options?.extra ?? const {});
-    mergedExtra[ApiHeadersInterceptor.idempotencyKeyExtra] = idempotencyKey;
-
-    return (options ?? Options()).copyWith(extra: mergedExtra);
+    if (requiresAuth != null) {
+      mergedExtra[RequestMetadata.requiresAuth] = requiresAuth;
+    }
+    return effective.copyWith(extra: mergedExtra);
   }
 }

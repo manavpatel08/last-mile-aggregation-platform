@@ -18,6 +18,7 @@ import { RoutingModule } from './modules/routing/routing.module.js';
 import { FaresModule } from './modules/fares/fares.module.js';
 import { BookingsModule } from './modules/bookings/bookings.module.js';
 import { TripsModule } from './modules/trips/trips.module.js';
+import { MatchingModule } from './modules/matching/matching.module.js';
 import { JwtAuthGuard } from './common/guards/jwt-auth.guard.js';
 import { RolesGuard } from './common/guards/roles.guard.js';
 import { DriverApprovalGuard } from './common/guards/driver-approval.guard.js';
@@ -50,6 +51,7 @@ import { IdempotencyInterceptor } from './common/interceptors/idempotency.interc
     FaresModule,
     BookingsModule,
     TripsModule,
+    MatchingModule,
   ],
   controllers: [AppController],
   providers: [

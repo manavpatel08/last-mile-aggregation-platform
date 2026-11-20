@@ -11,6 +11,14 @@ import 'dio_interceptors.dart';
 /// Callback triggered when a session cannot be refreshed and credentials are wiped.
 typedef SessionExpiredCallback = void Function();
 
+class _RefreshAttemptResult {
+  const _RefreshAttemptResult.success() : error = null;
+  const _RefreshAttemptResult.failure(this.error);
+
+  final Object? error;
+  bool get isSuccess => error == null;
+}
+
 /// Single-flight Dio interceptor that catches 401 responses on protected endpoints,
 /// coordinates an atomic refresh call with the backend, updates tokens safely, and retries requests.
 ///
@@ -30,7 +38,7 @@ class AuthRefreshInterceptor extends Interceptor {
   final AuthRepository authRepository;
   final SessionExpiredCallback? onSessionExpired;
 
-  Completer<bool>? _refreshCompleter;
+  Completer<_RefreshAttemptResult>? _refreshCompleter;
 
   static const String retryExtraKey = '_authRetry';
 
@@ -90,9 +98,15 @@ class AuthRefreshInterceptor extends Interceptor {
       }
 
       // 6. Otherwise perform or join single-flight refresh
-      final refreshSuccess = await _performSingleFlightRefresh();
-      if (!refreshSuccess) {
-        return handler.next(err);
+      final refreshResult = await _performSingleFlightRefresh();
+      if (!refreshResult.isSuccess) {
+        final refreshError = refreshResult.error;
+        final propagationException = _createRefreshDioException(
+          requestOptions: err.requestOptions,
+          error: refreshError ?? err,
+          originalError: err,
+        );
+        return handler.reject(propagationException);
       }
 
       // Retry the failed request with the rotated access token
@@ -105,26 +119,42 @@ class AuthRefreshInterceptor extends Interceptor {
 
       final retryResponse = await dio.fetch(requestOptions);
       return handler.resolve(retryResponse);
-    } catch (_) {
-      return handler.next(err);
+    } catch (e) {
+      if (e is DioException) {
+        return handler.reject(e);
+      }
+      return handler.reject(
+        DioException(
+          requestOptions: err.requestOptions,
+          error: e,
+          message: e.toString(),
+        ),
+      );
     }
   }
 
-  Future<bool> _performSingleFlightRefresh() async {
+  Future<_RefreshAttemptResult> _performSingleFlightRefresh() async {
     // If a refresh is already in flight, await the existing future
     if (_refreshCompleter != null) {
       return _refreshCompleter!.future;
     }
 
-    final completer = Completer<bool>();
+    final completer = Completer<_RefreshAttemptResult>();
     _refreshCompleter = completer;
 
     try {
       final refreshToken = await secureStorage.getRefreshToken();
       if (refreshToken == null || refreshToken.trim().isEmpty) {
         await _handleDefinitiveSessionFailure();
-        completer.complete(false);
-        return false;
+        const failure = _RefreshAttemptResult.failure(
+          ApiException(
+            statusCode: 401,
+            errorCode: 'UNAUTHORIZED',
+            message: 'No active session or refresh token available.',
+          ),
+        );
+        completer.complete(failure);
+        return failure;
       }
 
       final refreshResult = await authRepository.refreshSession(
@@ -143,8 +173,15 @@ class AuthRefreshInterceptor extends Interceptor {
         }
         // Unrecoverable state: backend burned old token, but device cannot persist new one
         await _handleDefinitiveSessionFailure();
-        completer.complete(false);
-        return false;
+        const failure = _RefreshAttemptResult.failure(
+          ApiException(
+            statusCode: 401,
+            errorCode: 'STORAGE_WRITE_FAILURE',
+            message: 'Failed to securely store authentication credentials.',
+          ),
+        );
+        completer.complete(failure);
+        return failure;
       }
 
       // Publish access token in RAM only after persistence succeeded
@@ -153,8 +190,9 @@ class AuthRefreshInterceptor extends Interceptor {
         expiresInSeconds: refreshResult.expiresIn,
       );
 
-      completer.complete(true);
-      return true;
+      const success = _RefreshAttemptResult.success();
+      completer.complete(success);
+      return success;
     } catch (e) {
       if (kDebugMode) {
         debugPrint('[AuthRefreshInterceptor] Token refresh failed: $e');
@@ -172,11 +210,59 @@ class AuthRefreshInterceptor extends Interceptor {
           );
         }
       }
-      completer.complete(false);
-      return false;
+      final failure = _RefreshAttemptResult.failure(e);
+      completer.complete(failure);
+      return failure;
     } finally {
       _refreshCompleter = null;
     }
+  }
+
+  DioException _createRefreshDioException({
+    required RequestOptions requestOptions,
+    required Object error,
+    required DioException originalError,
+  }) {
+    if (error is DioException) {
+      return error.copyWith(requestOptions: requestOptions);
+    }
+    if (error is ApiException) {
+      return DioException(
+        requestOptions: requestOptions,
+        response: Response(
+          requestOptions: requestOptions,
+          statusCode: error.statusCode,
+          data: {
+            'statusCode': error.statusCode,
+            'errorCode': error.errorCode,
+            'message': error.message,
+            'errors': error.errors,
+            'path': error.path ?? requestOptions.path,
+          },
+        ),
+        type: _dioTypeFromApiException(error),
+        error: error,
+        message: error.message,
+      );
+    }
+    return DioException(
+      requestOptions: requestOptions,
+      error: error,
+      message: error.toString(),
+    );
+  }
+
+  DioExceptionType _dioTypeFromApiException(ApiException error) {
+    if (error.errorCode == 'REQUEST_TIMEOUT') {
+      return DioExceptionType.connectionTimeout;
+    }
+    if (error.errorCode == 'NETWORK_UNAVAILABLE') {
+      return DioExceptionType.connectionError;
+    }
+    if (error.statusCode != null) {
+      return DioExceptionType.badResponse;
+    }
+    return DioExceptionType.unknown;
   }
 
   Future<void> _handleDefinitiveSessionFailure() async {

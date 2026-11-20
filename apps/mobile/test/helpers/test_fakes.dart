@@ -1,3 +1,4 @@
+import 'package:google_sign_in/google_sign_in.dart';
 import 'package:lastmile_mobile/core/network/api_exception.dart';
 import 'package:lastmile_mobile/core/network/auth_token_store.dart';
 import 'package:lastmile_mobile/core/storage/secure_token_storage.dart';
@@ -6,6 +7,89 @@ import 'package:lastmile_mobile/features/auth/data/google_sign_in_service.dart';
 import 'package:lastmile_mobile/features/auth/models/auth_session.dart';
 import 'package:lastmile_mobile/features/auth/models/auth_user.dart';
 import 'package:lastmile_mobile/features/auth/state/auth_provider.dart';
+
+/// Test double for [GoogleSignInAccount].
+class FakeGoogleSignInAccount implements GoogleSignInAccount {
+  FakeGoogleSignInAccount({this.idToken = 'fake-google-id-token'});
+
+  final String idToken;
+
+  @override
+  String get email => 'test@pdeu.ac.in';
+
+  @override
+  String get id => 'google-user-123';
+
+  @override
+  String? get displayName => 'Test User';
+
+  @override
+  String? get photoUrl => null;
+
+  @override
+  GoogleSignInAuthentication get authentication =>
+      GoogleSignInAuthentication(idToken: idToken);
+
+  @override
+  GoogleSignInAuthorizationClient get authorizationClient =>
+      throw UnimplementedError();
+}
+
+/// Test double for [GoogleSignInAdapter].
+class FakeGoogleSignInAdapter implements GoogleSignInAdapter {
+  FakeGoogleSignInAdapter({
+    this.shouldFailInit = false,
+    this.shouldCancel = false,
+    this.shouldThrowOnAuth = false,
+    this.idToken = 'fake-google-id-token',
+  });
+
+  bool shouldFailInit;
+  bool shouldCancel;
+  bool shouldThrowOnAuth;
+  String idToken;
+
+  int initializeCount = 0;
+  int authenticateCount = 0;
+  int signOutCount = 0;
+  int disconnectCount = 0;
+
+  @override
+  Future<void> initialize({
+    String? clientId,
+    String? serverClientId,
+  }) async {
+    initializeCount++;
+    if (shouldFailInit) {
+      throw Exception('Google Sign-In SDK initialization failed (-1001)');
+    }
+  }
+
+  @override
+  Future<GoogleSignInAccount> authenticate() async {
+    authenticateCount++;
+    if (shouldCancel) {
+      throw GoogleSignInException(
+        code: GoogleSignInExceptionCode.canceled,
+        description: 'Sign in canceled by user',
+      );
+    }
+    if (shouldThrowOnAuth) {
+      throw Exception('Authentication failed');
+    }
+    return FakeGoogleSignInAccount(idToken: idToken);
+  }
+
+  @override
+  Future<void> signOut() async {
+    signOutCount++;
+  }
+
+  @override
+  Future<void> disconnect() async {
+    disconnectCount++;
+  }
+}
 
 /// Test double for [GoogleSignInService].
 class FakeGoogleSignInService implements GoogleSignInService {
@@ -153,16 +237,26 @@ class FakeAuthRepository implements AuthRepository {
   }
 }
 
-/// Test double for [SecureTokenStorage] that can simulate write or delete failures.
+/// Test double for [SecureTokenStorage] that can simulate read, write or delete failures.
 class FailingSecureTokenStorage extends SecureTokenStorage {
   FailingSecureTokenStorage({
     this.failOnSave = true,
     this.failOnDelete = false,
+    this.failOnRead = false,
     Map<String, String>? initialData,
   }) : super.inMemory(initialData);
 
   final bool failOnSave;
   final bool failOnDelete;
+  bool failOnRead;
+
+  @override
+  Future<String?> getRefreshToken() async {
+    if (failOnRead) {
+      throw Exception('Secure storage read operation failed (-25300 Keychain lock)');
+    }
+    return super.getRefreshToken();
+  }
 
   @override
   Future<void> saveRefreshToken(String token) async {

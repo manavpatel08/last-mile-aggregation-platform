@@ -18,28 +18,87 @@ abstract interface class GoogleSignInService {
   Future<void> disconnect();
 }
 
+/// Internal platform adapter abstracting the Google Sign-In SDK for testability
+/// and instance lifecycle management.
+abstract interface class GoogleSignInAdapter {
+  Future<void> initialize({
+    String? clientId,
+    String? serverClientId,
+  });
+
+  Future<GoogleSignInAccount> authenticate();
+
+  Future<void> signOut();
+
+  Future<void> disconnect();
+}
+
+/// Default production adapter delegating to official [GoogleSignIn.instance].
+class DefaultGoogleSignInAdapter implements GoogleSignInAdapter {
+  DefaultGoogleSignInAdapter({GoogleSignIn? plugin})
+      : _plugin = plugin ?? GoogleSignIn.instance;
+
+  final GoogleSignIn _plugin;
+
+  @override
+  Future<void> initialize({
+    String? clientId,
+    String? serverClientId,
+  }) {
+    return _plugin.initialize(
+      clientId: clientId,
+      serverClientId: serverClientId,
+    );
+  }
+
+  @override
+  Future<GoogleSignInAccount> authenticate() {
+    return _plugin.authenticate();
+  }
+
+  @override
+  Future<void> signOut() {
+    return _plugin.signOut();
+  }
+
+  @override
+  Future<void> disconnect() {
+    return _plugin.disconnect();
+  }
+}
+
 /// Concrete [GoogleSignInService] using official `google_sign_in` plugin (v7+).
 class NativeGoogleSignInService implements GoogleSignInService {
   NativeGoogleSignInService({
     required this.config,
+    GoogleSignInAdapter? adapter,
+    GoogleSignInAdapter Function()? adapterFactory,
     GoogleSignIn? googleSignIn,
-  })  : _googleSignIn = googleSignIn ?? GoogleSignIn.instance;
+  })  : _adapterFactory = adapterFactory ??
+            (() => adapter ?? DefaultGoogleSignInAdapter(plugin: googleSignIn)),
+        _adapter = adapter ??
+            (googleSignIn != null
+                ? DefaultGoogleSignInAdapter(plugin: googleSignIn)
+                : null);
 
   final AppConfig config;
-  final GoogleSignIn _googleSignIn;
+  final GoogleSignInAdapter Function() _adapterFactory;
+  GoogleSignInAdapter? _adapter;
+
   bool _initialized = false;
-  Object? _initError;
   Future<void>? _initFuture;
 
+  /// Ensures the Google Sign-In SDK is initialized before any interactive authentication.
+  ///
+  /// Concurrency:
+  /// Concurrent callers share the same [_initFuture] so initialization runs at most once.
+  ///
+  /// Retry strategy:
+  /// If initialization throws, the failed state is cleared, allowing subsequent sign-in
+  /// attempts to recreate or re-initialize the adapter without being permanently locked.
   Future<void> _ensureInitialized() async {
     if (_initialized) return;
-    if (_initError != null) {
-      throw const ApiException(
-        errorCode: 'GOOGLE_INIT_FAILED',
-        message:
-            'Google Sign-In initialization failed. Please restart the app or try again.',
-      );
-    }
+
     if (_initFuture != null) {
       await _initFuture;
       if (!_initialized) {
@@ -52,9 +111,11 @@ class NativeGoogleSignInService implements GoogleSignInService {
       return;
     }
 
-    _initFuture = _runInitialization();
+    _adapter ??= _adapterFactory();
+    final future = _runInitialization();
+    _initFuture = future;
     try {
-      await _initFuture;
+      await future;
     } finally {
       _initFuture = null;
     }
@@ -70,15 +131,15 @@ class NativeGoogleSignInService implements GoogleSignInService {
 
   Future<void> _runInitialization() async {
     try {
-      await _googleSignIn.initialize(
+      await _adapter!.initialize(
         clientId: config.googleClientIdIos,
         serverClientId: config.googleServerClientId,
       );
       _initialized = true;
-      _initError = null;
     } catch (e) {
       _initialized = false;
-      _initError = e;
+      // Invalidate the adapter on failure so subsequent attempts recreate/retry
+      _adapter = null;
       if (kDebugMode) {
         debugPrint('[GoogleSignInService] Initialize error: $e');
       }
@@ -105,7 +166,7 @@ class NativeGoogleSignInService implements GoogleSignInService {
 
     try {
       await _ensureInitialized();
-      final account = await _googleSignIn.authenticate();
+      final account = await _adapter!.authenticate();
       final idToken = account.authentication.idToken;
       if (idToken == null || idToken.trim().isEmpty) {
         throw const ApiException(
@@ -144,8 +205,8 @@ class NativeGoogleSignInService implements GoogleSignInService {
   @override
   Future<void> signOut() async {
     try {
-      await _ensureInitialized();
-      await _googleSignIn.signOut();
+      final adapter = _adapter ?? _adapterFactory();
+      await adapter.signOut();
     } catch (e) {
       if (kDebugMode) {
         debugPrint('[GoogleSignInService] Sign out error: $e');
@@ -156,8 +217,8 @@ class NativeGoogleSignInService implements GoogleSignInService {
   @override
   Future<void> disconnect() async {
     try {
-      await _ensureInitialized();
-      await _googleSignIn.disconnect();
+      final adapter = _adapter ?? _adapterFactory();
+      await adapter.disconnect();
     } catch (e) {
       if (kDebugMode) {
         debugPrint('[GoogleSignInService] Disconnect error: $e');

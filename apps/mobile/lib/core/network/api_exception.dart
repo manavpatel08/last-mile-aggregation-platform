@@ -13,6 +13,10 @@ class ApiException implements Exception {
   });
 
   factory ApiException.fromDioException(DioException exception) {
+    if (exception.error is ApiException) {
+      return exception.error as ApiException;
+    }
+
     final response = exception.response;
     final data = response?.data;
 

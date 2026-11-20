@@ -163,7 +163,7 @@ void main() {
     );
 
     test(
-      'Definitively invalid refresh token (401) clears credentials and triggers onSessionExpired',
+      'Definitively invalid refresh token (401) clears credentials, triggers onSessionExpired, and surfaces as 401 Unauthorized',
       () async {
         final tokenStore = AuthTokenStore()
           ..setToken(accessToken: 'expired-token', expiresInSeconds: 900);
@@ -195,22 +195,27 @@ void main() {
         );
         dio.interceptors.add(interceptor);
 
-        await expectLater(
-          dio.get(
+        ApiException? thrownApiError;
+        try {
+          await dio.get(
             '/users/profile',
             options: Options(headers: {'Authorization': 'Bearer expired-token'}),
-          ),
-          throwsA(isA<DioException>()),
-        );
+          );
+        } on DioException catch (e) {
+          thrownApiError = ApiException.fromDioException(e);
+        }
 
         expect(sessionExpiredFired, isTrue);
         expect(tokenStore.accessToken, isNull);
         expect(await secureStorage.getRefreshToken(), isNull);
+        expect(thrownApiError, isNotNull);
+        expect(thrownApiError!.statusCode, 401);
+        expect(thrownApiError.errorCode, 'UNAUTHORIZED');
       },
     );
 
     test(
-      'Automatic refresh during a network failure preserves the refresh token',
+      'Automatic refresh during a network failure preserves the refresh token and surfaces as network error',
       () async {
         final tokenStore = AuthTokenStore()
           ..setToken(accessToken: 'expired-token', expiresInSeconds: 900);
@@ -241,13 +246,15 @@ void main() {
         );
         dio.interceptors.add(interceptor);
 
-        await expectLater(
-          dio.get(
+        ApiException? thrownApiError;
+        try {
+          await dio.get(
             '/bookings/active',
             options: Options(headers: {'Authorization': 'Bearer expired-token'}),
-          ),
-          throwsA(isA<DioException>()),
-        );
+          );
+        } on DioException catch (e) {
+          thrownApiError = ApiException.fromDioException(e);
+        }
 
         // Network failure must NOT wipe the refresh token or expire the session!
         expect(sessionExpiredFired, isFalse);
@@ -255,11 +262,65 @@ void main() {
           await secureStorage.getRefreshToken(),
           'preserve-me-refresh-token',
         );
+        expect(thrownApiError, isNotNull);
+        expect(thrownApiError!.errorCode, 'NETWORK_UNAVAILABLE');
       },
     );
 
     test(
-      'Automatic refresh during a temporary 5xx preserves the refresh token',
+      'Automatic refresh during a network timeout surfaces as timeout error rather than 401',
+      () async {
+        final tokenStore = AuthTokenStore()
+          ..setToken(accessToken: 'expired-token', expiresInSeconds: 900);
+        final secureStorage = SecureTokenStorage.inMemory({
+          SecureTokenStorage.refreshTokenKey: 'timeout-preserved-token',
+        });
+        final repo = FakeAuthRepository(
+          refreshException: const ApiException(
+            errorCode: 'REQUEST_TIMEOUT',
+            message: 'The request timed out. Please try again.',
+          ),
+        );
+
+        bool sessionExpiredFired = false;
+        final dio = Dio();
+        dio.httpClientAdapter = _MockAdapter((options) async {
+          return _res({'statusCode': 401}, 401);
+        });
+
+        final interceptor = AuthRefreshInterceptor(
+          dio: dio,
+          tokenStore: tokenStore,
+          secureStorage: secureStorage,
+          authRepository: repo,
+          onSessionExpired: () {
+            sessionExpiredFired = true;
+          },
+        );
+        dio.interceptors.add(interceptor);
+
+        ApiException? thrownApiError;
+        try {
+          await dio.get(
+            '/bookings/active',
+            options: Options(headers: {'Authorization': 'Bearer expired-token'}),
+          );
+        } on DioException catch (e) {
+          thrownApiError = ApiException.fromDioException(e);
+        }
+
+        expect(sessionExpiredFired, isFalse);
+        expect(
+          await secureStorage.getRefreshToken(),
+          'timeout-preserved-token',
+        );
+        expect(thrownApiError, isNotNull);
+        expect(thrownApiError!.errorCode, 'REQUEST_TIMEOUT');
+      },
+    );
+
+    test(
+      'Automatic refresh during a temporary 5xx preserves the refresh token and surfaces as server error',
       () async {
         final tokenStore = AuthTokenStore()
           ..setToken(accessToken: 'expired-token', expiresInSeconds: 900);
@@ -291,13 +352,15 @@ void main() {
         );
         dio.interceptors.add(interceptor);
 
-        await expectLater(
-          dio.get(
+        ApiException? thrownApiError;
+        try {
+          await dio.get(
             '/bookings/active',
             options: Options(headers: {'Authorization': 'Bearer expired-token'}),
-          ),
-          throwsA(isA<DioException>()),
-        );
+          );
+        } on DioException catch (e) {
+          thrownApiError = ApiException.fromDioException(e);
+        }
 
         // 5xx error must NOT wipe the refresh token or trigger session expiration!
         expect(sessionExpiredFired, isFalse);
@@ -305,6 +368,9 @@ void main() {
           await secureStorage.getRefreshToken(),
           'preserve-on-503-token',
         );
+        expect(thrownApiError, isNotNull);
+        expect(thrownApiError!.statusCode, 503);
+        expect(thrownApiError.errorCode, 'SERVICE_UNAVAILABLE');
       },
     );
 

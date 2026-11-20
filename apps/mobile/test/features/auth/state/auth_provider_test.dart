@@ -278,7 +278,60 @@ void main() {
     );
 
     test(
-      'Profile retrieval failure during restore does not mark user authenticated and preserves refresh token on transient error',
+      'Secure-storage read failure preserves refresh token, skips backend refresh, sets error state, and allows retry',
+      () async {
+        final tokenStore = AuthTokenStore()
+          ..setToken(accessToken: 'stale-access-token', expiresInSeconds: 900);
+        final failingStorage = FailingSecureTokenStorage(
+          failOnRead: true,
+          failOnSave: false,
+          initialData: {
+            SecureTokenStorage.refreshTokenKey: 'stored-precious-refresh-token',
+          },
+        );
+        final repo = FakeAuthRepository(currentUser: testUser);
+        final googleService = FakeGoogleSignInService();
+
+        final provider = AuthProvider(
+          authRepository: repo,
+          googleSignInService: googleService,
+          tokenStore: tokenStore,
+          secureStorage: failingStorage,
+        );
+
+        // First attempt: Storage read throws exception
+        await provider.restoreSession();
+
+        // 1. Catches read failure explicitly and transitions to error state
+        expect(provider.status, AuthStatus.error);
+        expect(provider.isAuthenticated, isFalse);
+        expect(provider.user, isNull);
+        expect(provider.errorMessage, contains('secure storage'));
+
+        // 2. Stale in-memory token is cleared
+        expect(tokenStore.accessToken, isNull);
+
+        // 3. Backend refresh is NEVER called when token could not be read
+        expect(repo.refreshCallCount, 0);
+
+        // 4. Stored refresh token is PRESERVED (not deleted or overwritten)
+        failingStorage.failOnRead = false;
+        expect(
+          await failingStorage.getRefreshToken(),
+          'stored-precious-refresh-token',
+        );
+
+        // 5. Subsequent retry after storage issue is resolved restores session successfully!
+        await provider.restoreSession();
+        expect(provider.status, AuthStatus.authenticated);
+        expect(provider.isAuthenticated, isTrue);
+        expect(provider.user?.email, 'student@pdeu.ac.in');
+        expect(repo.refreshCallCount, 1);
+      },
+    );
+
+    test(
+      'Profile retrieval failure during restore clears in-memory access token, preserves rotated refresh token, and allows subsequent retry',
       () async {
         final tokenStore = AuthTokenStore();
         final secureStorage = SecureTokenStorage.inMemory({
@@ -286,8 +339,8 @@ void main() {
         });
         final repo = FakeAuthRepository(
           refreshResult: const RefreshSessionResult(
-            accessToken: 'active-access-token',
-            refreshToken: 'new-rotated-token',
+            accessToken: 'brand-new-rotated-access-token',
+            refreshToken: 'brand-new-rotated-refresh-token',
             expiresIn: 900,
           ),
           userException: const ApiException(
@@ -310,8 +363,30 @@ void main() {
         expect(provider.isAuthenticated, isFalse);
         expect(provider.user, isNull);
         expect(provider.status, AuthStatus.error);
-        // Stored refresh token must be preserved!
-        expect(await secureStorage.getRefreshToken(), 'new-rotated-token');
+
+        // High Priority 2: In-memory access token MUST be cleared so stale token cannot be used!
+        expect(tokenStore.accessToken, isNull);
+
+        // Rotated refresh token MUST remain safely persisted in secure storage
+        expect(
+          await secureStorage.getRefreshToken(),
+          'brand-new-rotated-refresh-token',
+        );
+
+        // Subsequent restoration retry after network is back succeeds without signing in again!
+        repo.userException = null;
+        repo.currentUser = testUser;
+        repo.refreshResult = const RefreshSessionResult(
+          accessToken: 'retried-access-token',
+          refreshToken: 'retried-refresh-token',
+          expiresIn: 900,
+        );
+
+        await provider.restoreSession();
+        expect(provider.status, AuthStatus.authenticated);
+        expect(provider.isAuthenticated, isTrue);
+        expect(tokenStore.accessToken, 'retried-access-token');
+        expect(await secureStorage.getRefreshToken(), 'retried-refresh-token');
       },
     );
 

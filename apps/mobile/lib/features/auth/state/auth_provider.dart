@@ -69,7 +69,24 @@ class AuthProvider extends ChangeNotifier {
         notifyListeners();
       }
 
-      final refreshToken = await secureStorage.getRefreshToken();
+      final String? refreshToken;
+      try {
+        refreshToken = await secureStorage.getRefreshToken();
+      } catch (storageError) {
+        if (kDebugMode) {
+          debugPrint(
+            '[AuthProvider] Failed to read refresh token from secure storage: $storageError',
+          );
+        }
+        tokenStore.clear();
+        _user = null;
+        _status = AuthStatus.error;
+        _errorMessage =
+            'Unable to access secure storage. Please check device security settings and try again.';
+        notifyListeners();
+        return;
+      }
+
       if (refreshToken == null || refreshToken.trim().isEmpty) {
         _status = AuthStatus.unauthenticated;
         _errorMessage = null;
@@ -152,8 +169,9 @@ class AuthProvider extends ChangeNotifier {
             '[AuthProvider] Profile fetch failed during restore: $userError',
           );
         }
-        // Requirements 1 & 3: Never clear stored refresh token for profile retrieval failures (403, 401, 5xx).
-        // Profile retrieval failure preserves the valid rotated refresh token so the user can retry.
+        // Requirements: Clear in-memory access token so stale token cannot be used.
+        // Stored rotated refresh token remains persisted in secure storage.
+        tokenStore.clear();
         _user = null;
         _status = AuthStatus.error;
         _errorMessage = userError is ApiException

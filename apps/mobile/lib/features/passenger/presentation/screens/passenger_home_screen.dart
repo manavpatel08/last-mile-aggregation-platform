@@ -105,6 +105,72 @@ class PassengerHomeScreen extends StatelessWidget {
                 ),
               ),
             ),
+            if (user?.driverProfile == null) ...[
+              const SizedBox(height: 16),
+              Card(
+                elevation: 0,
+                color: AppColors.driverContainer.withValues(alpha: 0.6),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(16),
+                  side: BorderSide(
+                    color: AppColors.driverAccent.withValues(alpha: 0.3),
+                  ),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Row(
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.all(10),
+                        decoration: BoxDecoration(
+                          color: AppColors.driverAccent.withValues(alpha: 0.15),
+                          shape: BoxShape.circle,
+                        ),
+                        child: const Icon(
+                          Icons.drive_eta_outlined,
+                          color: AppColors.driverAccent,
+                          size: 28,
+                        ),
+                      ),
+                      const SizedBox(width: 14),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'Become a Driver',
+                              style: textTheme.titleMedium?.copyWith(
+                                fontWeight: FontWeight.bold,
+                                color: AppColors.onDriverContainer,
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              'Register your vehicle and start earning with campus rides.',
+                              style: textTheme.bodySmall?.copyWith(
+                                color: AppColors.onDriverContainer,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      FilledButton(
+                        key: const Key('become_driver_button'),
+                        style: FilledButton.styleFrom(
+                          backgroundColor: AppColors.driverAccent,
+                          foregroundColor: Colors.white,
+                        ),
+                        onPressed: () {
+                          context.push(AppRoutes.driverOnboarding);
+                        },
+                        child: const Text('Apply'),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
             const SizedBox(height: 20),
             Text('Planned Passenger Modules', style: textTheme.titleMedium),
             const SizedBox(height: 12),

@@ -7,6 +7,8 @@ import 'package:lastmile_mobile/features/auth/data/google_sign_in_service.dart';
 import 'package:lastmile_mobile/features/auth/models/auth_session.dart';
 import 'package:lastmile_mobile/features/auth/models/auth_user.dart';
 import 'package:lastmile_mobile/features/auth/state/auth_provider.dart';
+import 'package:lastmile_mobile/features/driver/data/driver_repository.dart';
+import 'package:lastmile_mobile/features/driver/models/driver_onboarding_request.dart';
 
 /// Test double for [GoogleSignInAccount].
 class FakeGoogleSignInAccount implements GoogleSignInAccount {
@@ -233,6 +235,56 @@ class FakeAuthRepository implements AuthRepository {
           fullName: 'Test User',
           role: 'PASSENGER',
           roles: ['PASSENGER'],
+        );
+  }
+}
+
+/// Test double for [DriverRepository].
+class FakeDriverRepository implements DriverRepository {
+  FakeDriverRepository({
+    this.response,
+    this.shouldThrow = false,
+    this.exceptionToThrow,
+  });
+
+  DriverOnboardingResponse? response;
+  bool shouldThrow;
+  Exception? exceptionToThrow;
+  DriverOnboardingRequest? lastRequest;
+  int onboardCallCount = 0;
+
+  @override
+  Future<DriverOnboardingResponse> onboardDriver(
+    DriverOnboardingRequest request,
+  ) async {
+    onboardCallCount++;
+    lastRequest = request;
+    if (exceptionToThrow != null) {
+      throw exceptionToThrow!;
+    }
+    if (shouldThrow) {
+      throw const ApiException(
+        statusCode: 409,
+        errorCode: 'CONFLICT',
+        message: 'Driver profile already registered for this user',
+      );
+    }
+    return response ??
+        DriverOnboardingResponse(
+          driverProfile: DriverProfile(
+            id: 'dp-fake-123',
+            licenseNumber: request.licenseNumber,
+            verificationStatus: 'PENDING',
+            operationalStatus: 'OFFLINE',
+            isOnline: false,
+          ),
+          vehicle: {
+            'registrationNumber': request.vehicle.registrationNumber,
+            'vehicleType': request.vehicle.vehicleType,
+            'passengerCapacity': request.vehicle.passengerCapacity,
+            'makeModel': request.vehicle.makeModel,
+          },
+          message: 'Driver onboarding application submitted successfully',
         );
   }
 }

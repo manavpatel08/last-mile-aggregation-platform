@@ -7,6 +7,7 @@ abstract final class AppRoutes {
   static const String roleSelection = '/role-selection';
   static const String passengerHome = '/passenger';
   static const String driverHome = '/driver';
+  static const String driverOnboarding = '/driver/onboard';
   static const String adminInfo = '/admin-info';
 
   static const String splashName = 'splash';
@@ -14,6 +15,7 @@ abstract final class AppRoutes {
   static const String roleSelectionName = 'role-selection';
   static const String passengerHomeName = 'passenger-home';
   static const String driverHomeName = 'driver-home';
+  static const String driverOnboardingName = 'driver-onboarding';
   static const String adminInfoName = 'admin-info';
 
   static String initialLocationForMode(AppMode mode) {

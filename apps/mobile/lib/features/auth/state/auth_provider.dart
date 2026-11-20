@@ -284,16 +284,38 @@ class AuthProvider extends ChangeNotifier {
   }
 
   /// Re-fetches the current user profile from `/users/me`.
-  Future<void> refreshProfile() async {
-    if (!isAuthenticated) return;
+  /// Returns `true` if profile retrieval succeeded, `false` otherwise.
+  Future<bool> refreshProfile() async {
+    if (!isAuthenticated) return false;
     try {
       final updatedProfile = await authRepository.getCurrentUser();
       _user = updatedProfile;
       notifyListeners();
+      return true;
     } catch (e) {
       if (kDebugMode) {
         debugPrint('[AuthProvider] Refresh profile error: $e');
       }
+      return false;
+    }
+  }
+
+  /// Updates or sets the current user's driver profile and adds DRIVER role.
+  /// Used to ensure client state consistency if backend onboarding succeeded
+  /// but subsequent profile refresh encountered a transient error.
+  void updateDriverProfile(DriverProfile profile) {
+    if (_user != null) {
+      final currentRoles = List<String>.from(_user!.roles);
+      if (!currentRoles.contains('DRIVER')) {
+        currentRoles.add('DRIVER');
+      }
+      _user = _user!.copyWith(
+        role: _user!.role == 'PASSENGER' ? 'DRIVER' : _user!.role,
+        roles: currentRoles,
+        driverProfile: profile,
+        driverVerificationStatus: profile.verificationStatus,
+      );
+      notifyListeners();
     }
   }
 

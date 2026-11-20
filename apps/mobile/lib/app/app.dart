@@ -12,7 +12,10 @@ import '../features/auth/data/api_auth_repository.dart';
 import '../features/auth/data/auth_repository.dart';
 import '../features/auth/data/google_sign_in_service.dart';
 import '../features/auth/state/auth_provider.dart';
+import '../features/driver/data/api_driver_repository.dart';
+import '../features/driver/data/driver_repository.dart';
 import '../features/driver/state/driver_home_provider.dart';
+import '../features/driver/state/driver_onboarding_provider.dart';
 import '../features/passenger/state/passenger_home_provider.dart';
 import 'router/app_router.dart';
 import 'state/app_mode_provider.dart';
@@ -30,6 +33,7 @@ class LastMileApp extends StatefulWidget {
     this.tokenStore,
     this.authRepository,
     this.googleSignInService,
+    this.driverRepository,
   });
 
   final AppConfig config;
@@ -40,6 +44,7 @@ class LastMileApp extends StatefulWidget {
   final AuthTokenStore? tokenStore;
   final AuthRepository? authRepository;
   final GoogleSignInService? googleSignInService;
+  final DriverRepository? driverRepository;
 
   @override
   State<LastMileApp> createState() => _LastMileAppState();
@@ -52,6 +57,7 @@ class _LastMileAppState extends State<LastMileApp> {
   late final SecureTokenStorage _secureStorage;
   late final AuthRepository _authRepository;
   late final GoogleSignInService _googleSignInService;
+  late final DriverRepository _driverRepository;
   late final AuthProvider _authProvider;
   late final bool _ownsAuthProvider;
   late final ApiClient _apiClient;
@@ -98,6 +104,9 @@ class _LastMileAppState extends State<LastMileApp> {
       _apiClient.addInterceptor(refreshInterceptor);
     }
 
+    _driverRepository = widget.driverRepository ??
+        ApiDriverRepository(apiClient: _apiClient);
+
     _router = AppRouter.createRouter(
       appModeProvider: _appModeProvider,
       authProvider: _authProvider,
@@ -126,6 +135,7 @@ class _LastMileAppState extends State<LastMileApp> {
         Provider<AuthRepository>.value(value: _authRepository),
         Provider<GoogleSignInService>.value(value: _googleSignInService),
         Provider<ApiClient>.value(value: _apiClient),
+        Provider<DriverRepository>.value(value: _driverRepository),
         ChangeNotifierProvider<AppModeProvider>.value(value: _appModeProvider),
         ChangeNotifierProvider<AuthProvider>.value(value: _authProvider),
         ChangeNotifierProvider<PassengerHomeProvider>(
@@ -133,6 +143,11 @@ class _LastMileAppState extends State<LastMileApp> {
         ),
         ChangeNotifierProvider<DriverHomeProvider>(
           create: (_) => DriverHomeProvider(),
+        ),
+        ChangeNotifierProvider<DriverOnboardingProvider>(
+          create: (_) => DriverOnboardingProvider(
+            driverRepository: _driverRepository,
+          ),
         ),
       ],
       child: MaterialApp.router(

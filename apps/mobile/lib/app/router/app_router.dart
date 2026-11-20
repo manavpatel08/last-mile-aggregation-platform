@@ -6,6 +6,7 @@ import '../../features/auth/presentation/screens/login_screen.dart';
 import '../../features/auth/presentation/screens/splash_screen.dart';
 import '../../features/auth/state/auth_provider.dart';
 import '../../features/driver/presentation/screens/driver_home_screen.dart';
+import '../../features/driver/presentation/screens/driver_onboarding_screen.dart';
 import '../../features/passenger/presentation/screens/passenger_home_screen.dart';
 import '../../features/role_selection/presentation/screens/role_selection_screen.dart';
 import '../state/app_mode_provider.dart';
@@ -79,6 +80,12 @@ abstract final class AppRouter {
           return AppRoutes.passengerHome;
         }
 
+        // Driver onboarding guard: users with an existing driver profile cannot access onboarding
+        if (matchedPath == AppRoutes.driverOnboarding &&
+            user.driverProfile != null) {
+          return AppRoutes.driverHome;
+        }
+
         // Passenger route guard: non-passengers cannot access passenger home
         if (matchedPath == AppRoutes.passengerHome &&
             !user.isPassenger &&
@@ -113,6 +120,11 @@ abstract final class AppRouter {
           path: AppRoutes.driverHome,
           name: AppRoutes.driverHomeName,
           builder: (context, state) => const DriverHomeScreen(),
+        ),
+        GoRoute(
+          path: AppRoutes.driverOnboarding,
+          name: AppRoutes.driverOnboardingName,
+          builder: (context, state) => const DriverOnboardingScreen(),
         ),
         GoRoute(
           path: AppRoutes.adminInfo,

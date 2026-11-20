@@ -145,6 +145,7 @@ void main() {
 
         expect(find.text('Passenger Home'), findsOneWidget);
         expect(find.text('Passenger Workspace'), findsOneWidget);
+        expect(find.byKey(const Key('become_driver_button')), findsNothing);
 
         await tester.tap(find.byKey(const Key('switch_mode_button')));
         await tester.pumpAndSettle();
@@ -229,6 +230,7 @@ void main() {
 
         expect(find.text('Passenger Home'), findsOneWidget);
         expect(find.text('Passenger Workspace'), findsOneWidget);
+        expect(find.byKey(const Key('become_driver_button')), findsOneWidget);
       },
     );
 

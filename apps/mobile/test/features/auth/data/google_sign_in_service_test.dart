@@ -24,15 +24,17 @@ void main() {
           adapter: adapter,
         );
 
-        // When initialization fails, signIn throws GOOGLE_INIT_FAILED
+        // When initialization fails, signIn throws GOOGLE_INIT_FAILED with restart instruction
         await expectLater(
           service.signIn(),
           throwsA(
-            isA<ApiException>().having(
-              (e) => e.errorCode,
-              'errorCode',
-              'GOOGLE_INIT_FAILED',
-            ),
+            isA<ApiException>()
+                .having((e) => e.errorCode, 'errorCode', 'GOOGLE_INIT_FAILED')
+                .having(
+                  (e) => e.message,
+                  'message',
+                  contains('restart the app'),
+                ),
           ),
         );
 
@@ -43,62 +45,79 @@ void main() {
     );
 
     test(
-      'NativeGoogleSignInService allows successful retry after initialization failure',
+      'NativeGoogleSignInService a second sign-in attempt does not call initialize again and returns cached failure',
       () async {
         final adapter = FakeGoogleSignInAdapter(shouldFailInit: true);
         final service = NativeGoogleSignInService(
           config: testConfig,
-          adapterFactory: () => adapter,
+          adapter: adapter,
         );
 
         // First attempt fails during initialization
         await expectLater(
           service.signIn(),
           throwsA(
-            isA<ApiException>().having(
-              (e) => e.errorCode,
-              'errorCode',
-              'GOOGLE_INIT_FAILED',
-            ),
+            isA<ApiException>()
+                .having((e) => e.errorCode, 'errorCode', 'GOOGLE_INIT_FAILED')
+                .having(
+                  (e) => e.message,
+                  'message',
+                  contains('restart the app'),
+                ),
           ),
         );
         expect(adapter.initializeCount, 1);
         expect(adapter.authenticateCount, 0);
 
-        // Storage or platform issue resolves; retry initialization
+        // Even if adapter would theoretically not fail, service must not re-call initialize()
         adapter.shouldFailInit = false;
-        adapter.idToken = 'retried-valid-google-id-token';
 
-        final result = await service.signIn();
-
-        // Successful initialization and authentication on retry
-        expect(result, 'retried-valid-google-id-token');
-        expect(adapter.initializeCount, 2);
-        expect(adapter.authenticateCount, 1);
+        await expectLater(
+          service.signIn(),
+          throwsA(
+            isA<ApiException>()
+                .having((e) => e.errorCode, 'errorCode', 'GOOGLE_INIT_FAILED')
+                .having(
+                  (e) => e.message,
+                  'message',
+                  contains('restart the app'),
+                ),
+          ),
+        );
+        // initialize() was attempted exactly once across both calls
+        expect(adapter.initializeCount, 1);
+        expect(adapter.authenticateCount, 0);
       },
     );
 
     test(
-      'NativeGoogleSignInService successful initialization and authentication returns ID token',
+      'NativeGoogleSignInService successful initialization supports subsequent sign-in calls without reinitialization',
       () async {
         final adapter = FakeGoogleSignInAdapter(
-          idToken: 'successful-google-id-token',
+          idToken: 'first-google-id-token',
         );
         final service = NativeGoogleSignInService(
           config: testConfig,
           adapter: adapter,
         );
 
-        final result = await service.signIn();
-
-        expect(result, 'successful-google-id-token');
+        final firstResult = await service.signIn();
+        expect(firstResult, 'first-google-id-token');
         expect(adapter.initializeCount, 1);
         expect(adapter.authenticateCount, 1);
+
+        // Subsequent sign-in call in the same runtime
+        adapter.idToken = 'second-google-id-token';
+        final secondResult = await service.signIn();
+        expect(secondResult, 'second-google-id-token');
+        // Initialize must NOT be called again; authenticate is called
+        expect(adapter.initializeCount, 1);
+        expect(adapter.authenticateCount, 2);
       },
     );
 
     test(
-      'NativeGoogleSignInService concurrent signIn calls share single initialization',
+      'NativeGoogleSignInService concurrent signIn calls share one initialization attempt',
       () async {
         final adapter = FakeGoogleSignInAdapter(
           idToken: 'shared-init-id-token',
@@ -117,6 +136,41 @@ void main() {
         // Initialization runs only once
         expect(adapter.initializeCount, 1);
         expect(adapter.authenticateCount, 2);
+      },
+    );
+
+    test(
+      'NativeGoogleSignInService concurrent signIn calls share failed initialization attempt',
+      () async {
+        final adapter = FakeGoogleSignInAdapter(shouldFailInit: true);
+        final service = NativeGoogleSignInService(
+          config: testConfig,
+          adapter: adapter,
+        );
+
+        final futures = [
+          service.signIn(),
+          service.signIn(),
+        ];
+
+        for (final future in futures) {
+          await expectLater(
+            future,
+            throwsA(
+              isA<ApiException>()
+                  .having((e) => e.errorCode, 'errorCode', 'GOOGLE_INIT_FAILED')
+                  .having(
+                    (e) => e.message,
+                    'message',
+                    contains('restart the app'),
+                  ),
+            ),
+          );
+        }
+
+        // Initialize was called exactly once despite concurrent callers
+        expect(adapter.initializeCount, 1);
+        expect(adapter.authenticateCount, 0);
       },
     );
 

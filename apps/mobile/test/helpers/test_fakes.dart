@@ -114,7 +114,7 @@ class FakeGoogleSignInService implements GoogleSignInService {
       throw const ApiException(
         errorCode: 'GOOGLE_INIT_FAILED',
         message:
-            'Google Sign-In initialization failed. Please restart the app or try again.',
+            'Google Sign-In initialization failed. Please restart the app.',
       );
     }
     authenticateCallCount++;

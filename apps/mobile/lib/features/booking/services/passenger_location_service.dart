@@ -93,7 +93,13 @@ class FakePassengerLocationService implements PassengerLocationService {
   });
 
   LocationResult initialResult;
+  Future<LocationResult> Function()? onGetCurrentLocation;
 
   @override
-  Future<LocationResult> getCurrentLocation() async => initialResult;
+  Future<LocationResult> getCurrentLocation() async {
+    if (onGetCurrentLocation != null) {
+      return onGetCurrentLocation!();
+    }
+    return initialResult;
+  }
 }

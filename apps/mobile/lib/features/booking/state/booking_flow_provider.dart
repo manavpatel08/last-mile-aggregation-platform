@@ -41,6 +41,7 @@ class BookingFlowProvider extends ChangeNotifier {
   PickupValidationResult? _pickupValidation;
   bool _isValidatingPickup = false;
   String? _pickupValidationError;
+  int _pickupValidationRequestId = 0;
 
   // Selected destination
   LatLng? _selectedDestination;
@@ -125,6 +126,7 @@ class BookingFlowProvider extends ChangeNotifier {
       // In retry mode, the immutable snapshot is pending and ready to retry
       return true;
     }
+    if (_isAcquiringLocation || _isValidatingPickup) return false;
     return _fareQuote != null &&
         !_isQuoteExpired &&
         _upfrontConsentAgreed &&
@@ -168,6 +170,8 @@ class BookingFlowProvider extends ChangeNotifier {
     _selectedPickupPoint = point;
     _pickupValidation = null;
     _pickupValidationError = null;
+    _pickupValidationRequestId++;
+    _isValidatingPickup = false;
     if (_passengerLocation != null) {
       validatePickupLocation();
     }
@@ -182,6 +186,11 @@ class BookingFlowProvider extends ChangeNotifier {
     _isAcquiringLocation = true;
     _locationErrorMessage = null;
     _pickupValidationError = null;
+    // Invalidate previous pickup validation immediately so old success cannot
+    // authorize newly acquired coordinates during or after GPS acquisition.
+    _pickupValidation = null;
+    _pickupValidationRequestId++;
+    _isValidatingPickup = false;
     notifyListeners();
 
     try {
@@ -196,6 +205,8 @@ class BookingFlowProvider extends ChangeNotifier {
         // Never fabricate fallback coordinates on failure: keep passenger location null
         _passengerLocation = null;
         _pickupValidation = null;
+        _pickupValidationRequestId++;
+        _isValidatingPickup = false;
         _locationErrorMessage =
             result.errorMessage ?? 'Unable to acquire location.';
         _clearQuote();
@@ -203,6 +214,8 @@ class BookingFlowProvider extends ChangeNotifier {
     } catch (e) {
       _passengerLocation = null;
       _pickupValidation = null;
+      _pickupValidationRequestId++;
+      _isValidatingPickup = false;
       _locationErrorMessage = 'Location acquisition error: $e';
       _clearQuote();
     } finally {
@@ -217,10 +230,12 @@ class BookingFlowProvider extends ChangeNotifier {
     _passengerLocation = location;
     _locationErrorMessage = null;
     _pickupValidationError = null;
+    _pickupValidation = null;
+    _pickupValidationRequestId++;
+    _isValidatingPickup = false;
     if (location != null) {
       validatePickupLocation();
     } else {
-      _pickupValidation = null;
       _clearQuote();
     }
     notifyListeners();
@@ -231,9 +246,14 @@ class BookingFlowProvider extends ChangeNotifier {
     if (_selectedPickupPoint == null || _passengerLocation == null) {
       _pickupValidation = null;
       _pickupValidationError = null;
+      _isValidatingPickup = false;
       notifyListeners();
       return;
     }
+
+    final targetPickupPointId = _selectedPickupPoint!.id;
+    final targetLocation = _passengerLocation!;
+    final requestId = ++_pickupValidationRequestId;
 
     _isValidatingPickup = true;
     _pickupValidationError = null;
@@ -241,15 +261,31 @@ class BookingFlowProvider extends ChangeNotifier {
 
     try {
       final result = await bookingRepository.validatePickup(
-        pickupPointId: _selectedPickupPoint!.id,
-        latitude: _passengerLocation!.latitude,
-        longitude: _passengerLocation!.longitude,
+        pickupPointId: targetPickupPointId,
+        latitude: targetLocation.latitude,
+        longitude: targetLocation.longitude,
       );
+
+      // Protect against stale asynchronous validation results:
+      // Ignore if a newer validation request has been started, or if the
+      // currently selected pickup point or coordinates have changed.
+      if (requestId != _pickupValidationRequestId ||
+          _selectedPickupPoint?.id != targetPickupPointId ||
+          _passengerLocation != targetLocation) {
+        return;
+      }
+
       _pickupValidation = result;
+      _pickupValidationError = null;
       if (!result.isValid) {
         _clearQuote();
       }
     } catch (e) {
+      if (requestId != _pickupValidationRequestId ||
+          _selectedPickupPoint?.id != targetPickupPointId ||
+          _passengerLocation != targetLocation) {
+        return;
+      }
       // Fail closed when validation endpoint fails or returns an error
       _pickupValidation = null;
       _pickupValidationError = e is ApiException
@@ -257,8 +293,12 @@ class BookingFlowProvider extends ChangeNotifier {
           : 'Failed to validate pickup proximity: ${e.toString()}';
       _clearQuote();
     } finally {
-      _isValidatingPickup = false;
-      notifyListeners();
+      // Ensure an older validation request cannot incorrectly set
+      // _isValidatingPickup to false while a newer validation is still running.
+      if (requestId == _pickupValidationRequestId) {
+        _isValidatingPickup = false;
+        notifyListeners();
+      }
     }
   }
 
@@ -379,10 +419,21 @@ class BookingFlowProvider extends ChangeNotifier {
       idempotencyKey = _currentIdempotencyKey!;
     } else {
       // FIRST ATTEMPT: Validate preconditions and save immutable request snapshot
-      if (!canSubmitBooking) return false;
+      if (_isAcquiringLocation || _isValidatingPickup) {
+        _submissionError =
+            'Please wait for pickup location and geofence validation to complete.';
+        notifyListeners();
+        return false;
+      }
       if (_passengerLocation == null || _pickupValidation?.isValid != true) {
         _submissionError =
             'A verified pickup location within the 150m geofence is required.';
+        notifyListeners();
+        return false;
+      }
+      if (!canSubmitBooking) {
+        _submissionError =
+            'Please verify your booking details, upfront consent, and fare quote.';
         notifyListeners();
         return false;
       }

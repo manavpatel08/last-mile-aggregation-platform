@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:lastmile_mobile/core/network/api_exception.dart';
@@ -42,6 +44,12 @@ class _MockBookingRepository implements BookingRepository {
     allowedRadiusMeters: 150.0,
   );
 
+  Future<PickupValidationResult> Function(
+    String pickupPointId,
+    double latitude,
+    double longitude,
+  )? onValidatePickup;
+
   FareQuote? mockFareQuote;
   BookingResponse? mockCreatedBooking;
   BookingResponse? mockActiveBooking;
@@ -81,6 +89,9 @@ class _MockBookingRepository implements BookingRepository {
     required double longitude,
   }) async {
     if (errorToThrow != null) throw errorToThrow!;
+    if (onValidatePickup != null) {
+      return onValidatePickup!(pickupPointId, latitude, longitude);
+    }
     return mockPickupValidation;
   }
 
@@ -301,6 +312,162 @@ void main() {
           originalSnapshot.passengerPickupLocation.latitude);
       expect(repository.lastBookingRequest!.passengerPickupLocation.longitude,
           originalSnapshot.passengerPickupLocation.longitude);
+    });
+
+    test('existing valid geofence followed by GPS refresh: submission remains disabled until new coordinates are validated',
+        () async {
+      await provider.loadInitialData();
+      await provider.selectDestination(const LatLng(23.1885, 72.6288));
+      await provider.requestFareQuote();
+      provider.setUpfrontConsentAgreed(true);
+
+      // Initially valid and ready to submit
+      expect(provider.canSubmitBooking, isTrue);
+
+      final gpsCompleter = Completer<LocationResult>();
+      locationService.onGetCurrentLocation = () => gpsCompleter.future;
+
+      // Start GPS refresh
+      final refreshFuture = provider.refreshPassengerLocation();
+
+      // Invariant 1: Invalidate previous pickup validation immediately
+      expect(provider.pickupValidation, isNull);
+      expect(provider.isAcquiringLocation, isTrue);
+      // Invariant 2 & 3: Submission remains strictly disabled
+      expect(provider.canSubmitBooking, isFalse);
+
+      final submitAttempt = await provider.submitBooking();
+      expect(submitAttempt, isFalse);
+      expect(provider.submissionError, contains('Please wait'));
+
+      // Now complete GPS with valid coordinates
+      gpsCompleter.complete(
+        const LocationResult.success(latitude: 23.1550, longitude: 72.6668),
+      );
+      await refreshFuture;
+
+      // After validation completes, submission is re-enabled
+      expect(provider.canSubmitBooking, isTrue);
+    });
+
+    test('new GPS coordinate outside the geofence: old successful validation cannot authorize submission',
+        () async {
+      await provider.loadInitialData();
+      await provider.selectDestination(const LatLng(23.1885, 72.6288));
+      await provider.requestFareQuote();
+      provider.setUpfrontConsentAgreed(true);
+
+      expect(provider.canSubmitBooking, isTrue);
+
+      // Now GPS acquires new coordinate far outside geofence
+      locationService.initialResult = const LocationResult.success(
+        latitude: 23.3500,
+        longitude: 72.8500,
+      );
+      repository.mockPickupValidation = const PickupValidationResult(
+        isValid: false,
+        distanceMeters: 25000.0,
+        allowedRadiusMeters: 150.0,
+      );
+
+      await provider.refreshPassengerLocation();
+
+      // Old successful validation must not authorize new coordinates
+      expect(provider.pickupValidation?.isValid, isFalse);
+      expect(provider.canSubmitBooking, isFalse);
+
+      final booked = await provider.submitBooking();
+      expect(booked, isFalse);
+      expect(provider.submissionError, contains('A verified pickup location'));
+    });
+
+    test('two pickup validation requests completing out of order: only the latest matching request can update state',
+        () async {
+      await provider.loadInitialData();
+
+      final completer1 = Completer<PickupValidationResult>();
+      final completer2 = Completer<PickupValidationResult>();
+      int callCount = 0;
+
+      repository.onValidatePickup = (pointId, lat, lng) {
+        callCount++;
+        if (callCount == 1) {
+          return completer1.future;
+        } else {
+          return completer2.future;
+        }
+      };
+
+      // Request 1: Location A (inside geofence)
+      provider.setPassengerLocation(const LatLng(23.1550, 72.6668));
+      expect(provider.isValidatingPickup, isTrue);
+
+      // Request 2: Location B (outside geofence)
+      provider.setPassengerLocation(const LatLng(23.3000, 72.8000));
+      expect(provider.isValidatingPickup, isTrue);
+
+      // Request 2 completes FIRST with invalid geofence
+      completer2.complete(
+        const PickupValidationResult(
+          isValid: false,
+          distanceMeters: 15000.0,
+          allowedRadiusMeters: 150.0,
+        ),
+      );
+      await Future<void>.delayed(Duration.zero);
+
+      // State is updated with Request 2
+      expect(provider.pickupValidation?.isValid, isFalse);
+      expect(provider.pickupValidation?.distanceMeters, 15000.0);
+      expect(provider.isValidatingPickup, isFalse);
+
+      // Request 1 completes LATER with valid geofence
+      completer1.complete(
+        const PickupValidationResult(
+          isValid: true,
+          distanceMeters: 10.0,
+          allowedRadiusMeters: 150.0,
+        ),
+      );
+      await Future<void>.delayed(Duration.zero);
+
+      // Invariant: Stale Request 1 MUST NOT overwrite newer Request 2!
+      expect(provider.pickupValidation?.isValid, isFalse);
+      expect(provider.pickupValidation?.distanceMeters, 15000.0);
+      expect(provider.isValidatingPickup, isFalse);
+    });
+
+    test('submit called directly during validation must fail', () async {
+      await provider.loadInitialData();
+      await provider.selectDestination(const LatLng(23.1885, 72.6288));
+      await provider.requestFareQuote();
+      provider.setUpfrontConsentAgreed(true);
+
+      final validationCompleter = Completer<PickupValidationResult>();
+      repository.onValidatePickup = (pointId, lat, lng) => validationCompleter.future;
+
+      // Trigger pickup validation
+      final validationFuture = provider.validatePickupLocation();
+      expect(provider.isValidatingPickup, isTrue);
+      expect(provider.canSubmitBooking, isFalse);
+
+      // Attempt submit while validating
+      final submitSuccess = await provider.submitBooking();
+      expect(submitSuccess, isFalse);
+      expect(provider.submissionError,
+          contains('Please wait for pickup location and geofence validation to complete.'));
+      expect(repository.createBookingCalls, 0);
+
+      // Clean up validation
+      validationCompleter.complete(
+        const PickupValidationResult(
+          isValid: true,
+          distanceMeters: 20.0,
+          allowedRadiusMeters: 150.0,
+        ),
+      );
+      await validationFuture;
+      expect(provider.isValidatingPickup, isFalse);
     });
 
     test('loadInitialData populates pickup zones and selects default hub',

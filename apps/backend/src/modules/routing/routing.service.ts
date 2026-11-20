@@ -556,18 +556,42 @@ export class RoutingService {
     origin: { latitude: number; longitude: number },
     destination: { latitude: number; longitude: number },
   ): Promise<RouteResult> {
-    if (!this.isValidCoordinate(origin) || !this.isValidCoordinate(destination)) {
-      this.logger.warn('Invalid coordinates provided to getRoute; returning fallback');
-      return this.calculateGeodesicFallback(origin, destination);
+    return this.getMultiStopRoute([origin, destination]);
+  }
+
+  /**
+   * Request multi-stop road route through ordered waypoints.
+   * Calls OSRM /route/v1 with 1500ms timeout; gracefully falls back to
+   * geodesic road-network approximation if OSRM is unavailable.
+   */
+  async getMultiStopRoute(
+    waypoints: Array<{ latitude: number; longitude: number }>,
+  ): Promise<RouteResult> {
+    if (!Array.isArray(waypoints) || waypoints.length < 2) {
+      this.logger.warn('Insufficient waypoints provided to getMultiStopRoute');
+      return {
+        distanceMeters: 0,
+        durationSec: 0,
+        geometry: null,
+        source: 'FALLBACK',
+        isFallback: true,
+      };
+    }
+
+    for (const pt of waypoints) {
+      if (!this.isValidCoordinate(pt)) {
+        this.logger.warn('Invalid coordinate in waypoints for getMultiStopRoute');
+        return this.calculateGeodesicFallback(waypoints[0], waypoints[waypoints.length - 1]);
+      }
     }
 
     const decision = await this.evaluateBreaker();
     if (!decision.allowed) {
-      return this.calculateGeodesicFallback(origin, destination);
+      return this.calculateGeodesicFallback(waypoints[0], waypoints[waypoints.length - 1]);
     }
 
-    const coords = `${origin.longitude},${origin.latitude};${destination.longitude},${destination.latitude}`;
-    const url = `${this.osrmUrl}/route/v1/driving/${coords}?overview=full&geometries=geojson`;
+    const coords = waypoints.map((pt) => `${pt.longitude},${pt.latitude}`).join(';');
+    const url = `${this.osrmUrl}/route/v1/driving/${coords}?overview=full&geometries=geojson&steps=true`;
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 1500);
@@ -624,7 +648,7 @@ export class RoutingService {
     this.logger.warn(
       'OSRM routing unavailable; geodesic fallback calculation utilized.',
     );
-    return this.calculateGeodesicFallback(origin, destination);
+    return this.calculateGeodesicFallback(waypoints[0], waypoints[waypoints.length - 1]);
   }
 
   /**

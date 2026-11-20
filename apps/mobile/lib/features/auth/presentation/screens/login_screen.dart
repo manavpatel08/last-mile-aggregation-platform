@@ -93,6 +93,13 @@ class LoginScreen extends StatelessWidget {
                               ),
                             ),
                           ),
+                          if (authProvider.status == AuthStatus.error) ...[
+                            TextButton(
+                              key: const Key('restore_session_retry_button'),
+                              onPressed: () => authProvider.restoreSession(),
+                              child: const Text('Retry'),
+                            ),
+                          ],
                           IconButton(
                             icon: const Icon(Icons.close, size: 16),
                             color: AppColors.error,

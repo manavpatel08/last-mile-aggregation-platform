@@ -5,6 +5,7 @@ import '../../features/auth/presentation/screens/admin_info_screen.dart';
 import '../../features/auth/presentation/screens/login_screen.dart';
 import '../../features/auth/presentation/screens/splash_screen.dart';
 import '../../features/auth/state/auth_provider.dart';
+import '../../features/booking/presentation/screens/booking_flow_screen.dart';
 import '../../features/driver/presentation/screens/driver_home_screen.dart';
 import '../../features/driver/presentation/screens/driver_onboarding_screen.dart';
 import '../../features/passenger/presentation/screens/passenger_home_screen.dart';
@@ -87,7 +88,8 @@ abstract final class AppRouter {
         }
 
         // Passenger route guard: non-passengers cannot access passenger home
-        if (matchedPath == AppRoutes.passengerHome &&
+        if ((matchedPath == AppRoutes.passengerHome ||
+                matchedPath == AppRoutes.passengerBooking) &&
             !user.isPassenger &&
             user.isDriver) {
           return AppRoutes.driverHome;
@@ -115,6 +117,11 @@ abstract final class AppRouter {
           path: AppRoutes.passengerHome,
           name: AppRoutes.passengerHomeName,
           builder: (context, state) => const PassengerHomeScreen(),
+        ),
+        GoRoute(
+          path: AppRoutes.passengerBooking,
+          name: AppRoutes.passengerBookingName,
+          builder: (context, state) => const BookingFlowScreen(),
         ),
         GoRoute(
           path: AppRoutes.driverHome,

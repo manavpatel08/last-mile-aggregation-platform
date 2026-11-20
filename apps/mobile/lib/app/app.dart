@@ -12,6 +12,10 @@ import '../features/auth/data/api_auth_repository.dart';
 import '../features/auth/data/auth_repository.dart';
 import '../features/auth/data/google_sign_in_service.dart';
 import '../features/auth/state/auth_provider.dart';
+import '../features/booking/data/api_booking_repository.dart';
+import '../features/booking/data/booking_repository.dart';
+import '../features/booking/services/passenger_location_service.dart';
+import '../features/booking/state/booking_flow_provider.dart';
 import '../features/driver/data/api_driver_repository.dart';
 import '../features/driver/data/driver_repository.dart';
 import '../features/driver/state/driver_home_provider.dart';
@@ -35,6 +39,9 @@ class LastMileApp extends StatefulWidget {
     this.googleSignInService,
     this.driverRepository,
     this.driverOnboardingProvider,
+    this.bookingRepository,
+    this.locationService,
+    this.bookingFlowProvider,
   });
 
   final AppConfig config;
@@ -47,6 +54,9 @@ class LastMileApp extends StatefulWidget {
   final GoogleSignInService? googleSignInService;
   final DriverRepository? driverRepository;
   final DriverOnboardingProvider? driverOnboardingProvider;
+  final BookingRepository? bookingRepository;
+  final PassengerLocationService? locationService;
+  final BookingFlowProvider? bookingFlowProvider;
 
   @override
   State<LastMileApp> createState() => _LastMileAppState();
@@ -62,6 +72,10 @@ class _LastMileAppState extends State<LastMileApp> {
   late final DriverRepository _driverRepository;
   late final DriverOnboardingProvider _driverOnboardingProvider;
   late final bool _ownsDriverOnboardingProvider;
+  late final BookingRepository _bookingRepository;
+  late final PassengerLocationService _locationService;
+  late final BookingFlowProvider _bookingFlowProvider;
+  late final bool _ownsBookingFlowProvider;
   late final AuthProvider _authProvider;
   late final bool _ownsAuthProvider;
   late final ApiClient _apiClient;
@@ -115,6 +129,17 @@ class _LastMileAppState extends State<LastMileApp> {
     _driverOnboardingProvider = widget.driverOnboardingProvider ??
         DriverOnboardingProvider(driverRepository: _driverRepository);
 
+    _bookingRepository = widget.bookingRepository ??
+        ApiBookingRepository(apiClient: _apiClient);
+    _locationService = widget.locationService ??
+        const GeolocatorPassengerLocationService();
+    _ownsBookingFlowProvider = widget.bookingFlowProvider == null;
+    _bookingFlowProvider = widget.bookingFlowProvider ??
+        BookingFlowProvider(
+          bookingRepository: _bookingRepository,
+          locationService: _locationService,
+        );
+
     _router = AppRouter.createRouter(
       appModeProvider: _appModeProvider,
       authProvider: _authProvider,
@@ -133,6 +158,9 @@ class _LastMileAppState extends State<LastMileApp> {
     if (_ownsDriverOnboardingProvider) {
       _driverOnboardingProvider.dispose();
     }
+    if (_ownsBookingFlowProvider) {
+      _bookingFlowProvider.dispose();
+    }
     super.dispose();
   }
 
@@ -147,6 +175,8 @@ class _LastMileAppState extends State<LastMileApp> {
         Provider<GoogleSignInService>.value(value: _googleSignInService),
         Provider<ApiClient>.value(value: _apiClient),
         Provider<DriverRepository>.value(value: _driverRepository),
+        Provider<BookingRepository>.value(value: _bookingRepository),
+        Provider<PassengerLocationService>.value(value: _locationService),
         ChangeNotifierProvider<AppModeProvider>.value(value: _appModeProvider),
         ChangeNotifierProvider<AuthProvider>.value(value: _authProvider),
         ChangeNotifierProvider<PassengerHomeProvider>(
@@ -157,6 +187,9 @@ class _LastMileAppState extends State<LastMileApp> {
         ),
         ChangeNotifierProvider<DriverOnboardingProvider>.value(
           value: _driverOnboardingProvider,
+        ),
+        ChangeNotifierProvider<BookingFlowProvider>.value(
+          value: _bookingFlowProvider,
         ),
       ],
       child: MaterialApp.router(

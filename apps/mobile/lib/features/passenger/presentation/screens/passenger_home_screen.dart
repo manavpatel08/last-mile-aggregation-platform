@@ -1,5 +1,5 @@
-import 'package:material_ui/material_ui.dart';
 import 'package:go_router/go_router.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 
 import '../../../../app/router/app_routes.dart';
@@ -9,16 +9,33 @@ import '../../../../core/theme/app_colors.dart';
 import '../../../../core/widgets/mode_badge.dart';
 import '../../../../core/widgets/placeholder_section_card.dart';
 import '../../../auth/state/auth_provider.dart';
+import '../../../booking/data/booking_repository.dart';
+import '../../../booking/presentation/widgets/active_booking_card.dart';
 import '../../state/passenger_home_provider.dart';
 
-/// Basic Passenger Home placeholder screen established by TASK-002 and updated for TASK-003.
-class PassengerHomeScreen extends StatelessWidget {
+/// Passenger Home screen coordinating ride booking entry, active booking status,
+/// role switching, and driver application entry points.
+class PassengerHomeScreen extends StatefulWidget {
   const PassengerHomeScreen({super.key});
+
+  @override
+  State<PassengerHomeScreen> createState() => _PassengerHomeScreenState();
+}
+
+class _PassengerHomeScreenState extends State<PassengerHomeScreen> {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        final repo = context.read<BookingRepository>();
+        context.read<PassengerHomeProvider>().loadActiveBooking(repo);
+      }
+    });
+  }
 
   IconData _iconForSection(String id) {
     switch (id) {
-      case 'booking':
-        return Icons.route_outlined;
       case 'active_ride':
         return Icons.directions_transit_outlined;
       case 'history':
@@ -64,6 +81,7 @@ class PassengerHomeScreen extends StatelessWidget {
         child: ListView(
           padding: const EdgeInsets.all(20),
           children: [
+            // Passenger Workspace Banner
             Card(
               color: AppColors.primaryContainer,
               child: Padding(
@@ -105,6 +123,89 @@ class PassengerHomeScreen extends StatelessWidget {
                 ),
               ),
             ),
+
+            // Active Booking Card (if present)
+            if (passengerProvider.activeBooking != null) ...[
+              const SizedBox(height: 16),
+              ActiveBookingCard(
+                booking: passengerProvider.activeBooking!,
+                isRefreshing: passengerProvider.isLoadingActiveBooking,
+                onRefresh: () {
+                  final repo = context.read<BookingRepository>();
+                  passengerProvider.loadActiveBooking(repo);
+                },
+              ),
+            ],
+
+            // Functional Ride Booking Entry Point
+            const SizedBox(height: 16),
+            Card(
+              key: const Key('book_ride_card'),
+              elevation: 0,
+              color: AppColors.surfaceCard,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(16),
+                side: BorderSide(
+                  color: AppColors.primary.withValues(alpha: 0.3),
+                  width: 1.5,
+                ),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Row(
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: AppColors.primary.withValues(alpha: 0.1),
+                        shape: BoxShape.circle,
+                      ),
+                      child: const Icon(
+                        Icons.route_outlined,
+                        color: AppColors.primary,
+                        size: 28,
+                      ),
+                    ),
+                    const SizedBox(width: 14),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Book a Ride',
+                            style: textTheme.titleMedium?.copyWith(
+                              fontWeight: FontWeight.bold,
+                              color: AppColors.textPrimary,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            'Interactive map, 2-minute binding quote, and shared micro-mobility.',
+                            style: textTheme.bodySmall?.copyWith(
+                              color: AppColors.textSecondary,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    FilledButton(
+                      key: const Key('book_ride_button'),
+                      style: FilledButton.styleFrom(
+                        backgroundColor: AppColors.primary,
+                        foregroundColor: Colors.white,
+                      ),
+                      onPressed: () {
+                        context.push(AppRoutes.passengerBooking);
+                      },
+                      child: const Text('Book'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+
+            // Become a Driver entry point (if user has no driver profile)
             if (user?.driverProfile == null) ...[
               const SizedBox(height: 16),
               Card(
@@ -171,6 +272,7 @@ class PassengerHomeScreen extends StatelessWidget {
                 ),
               ),
             ],
+
             const SizedBox(height: 20),
             Text('Planned Passenger Modules', style: textTheme.titleMedium),
             const SizedBox(height: 12),

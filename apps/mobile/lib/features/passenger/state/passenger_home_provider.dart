@@ -1,5 +1,8 @@
 import 'package:flutter/foundation.dart';
 
+import '../../booking/data/booking_repository.dart';
+import '../../booking/models/booking_response.dart';
+
 /// Immutable descriptor for a placeholder section shown on the Passenger Home screen.
 class PassengerPlaceholderItem {
   const PassengerPlaceholderItem({
@@ -14,22 +17,13 @@ class PassengerPlaceholderItem {
 }
 
 /// Feature-scoped Provider foundation for Passenger Home presentation state.
-///
-/// Contains placeholder metadata only; booking, fare quotes, maps, and live
-/// tracking belong to subsequent implementation tasks.
 class PassengerHomeProvider extends ChangeNotifier {
   final List<PassengerPlaceholderItem> _sections = const [
     PassengerPlaceholderItem(
-      id: 'booking',
-      title: 'Ride Booking',
-      description:
-          'Shared and private ride booking flows will be added in a subsequent task.',
-    ),
-    PassengerPlaceholderItem(
       id: 'active_ride',
-      title: 'Active Ride Status',
+      title: 'Active Ride Tracking',
       description:
-          'Matching progress, boarding verification, and live trip status will appear here.',
+          'Driver assignment, boarding confirmation, and live GPS streaming will appear here.',
     ),
     PassengerPlaceholderItem(
       id: 'history',
@@ -41,6 +35,36 @@ class PassengerHomeProvider extends ChangeNotifier {
 
   List<PassengerPlaceholderItem> get sections => _sections;
 
-  String get statusSummary =>
-      'Passenger application foundation is ready. Live booking and backend integration are pending future stages.';
+  BookingResponse? _activeBooking;
+  bool _isLoadingActiveBooking = false;
+  String? _activeBookingError;
+
+  BookingResponse? get activeBooking => _activeBooking;
+  bool get isLoadingActiveBooking => _isLoadingActiveBooking;
+  String? get activeBookingError => _activeBookingError;
+
+  String get statusSummary => _activeBooking != null
+      ? 'Active booking in progress (${_activeBooking!.status}). Ceiling: ₹${_activeBooking!.agreedFareCeiling}'
+      : 'PDEU campus last-mile connectivity is active. Request a ride anytime.';
+
+  void updateActiveBooking(BookingResponse? booking) {
+    _activeBooking = booking;
+    notifyListeners();
+  }
+
+  Future<void> loadActiveBooking(BookingRepository bookingRepository) async {
+    _isLoadingActiveBooking = true;
+    _activeBookingError = null;
+    notifyListeners();
+
+    try {
+      final booking = await bookingRepository.getActiveBooking();
+      _activeBooking = booking;
+    } catch (e) {
+      _activeBookingError = e.toString();
+    } finally {
+      _isLoadingActiveBooking = false;
+      notifyListeners();
+    }
+  }
 }

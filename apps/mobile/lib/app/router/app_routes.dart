@@ -6,6 +6,7 @@ abstract final class AppRoutes {
   static const String login = '/login';
   static const String roleSelection = '/role-selection';
   static const String passengerHome = '/passenger';
+  static const String passengerBooking = '/passenger/book';
   static const String driverHome = '/driver';
   static const String driverOnboarding = '/driver/onboard';
   static const String adminInfo = '/admin-info';
@@ -14,6 +15,7 @@ abstract final class AppRoutes {
   static const String loginName = 'login';
   static const String roleSelectionName = 'role-selection';
   static const String passengerHomeName = 'passenger-home';
+  static const String passengerBookingName = 'passenger-booking';
   static const String driverHomeName = 'driver-home';
   static const String driverOnboardingName = 'driver-onboarding';
   static const String adminInfoName = 'admin-info';

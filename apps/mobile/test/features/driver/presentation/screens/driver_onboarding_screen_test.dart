@@ -6,6 +6,7 @@ import 'package:lastmile_mobile/core/network/auth_token_store.dart';
 import 'package:lastmile_mobile/core/storage/secure_token_storage.dart';
 import 'package:lastmile_mobile/features/auth/models/auth_user.dart';
 import 'package:lastmile_mobile/features/auth/state/auth_provider.dart';
+import 'package:lastmile_mobile/features/driver/state/driver_onboarding_provider.dart';
 
 import '../../../../helpers/test_fakes.dart';
 
@@ -258,6 +259,186 @@ void main() {
       expect(find.text('Driver profile already registered for this user'), findsOneWidget);
       // Stays on Driver Onboarding screen
       expect(find.text('Driver Onboarding'), findsOneWidget);
+    });
+
+    testWidgets('Driver Home displays pending_sync_banner and Refresh Application Status button when profileRefreshPending is true', (tester) async {
+      const pendingDriverUser = AuthUser(
+        id: 'driver-sync-pending',
+        email: 'driver-sync@pdeu.ac.in',
+        fullName: 'Pending Sync Driver',
+        role: 'DRIVER',
+        roles: ['DRIVER'],
+        driverVerificationStatus: 'PENDING',
+        driverProfile: DriverProfile(
+          id: 'dp-pending-sync',
+          verificationStatus: 'PENDING',
+          operationalStatus: 'OFFLINE',
+          isOnline: false,
+        ),
+      );
+
+      final tokenStore = AuthTokenStore();
+      final secureStorage = SecureTokenStorage.inMemory({
+        SecureTokenStorage.refreshTokenKey: 'existing-refresh-token',
+      });
+      final authRepo = FakeAuthRepository(currentUser: pendingDriverUser);
+      final driverRepo = FakeDriverRepository();
+      final onboardingProvider = DriverOnboardingProvider(
+        driverRepository: driverRepo,
+      )..setProfileRefreshPending(true);
+
+      final authProvider = AuthProvider(
+        authRepository: authRepo,
+        googleSignInService: FakeGoogleSignInService(),
+        tokenStore: tokenStore,
+        secureStorage: secureStorage,
+      );
+      await authProvider.restoreSession();
+
+      await tester.pumpWidget(
+        LastMileApp(
+          config: testConfig,
+          authProvider: authProvider,
+          tokenStore: tokenStore,
+          secureStorage: secureStorage,
+          authRepository: authRepo,
+          driverRepository: driverRepo,
+          driverOnboardingProvider: onboardingProvider,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // On Driver Home:
+      expect(find.text('Driver Home'), findsOneWidget);
+      expect(find.byKey(const Key('pending_sync_banner')), findsOneWidget);
+      expect(find.text('Profile Synchronization Pending'), findsOneWidget);
+      expect(find.byKey(const Key('refresh_application_status_button')), findsOneWidget);
+    });
+
+    testWidgets('Tapping Refresh Application Status triggers profile sync without calling onboardDriver and dismisses banner on success', (tester) async {
+      const pendingDriverUser = AuthUser(
+        id: 'driver-sync-pending',
+        email: 'driver-sync@pdeu.ac.in',
+        fullName: 'Pending Sync Driver',
+        role: 'DRIVER',
+        roles: ['DRIVER'],
+        driverVerificationStatus: 'PENDING',
+        driverProfile: DriverProfile(
+          id: 'dp-pending-sync',
+          verificationStatus: 'PENDING',
+          operationalStatus: 'OFFLINE',
+          isOnline: false,
+        ),
+      );
+
+      final tokenStore = AuthTokenStore();
+      final secureStorage = SecureTokenStorage.inMemory({
+        SecureTokenStorage.refreshTokenKey: 'existing-refresh-token',
+      });
+      final authRepo = FakeAuthRepository(currentUser: pendingDriverUser);
+      final driverRepo = FakeDriverRepository();
+      final onboardingProvider = DriverOnboardingProvider(
+        driverRepository: driverRepo,
+      )..setProfileRefreshPending(true);
+
+      final authProvider = AuthProvider(
+        authRepository: authRepo,
+        googleSignInService: FakeGoogleSignInService(),
+        tokenStore: tokenStore,
+        secureStorage: secureStorage,
+      );
+      await authProvider.restoreSession();
+
+      await tester.pumpWidget(
+        LastMileApp(
+          config: testConfig,
+          authProvider: authProvider,
+          tokenStore: tokenStore,
+          secureStorage: secureStorage,
+          authRepository: authRepo,
+          driverRepository: driverRepo,
+          driverOnboardingProvider: onboardingProvider,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.byKey(const Key('pending_sync_banner')), findsOneWidget);
+      expect(driverRepo.onboardCallCount, 0);
+
+      // Tap refresh status
+      await tester.tap(find.byKey(const Key('refresh_application_status_button')));
+      await tester.pumpAndSettle();
+
+      // Sync completed!
+      expect(onboardingProvider.profileRefreshPending, isFalse);
+      expect(find.byKey(const Key('pending_sync_banner')), findsNothing);
+      expect(find.text('Driver Verification: PENDING'), findsOneWidget);
+      // CRITICAL: onboardDriver was NEVER called during retry!
+      expect(driverRepo.onboardCallCount, 0);
+    });
+
+    testWidgets('Tapping Refresh Application Status preserves banner and pending state when sync fails', (tester) async {
+      const pendingDriverUser = AuthUser(
+        id: 'driver-sync-pending',
+        email: 'driver-sync@pdeu.ac.in',
+        fullName: 'Pending Sync Driver',
+        role: 'DRIVER',
+        roles: ['DRIVER'],
+        driverVerificationStatus: 'PENDING',
+        driverProfile: DriverProfile(
+          id: 'dp-pending-sync',
+          verificationStatus: 'PENDING',
+          operationalStatus: 'OFFLINE',
+          isOnline: false,
+        ),
+      );
+
+      final tokenStore = AuthTokenStore();
+      final secureStorage = SecureTokenStorage.inMemory({
+        SecureTokenStorage.refreshTokenKey: 'existing-refresh-token',
+      });
+      final authRepo = FakeAuthRepository(currentUser: pendingDriverUser);
+      final driverRepo = FakeDriverRepository();
+      final onboardingProvider = DriverOnboardingProvider(
+        driverRepository: driverRepo,
+      )..setProfileRefreshPending(true);
+
+      final authProvider = AuthProvider(
+        authRepository: authRepo,
+        googleSignInService: FakeGoogleSignInService(),
+        tokenStore: tokenStore,
+        secureStorage: secureStorage,
+      );
+      await authProvider.restoreSession();
+
+      // Configure /users/me to fail
+      authRepo.shouldThrowOnUser = true;
+
+      await tester.pumpWidget(
+        LastMileApp(
+          config: testConfig,
+          authProvider: authProvider,
+          tokenStore: tokenStore,
+          secureStorage: secureStorage,
+          authRepository: authRepo,
+          driverRepository: driverRepo,
+          driverOnboardingProvider: onboardingProvider,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.byKey(const Key('pending_sync_banner')), findsOneWidget);
+
+      // Tap refresh status while endpoint fails
+      await tester.tap(find.byKey(const Key('refresh_application_status_button')));
+      await tester.pumpAndSettle();
+
+      // Pending state preserved, banner remains visible for another attempt
+      expect(onboardingProvider.profileRefreshPending, isTrue);
+      expect(find.byKey(const Key('pending_sync_banner')), findsOneWidget);
+      expect(find.byKey(const Key('refresh_application_status_button')), findsOneWidget);
+      // CRITICAL: onboardDriver was NEVER called!
+      expect(driverRepo.onboardCallCount, 0);
     });
   });
 }

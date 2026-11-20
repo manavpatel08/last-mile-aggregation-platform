@@ -105,6 +105,7 @@ void main() {
 
       expect(success, isTrue);
       expect(provider.applicationSubmitted, isTrue);
+      expect(provider.profileRefreshPending, isTrue);
       expect(provider.warningMessage, contains('PENDING'));
       expect(provider.warningMessage, contains('do not need to re-submit'));
       expect(fakeDriverRepo.onboardCallCount, 1);
@@ -121,6 +122,67 @@ void main() {
       );
       expect(secondAttempt, isTrue);
       expect(fakeDriverRepo.onboardCallCount, 1); // Still 1, never duplicated!
+    });
+
+    test('retryProfileSync successfully synchronizes profile and clears profileRefreshPending without calling onboardDriver', () async {
+      // Start in profileRefreshPending state
+      final pendingProvider = DriverOnboardingProvider(
+        driverRepository: fakeDriverRepo,
+      )..setProfileRefreshPending(true);
+      expect(pendingProvider.profileRefreshPending, isTrue);
+
+      // Now backend GET /users/me is operational and returns updated profile
+      fakeAuthRepo.currentUser = const AuthUser(
+        id: 'passenger-user-id',
+        email: 'student@pdeu.ac.in',
+        fullName: 'PDEU Student',
+        role: 'DRIVER',
+        roles: ['PASSENGER', 'DRIVER'],
+        driverVerificationStatus: 'PENDING',
+        driverProfile: DriverProfile(
+          id: 'dp-pending-123',
+          verificationStatus: 'PENDING',
+          operationalStatus: 'OFFLINE',
+          isOnline: false,
+        ),
+      );
+
+      final initialOnboardCalls = fakeDriverRepo.onboardCallCount;
+
+      final syncSuccess = await pendingProvider.retryProfileSync(
+        authProvider: authProvider,
+      );
+
+      expect(syncSuccess, isTrue);
+      expect(pendingProvider.profileRefreshPending, isFalse);
+      expect(pendingProvider.warningMessage, isNull);
+      expect(pendingProvider.errorMessage, isNull);
+      // CRITICAL: onboardDriver was NOT called!
+      expect(fakeDriverRepo.onboardCallCount, initialOnboardCalls);
+      expect(authProvider.user?.driverVerificationStatus, 'PENDING');
+    });
+
+    test('retryProfileSync failure preserves profileRefreshPending and never calls onboardDriver', () async {
+      final pendingProvider = DriverOnboardingProvider(
+        driverRepository: fakeDriverRepo,
+      )..setProfileRefreshPending(true);
+      expect(pendingProvider.profileRefreshPending, isTrue);
+
+      // Backend GET /users/me still fails
+      fakeAuthRepo.shouldThrowOnUser = true;
+
+      final initialOnboardCalls = fakeDriverRepo.onboardCallCount;
+
+      final syncSuccess = await pendingProvider.retryProfileSync(
+        authProvider: authProvider,
+      );
+
+      expect(syncSuccess, isFalse);
+      // Preserved pending state for another attempt
+      expect(pendingProvider.profileRefreshPending, isTrue);
+      expect(pendingProvider.warningMessage, contains('synchronization failed'));
+      // CRITICAL: onboardDriver was NOT called!
+      expect(fakeDriverRepo.onboardCallCount, initialOnboardCalls);
     });
 
     test('submission failure on 409 Conflict surfaces message and does not switch mode', () async {

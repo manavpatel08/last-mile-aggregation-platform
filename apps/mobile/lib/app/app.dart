@@ -34,6 +34,7 @@ class LastMileApp extends StatefulWidget {
     this.authRepository,
     this.googleSignInService,
     this.driverRepository,
+    this.driverOnboardingProvider,
   });
 
   final AppConfig config;
@@ -45,6 +46,7 @@ class LastMileApp extends StatefulWidget {
   final AuthRepository? authRepository;
   final GoogleSignInService? googleSignInService;
   final DriverRepository? driverRepository;
+  final DriverOnboardingProvider? driverOnboardingProvider;
 
   @override
   State<LastMileApp> createState() => _LastMileAppState();
@@ -58,6 +60,8 @@ class _LastMileAppState extends State<LastMileApp> {
   late final AuthRepository _authRepository;
   late final GoogleSignInService _googleSignInService;
   late final DriverRepository _driverRepository;
+  late final DriverOnboardingProvider _driverOnboardingProvider;
+  late final bool _ownsDriverOnboardingProvider;
   late final AuthProvider _authProvider;
   late final bool _ownsAuthProvider;
   late final ApiClient _apiClient;
@@ -107,6 +111,10 @@ class _LastMileAppState extends State<LastMileApp> {
     _driverRepository = widget.driverRepository ??
         ApiDriverRepository(apiClient: _apiClient);
 
+    _ownsDriverOnboardingProvider = widget.driverOnboardingProvider == null;
+    _driverOnboardingProvider = widget.driverOnboardingProvider ??
+        DriverOnboardingProvider(driverRepository: _driverRepository);
+
     _router = AppRouter.createRouter(
       appModeProvider: _appModeProvider,
       authProvider: _authProvider,
@@ -121,6 +129,9 @@ class _LastMileAppState extends State<LastMileApp> {
     }
     if (_ownsAuthProvider) {
       _authProvider.dispose();
+    }
+    if (_ownsDriverOnboardingProvider) {
+      _driverOnboardingProvider.dispose();
     }
     super.dispose();
   }
@@ -144,10 +155,8 @@ class _LastMileAppState extends State<LastMileApp> {
         ChangeNotifierProvider<DriverHomeProvider>(
           create: (_) => DriverHomeProvider(),
         ),
-        ChangeNotifierProvider<DriverOnboardingProvider>(
-          create: (_) => DriverOnboardingProvider(
-            driverRepository: _driverRepository,
-          ),
+        ChangeNotifierProvider<DriverOnboardingProvider>.value(
+          value: _driverOnboardingProvider,
         ),
       ],
       child: MaterialApp.router(

@@ -10,6 +10,7 @@ import '../../../../core/widgets/mode_badge.dart';
 import '../../../../core/widgets/placeholder_section_card.dart';
 import '../../../auth/state/auth_provider.dart';
 import '../../state/driver_home_provider.dart';
+import '../../state/driver_onboarding_provider.dart';
 
 /// Basic Driver Home placeholder screen established by TASK-002 and updated for TASK-003.
 class DriverHomeScreen extends StatelessWidget {
@@ -32,6 +33,7 @@ class DriverHomeScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     final textTheme = Theme.of(context).textTheme;
     final driverProvider = context.watch<DriverHomeProvider>();
+    final onboardingProvider = context.watch<DriverOnboardingProvider>();
     final authProvider = context.watch<AuthProvider>();
     final user = authProvider.user;
 
@@ -102,6 +104,75 @@ class DriverHomeScreen extends StatelessWidget {
         child: ListView(
           padding: const EdgeInsets.all(20),
           children: [
+            if (onboardingProvider.profileRefreshPending) ...[
+              Container(
+                key: const Key('pending_sync_banner'),
+                margin: const EdgeInsets.only(bottom: 16),
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: AppColors.secondaryContainer.withValues(alpha: 0.6),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: AppColors.secondary.withValues(alpha: 0.3),
+                  ),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        const Icon(
+                          Icons.sync_problem_outlined,
+                          color: AppColors.secondary,
+                          size: 24,
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Text(
+                            'Profile Synchronization Pending',
+                            style: textTheme.titleSmall?.copyWith(
+                              color: AppColors.secondary,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'Your driver onboarding application was submitted successfully. However, your profile could not be synchronized with the server. Please check your network and refresh application status.',
+                      style: textTheme.bodySmall,
+                    ),
+                    const SizedBox(height: 12),
+                    FilledButton.icon(
+                      key: const Key('refresh_application_status_button'),
+                      style: FilledButton.styleFrom(
+                        backgroundColor: AppColors.secondary,
+                        foregroundColor: Colors.white,
+                      ),
+                      onPressed: onboardingProvider.isSubmitting
+                          ? null
+                          : () async {
+                              await onboardingProvider.retryProfileSync(
+                                authProvider: context.read<AuthProvider>(),
+                              );
+                            },
+                      icon: onboardingProvider.isSubmitting
+                          ? const SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Colors.white,
+                              ),
+                            )
+                          : const Icon(Icons.refresh, size: 18),
+                      label: const Text('Refresh Application Status'),
+                    ),
+                  ],
+                ),
+              ),
+            ],
             if (!isApproved) ...[
               Container(
                 margin: const EdgeInsets.only(bottom: 16),

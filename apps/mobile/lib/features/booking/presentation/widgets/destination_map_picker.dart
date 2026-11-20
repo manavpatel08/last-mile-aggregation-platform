@@ -34,6 +34,7 @@ class DestinationMapPicker extends StatefulWidget {
 class _DestinationMapPickerState extends State<DestinationMapPicker> {
   late final MapController _mapController;
 
+  static const copyrightUrl = 'https://www.openstreetmap.org/copyright';
   static const _defaultCenter = LatLng(23.1550, 72.6668); // PDEU campus
 
   @override
@@ -46,6 +47,35 @@ class _DestinationMapPickerState extends State<DestinationMapPicker> {
   void dispose() {
     _mapController.dispose();
     super.dispose();
+  }
+
+  Future<void> _handleAttributionTap() async {
+    final uri = Uri.parse(copyrightUrl);
+    try {
+      final success = await launchUrl(
+        uri,
+        mode: LaunchMode.externalApplication,
+      );
+      if (!success && mounted) {
+        _showAttributionError();
+      }
+    } catch (_) {
+      if (mounted) {
+        _showAttributionError();
+      }
+    }
+  }
+
+  void _showAttributionError() {
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    messenger?.hideCurrentSnackBar();
+    messenger?.showSnackBar(
+      const SnackBar(
+        key: Key('osm_attribution_error_snackbar'),
+        content: Text('Unable to open OpenStreetMap copyright page.'),
+        duration: Duration(seconds: 4),
+      ),
+    );
   }
 
   @override
@@ -229,16 +259,7 @@ class _DestinationMapPickerState extends State<DestinationMapPicker> {
                       child: InkWell(
                         key: const Key('osm_attribution'),
                         borderRadius: BorderRadius.circular(4),
-                        onTap: () async {
-                          final uri = Uri.parse(
-                              'https://www.openstreetmap.org/copyright');
-                          if (await canLaunchUrl(uri)) {
-                            await launchUrl(
-                              uri,
-                              mode: LaunchMode.externalApplication,
-                            );
-                          }
-                        },
+                        onTap: _handleAttributionTap,
                         child: const Padding(
                           padding: EdgeInsets.symmetric(
                             horizontal: 6,

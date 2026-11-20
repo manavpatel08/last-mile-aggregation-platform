@@ -15,6 +15,8 @@ import 'package:lastmile_mobile/features/booking/presentation/screens/booking_fl
 import 'package:lastmile_mobile/features/booking/services/passenger_location_service.dart';
 import 'package:lastmile_mobile/features/booking/state/booking_flow_provider.dart';
 import 'package:lastmile_mobile/features/passenger/state/passenger_home_provider.dart';
+import 'package:url_launcher_platform_interface/link.dart';
+import 'package:url_launcher_platform_interface/url_launcher_platform_interface.dart';
 
 class _FakeBookingRepository implements BookingRepository {
   List<PickupPoint> pickupZones = [
@@ -488,12 +490,17 @@ void main() {
     });
 
     testWidgets(
-        'renders clearly visible OSM attribution in map widget',
+        'renders clearly visible OSM attribution in map widget and tapping launches copyright URL',
         (tester) async {
       tester.view.physicalSize = const Size(1080, 2400);
       tester.view.devicePixelRatio = 1.0;
       addTearDown(tester.view.resetPhysicalSize);
       addTearDown(tester.view.resetDevicePixelRatio);
+
+      final originalLauncher = UrlLauncherPlatform.instance;
+      final fakeLauncher = _FakeScreenUrlLauncher();
+      UrlLauncherPlatform.instance = fakeLauncher;
+      addTearDown(() => UrlLauncherPlatform.instance = originalLauncher);
 
       final repo = _FakeBookingRepository();
       final loc = FakePassengerLocationService();
@@ -506,8 +513,16 @@ void main() {
       await tester.pumpWidget(_buildTestableWidget(provider: provider));
       await tester.pumpAndSettle();
 
-      expect(find.byKey(const Key('osm_attribution')), findsOneWidget);
+      final attributionFinder = find.byKey(const Key('osm_attribution'));
+      expect(attributionFinder, findsOneWidget);
       expect(find.text('© OpenStreetMap contributors'), findsOneWidget);
+
+      await tester.tap(attributionFinder);
+      await tester.pumpAndSettle();
+
+      expect(fakeLauncher.launchCallCount, 1);
+      expect(fakeLauncher.lastUrl, 'https://www.openstreetmap.org/copyright');
+      expect(fakeLauncher.lastOptions?.mode, PreferredLaunchMode.externalApplication);
     });
 
     testWidgets(
@@ -588,4 +603,21 @@ void main() {
           findsOneWidget);
     });
   });
+}
+
+class _FakeScreenUrlLauncher extends UrlLauncherPlatform {
+  String? lastUrl;
+  LaunchOptions? lastOptions;
+  int launchCallCount = 0;
+
+  @override
+  LinkDelegate? get linkDelegate => null;
+
+  @override
+  Future<bool> launchUrl(String url, LaunchOptions options) async {
+    launchCallCount++;
+    lastUrl = url;
+    lastOptions = options;
+    return true;
+  }
 }

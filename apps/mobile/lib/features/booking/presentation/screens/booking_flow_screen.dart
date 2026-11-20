@@ -325,6 +325,38 @@ class _BookingFlowScreenState extends State<BookingFlowScreen> {
                 : const Icon(Icons.calculate_outlined),
             label: const Text('Get Fare Quote'),
           ),
+        ] else if (provider.selectedDestination != null &&
+            provider.destinationValidation?.isInsideServiceRegion == true &&
+            provider.fareQuote == null &&
+            !provider.hasPendingSubmission) ...[
+          Container(
+            key: const Key('pickup_location_guidance_banner'),
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: AppColors.warning.withValues(alpha: 0.12),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: AppColors.warning),
+            ),
+            child: Row(
+              children: [
+                const Icon(Icons.info_outline, color: AppColors.warning, size: 20),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    provider.passengerLocation == null
+                        ? 'Actual GPS coordinates are required to verify you are within 150m of the pickup hub before requesting a quote. Tap Update GPS to grant location.'
+                        : provider.pickupValidation?.isValid != true
+                            ? 'Your current GPS position is outside the 150m pickup geofence. Please move closer to ${provider.selectedPickupPoint?.name ?? 'the pickup hub'} and tap Update GPS.'
+                            : 'Validating pickup proximity...',
+                    style: const TextStyle(
+                      fontSize: 12,
+                      color: AppColors.textPrimary,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
         ],
 
         if (provider.isLoadingQuote) ...[
@@ -629,42 +661,69 @@ class _BookingFlowScreenState extends State<BookingFlowScreen> {
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                Row(
-                  children: [
-                    Icon(
-                      validation?.isValid == true
-                          ? Icons.check_circle_outline
-                          : Icons.location_searching,
-                      size: 16,
-                      color: validation?.isValid == true
-                          ? AppColors.success
-                          : AppColors.textSecondary,
-                    ),
-                    const SizedBox(width: 4),
-                    Text(
-                      validation != null
-                          ? (validation.isValid
-                              ? 'Within geofence (~${validation.distanceMeters.toInt()}m)'
-                              : 'Distance: ${validation.distanceMeters.toInt()}m (exceeds 150m)')
-                          : 'Proximity: verifying...',
-                      style: TextStyle(
-                        fontSize: 11,
-                        color: validation?.isValid == false
-                            ? AppColors.error
-                            : AppColors.textSecondary,
-                        fontWeight: validation?.isValid == false
-                            ? FontWeight.bold
-                            : FontWeight.normal,
+                Expanded(
+                  child: Row(
+                    children: [
+                      Icon(
+                        validation?.isValid == true
+                            ? Icons.check_circle_outline
+                            : (provider.passengerLocation == null
+                                ? Icons.location_off_outlined
+                                : Icons.location_searching),
+                        size: 16,
+                        color: validation?.isValid == true
+                            ? AppColors.success
+                            : (provider.passengerLocation == null ||
+                                    validation?.isValid == false ||
+                                    provider.pickupValidationError != null
+                                ? AppColors.error
+                                : AppColors.textSecondary),
                       ),
-                    ),
-                  ],
+                      const SizedBox(width: 4),
+                      Expanded(
+                        child: Text(
+                          provider.isAcquiringLocation
+                              ? 'Acquiring GPS location...'
+                              : provider.isValidatingPickup
+                                  ? 'Validating geofence...'
+                                  : provider.passengerLocation == null
+                                      ? 'Location unavailable (GPS required)'
+                                      : validation != null
+                                          ? (validation.isValid
+                                              ? 'Within geofence (~${validation.distanceMeters.toInt()}m)'
+                                              : 'Distance: ${validation.distanceMeters.toInt()}m (exceeds 150m)')
+                                          : provider.pickupValidationError != null
+                                              ? 'Geofence validation error'
+                                              : 'Proximity: unverified',
+                          style: TextStyle(
+                            fontSize: 11,
+                            color: validation?.isValid == true
+                                ? AppColors.success
+                                : (provider.passengerLocation == null ||
+                                        validation?.isValid == false ||
+                                        provider.pickupValidationError != null
+                                    ? AppColors.error
+                                    : AppColors.textSecondary),
+                            fontWeight: validation?.isValid == false ||
+                                    provider.passengerLocation == null ||
+                                    provider.pickupValidationError != null
+                                ? FontWeight.bold
+                                : FontWeight.normal,
+                          ),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
                 TextButton.icon(
                   key: const Key('refresh_location_button'),
-                  onPressed: provider.isAcquiringLocation
+                  onPressed: provider.isAcquiringLocation ||
+                          provider.isValidatingPickup
                       ? null
                       : () => provider.refreshPassengerLocation(),
-                  icon: provider.isAcquiringLocation
+                  icon: provider.isAcquiringLocation ||
+                          provider.isValidatingPickup
                       ? const SizedBox(
                           width: 12,
                           height: 12,
@@ -676,10 +735,53 @@ class _BookingFlowScreenState extends State<BookingFlowScreen> {
               ],
             ),
             if (provider.locationErrorMessage != null) ...[
-              const SizedBox(height: 4),
-              Text(
-                provider.locationErrorMessage!,
-                style: const TextStyle(fontSize: 11, color: AppColors.warning),
+              const SizedBox(height: 6),
+              Container(
+                key: const Key('location_error_banner'),
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                decoration: BoxDecoration(
+                  color: AppColors.error.withValues(alpha: 0.1),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.error_outline,
+                        size: 14, color: AppColors.error),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        provider.locationErrorMessage!,
+                        style: const TextStyle(
+                            fontSize: 11, color: AppColors.error),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+            if (provider.pickupValidationError != null) ...[
+              const SizedBox(height: 6),
+              Container(
+                key: const Key('pickup_validation_error_banner'),
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                decoration: BoxDecoration(
+                  color: AppColors.error.withValues(alpha: 0.1),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.error_outline,
+                        size: 14, color: AppColors.error),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        provider.pickupValidationError!,
+                        style: const TextStyle(
+                            fontSize: 11, color: AppColors.error),
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ],
           ],

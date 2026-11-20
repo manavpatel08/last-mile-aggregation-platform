@@ -486,5 +486,106 @@ void main() {
         findsOneWidget,
       );
     });
+
+    testWidgets(
+        'renders clearly visible OSM attribution in map widget',
+        (tester) async {
+      tester.view.physicalSize = const Size(1080, 2400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      final repo = _FakeBookingRepository();
+      final loc = FakePassengerLocationService();
+      final provider = BookingFlowProvider(
+        bookingRepository: repo,
+        locationService: loc,
+      );
+      addTearDown(provider.dispose);
+
+      await tester.pumpWidget(_buildTestableWidget(provider: provider));
+      await tester.pumpAndSettle();
+
+      expect(find.byKey(const Key('osm_attribution')), findsOneWidget);
+      expect(find.text('© OpenStreetMap contributors'), findsOneWidget);
+    });
+
+    testWidgets(
+        'denied location permission displays error banner and prevents quote generation',
+        (tester) async {
+      tester.view.physicalSize = const Size(1080, 2400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      final repo = _FakeBookingRepository();
+      final loc = FakePassengerLocationService(
+        initialResult: const LocationResult.failure(
+          'Location permission denied. Please grant location access.',
+          isPermissionDenied: true,
+        ),
+      );
+      final provider = BookingFlowProvider(
+        bookingRepository: repo,
+        locationService: loc,
+      );
+      addTearDown(provider.dispose);
+
+      await tester.pumpWidget(_buildTestableWidget(provider: provider));
+      await tester.pumpAndSettle();
+
+      // Verify location error banner is rendered and no coordinate is fabricated
+      expect(find.byKey(const Key('location_error_banner')), findsOneWidget);
+      expect(find.text('Location permission denied. Please grant location access.'),
+          findsOneWidget);
+      expect(provider.passengerLocation, isNull);
+
+      // Select destination
+      final chipFinder = find.text('Infocity (23.188, 72.628)');
+      await tester.ensureVisible(chipFinder);
+      await tester.tap(chipFinder);
+      await tester.pumpAndSettle();
+
+      // Fare quote button MUST NOT be displayed
+      expect(find.byKey(const Key('get_fare_quote_button')), findsNothing);
+      expect(find.byKey(const Key('pickup_location_guidance_banner')),
+          findsOneWidget);
+    });
+
+    testWidgets(
+        'failed pickup geofence validation displays exceeding distance and prevents quote button',
+        (tester) async {
+      tester.view.physicalSize = const Size(1080, 2400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      final repo = _FakeBookingRepository();
+      repo.pickupValidation = const PickupValidationResult(
+        isValid: false,
+        distanceMeters: 310.0,
+        allowedRadiusMeters: 150.0,
+      );
+      final loc = FakePassengerLocationService();
+      final provider = BookingFlowProvider(
+        bookingRepository: repo,
+        locationService: loc,
+      );
+      addTearDown(provider.dispose);
+
+      await tester.pumpWidget(_buildTestableWidget(provider: provider));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Distance: 310m (exceeds 150m)'), findsOneWidget);
+
+      final chipFinder = find.text('Infocity (23.188, 72.628)');
+      await tester.ensureVisible(chipFinder);
+      await tester.tap(chipFinder);
+      await tester.pumpAndSettle();
+
+      expect(find.byKey(const Key('get_fare_quote_button')), findsNothing);
+      expect(find.byKey(const Key('pickup_location_guidance_banner')),
+          findsOneWidget);
+    });
   });
 }

@@ -157,6 +157,152 @@ void main() {
   });
 
   group('BookingFlowProvider', () {
+    test('denied location permission: no fabricated pickup coordinate and no fare quote or booking enabled',
+        () async {
+      locationService.initialResult = const LocationResult.failure(
+        'Location permission was denied. Please grant location access.',
+        isPermissionDenied: true,
+      );
+
+      await provider.loadInitialData();
+
+      // Coordinate MUST remain null - no fabricated fallback to pickup hub!
+      expect(provider.passengerLocation, isNull);
+      expect(provider.pickupValidation, isNull);
+      expect(provider.locationErrorMessage, contains('Location permission was denied'));
+      expect(provider.canRequestQuote, isFalse);
+      expect(provider.canSubmitBooking, isFalse);
+
+      // Attempting to select destination and request quote must fail closed
+      await provider.selectDestination(const LatLng(23.1885, 72.6288));
+      expect(provider.canRequestQuote, isFalse);
+
+      await provider.requestFareQuote();
+      expect(provider.fareQuote, isNull);
+      expect(provider.quoteError, contains('Actual GPS location is required'));
+
+      // Attempting to submit booking must fail closed
+      final booked = await provider.submitBooking();
+      expect(booked, isFalse);
+      expect(repository.createBookingCalls, 0);
+    });
+
+    test('disabled location services: no coordinate and quote/booking disabled',
+        () async {
+      locationService.initialResult = const LocationResult.failure(
+        'Location services are disabled on your device.',
+        isLocationServiceDisabled: true,
+      );
+
+      await provider.refreshPassengerLocation();
+
+      expect(provider.passengerLocation, isNull);
+      expect(provider.pickupValidation, isNull);
+      expect(provider.locationErrorMessage, contains('Location services are disabled'));
+      expect(provider.canRequestQuote, isFalse);
+      expect(provider.canSubmitBooking, isFalse);
+    });
+
+    test('failed pickup geofence validation fails closed and prevents fare quote',
+        () async {
+      locationService.initialResult = const LocationResult.success(
+        latitude: 23.2000,
+        longitude: 72.7000,
+      );
+      repository.mockPickupValidation = const PickupValidationResult(
+        isValid: false,
+        distanceMeters: 450.0,
+        allowedRadiusMeters: 150.0,
+      );
+
+      await provider.loadInitialData();
+      await provider.selectDestination(const LatLng(23.1885, 72.6288));
+
+      expect(provider.passengerLocation, isNotNull);
+      expect(provider.pickupValidation?.isValid, isFalse);
+      expect(provider.canRequestQuote, isFalse);
+      expect(provider.canSubmitBooking, isFalse);
+
+      await provider.requestFareQuote();
+      expect(provider.fareQuote, isNull);
+      expect(provider.quoteError, contains('150m authorized pickup geofence'));
+    });
+
+    test('valid GPS fix plus successful geofence validation enables the flow',
+        () async {
+      locationService.initialResult = const LocationResult.success(
+        latitude: 23.1551,
+        longitude: 72.6669,
+      );
+      repository.mockPickupValidation = const PickupValidationResult(
+        isValid: true,
+        distanceMeters: 18.0,
+        allowedRadiusMeters: 150.0,
+      );
+
+      await provider.loadInitialData();
+      await provider.selectDestination(const LatLng(23.1885, 72.6288));
+
+      expect(provider.passengerLocation, isNotNull);
+      expect(provider.pickupValidation?.isValid, isTrue);
+      expect(provider.canRequestQuote, isTrue);
+
+      await provider.requestFareQuote();
+      expect(provider.fareQuote, isNotNull);
+
+      provider.setUpfrontConsentAgreed(true);
+      expect(provider.canSubmitBooking, isTrue);
+
+      final success = await provider.submitBooking();
+      expect(success, isTrue);
+      expect(repository.lastBookingRequest!.passengerPickupLocation.latitude, 23.1551);
+      expect(repository.lastBookingRequest!.passengerPickupLocation.longitude, 72.6669);
+    });
+
+    test('pending submission retry reuses identical payload and key without requiring new GPS fix',
+        () async {
+      locationService.initialResult = const LocationResult.success(
+        latitude: 23.1550,
+        longitude: 72.6668,
+      );
+      await provider.loadInitialData();
+      await provider.selectDestination(const LatLng(23.1885, 72.6288));
+      await provider.requestFareQuote();
+      provider.setUpfrontConsentAgreed(true);
+
+      // First submission times out
+      repository.errorToThrow = const ApiException(
+        statusCode: 408,
+        errorCode: 'REQUEST_TIMEOUT',
+        message: 'Request timed out.',
+      );
+      await provider.submitBooking();
+      expect(provider.hasPendingSubmission, isTrue);
+
+      final originalSnapshot = provider.pendingRequestSnapshot!;
+      final originalKey = provider.currentIdempotencyKey!;
+
+      // Simulate device GPS lost or disabled during retry window
+      locationService.initialResult = const LocationResult.failure(
+        'Location services disabled',
+        isLocationServiceDisabled: true,
+      );
+      await provider.refreshPassengerLocation(); // Should not mutate pending retry
+
+      // Retry booking submission
+      repository.errorToThrow = null;
+      final retrySuccess = await provider.submitBooking();
+      expect(retrySuccess, isTrue);
+
+      // Verify retry reuses identical original snapshot and key
+      expect(repository.lastBookingRequest, equals(originalSnapshot));
+      expect(repository.lastIdempotencyKey, equals(originalKey));
+      expect(repository.lastBookingRequest!.passengerPickupLocation.latitude,
+          originalSnapshot.passengerPickupLocation.latitude);
+      expect(repository.lastBookingRequest!.passengerPickupLocation.longitude,
+          originalSnapshot.passengerPickupLocation.longitude);
+    });
+
     test('loadInitialData populates pickup zones and selects default hub',
         () async {
       await provider.loadInitialData();

@@ -39,6 +39,8 @@ class BookingFlowProvider extends ChangeNotifier {
   bool _isAcquiringLocation = false;
   String? _locationErrorMessage;
   PickupValidationResult? _pickupValidation;
+  bool _isValidatingPickup = false;
+  String? _pickupValidationError;
 
   // Selected destination
   LatLng? _selectedDestination;
@@ -78,6 +80,8 @@ class BookingFlowProvider extends ChangeNotifier {
   bool get isAcquiringLocation => _isAcquiringLocation;
   String? get locationErrorMessage => _locationErrorMessage;
   PickupValidationResult? get pickupValidation => _pickupValidation;
+  bool get isValidatingPickup => _isValidatingPickup;
+  String? get pickupValidationError => _pickupValidationError;
 
   LatLng? get selectedDestination => _selectedDestination;
   bool get isValidatingDestination => _isValidatingDestination;
@@ -107,9 +111,13 @@ class BookingFlowProvider extends ChangeNotifier {
   bool get canRequestQuote =>
       !hasPendingSubmission &&
       _selectedPickupPoint != null &&
+      _passengerLocation != null &&
+      _pickupValidation?.isValid == true &&
       _selectedDestination != null &&
       _destinationValidation?.isInsideServiceRegion == true &&
-      !_isLoadingQuote;
+      !_isLoadingQuote &&
+      !_isAcquiringLocation &&
+      !_isValidatingPickup;
 
   bool get canSubmitBooking {
     if (_isSubmittingBooking || _isReconciling) return false;
@@ -119,7 +127,9 @@ class BookingFlowProvider extends ChangeNotifier {
     }
     return _fareQuote != null &&
         !_isQuoteExpired &&
-        _upfrontConsentAgreed;
+        _upfrontConsentAgreed &&
+        _passengerLocation != null &&
+        _pickupValidation?.isValid == true;
   }
 
   /// Loads initial pickup hubs, service regions, and passenger GPS fix.
@@ -157,6 +167,7 @@ class BookingFlowProvider extends ChangeNotifier {
     if (hasPendingSubmission) return;
     _selectedPickupPoint = point;
     _pickupValidation = null;
+    _pickupValidationError = null;
     if (_passengerLocation != null) {
       validatePickupLocation();
     }
@@ -170,6 +181,7 @@ class BookingFlowProvider extends ChangeNotifier {
     if (hasPendingSubmission) return;
     _isAcquiringLocation = true;
     _locationErrorMessage = null;
+    _pickupValidationError = null;
     notifyListeners();
 
     try {
@@ -181,48 +193,73 @@ class BookingFlowProvider extends ChangeNotifier {
         _locationErrorMessage = null;
         await validatePickupLocation();
       } else {
+        // Never fabricate fallback coordinates on failure: keep passenger location null
+        _passengerLocation = null;
+        _pickupValidation = null;
         _locationErrorMessage =
             result.errorMessage ?? 'Unable to acquire location.';
-        // If GPS fails and no location set, fallback to pickup point center for testing
-        if (_passengerLocation == null && _selectedPickupPoint != null) {
-          _passengerLocation = LatLng(
-            _selectedPickupPoint!.latitude,
-            _selectedPickupPoint!.longitude,
-          );
-        }
+        _clearQuote();
       }
     } catch (e) {
+      _passengerLocation = null;
+      _pickupValidation = null;
       _locationErrorMessage = 'Location acquisition error: $e';
+      _clearQuote();
     } finally {
       _isAcquiringLocation = false;
       notifyListeners();
     }
   }
 
-  /// Sets passenger pickup location manually (for testing/simulator fallback).
-  void setPassengerLocation(LatLng location) {
+  /// Sets passenger pickup location manually (for testing/simulator verification).
+  void setPassengerLocation(LatLng? location) {
     if (hasPendingSubmission) return;
     _passengerLocation = location;
     _locationErrorMessage = null;
-    validatePickupLocation();
+    _pickupValidationError = null;
+    if (location != null) {
+      validatePickupLocation();
+    } else {
+      _pickupValidation = null;
+      _clearQuote();
+    }
     notifyListeners();
   }
 
   /// Validates passenger pickup coordinate against the backend 150m geofence.
   Future<void> validatePickupLocation() async {
-    if (_selectedPickupPoint == null || _passengerLocation == null) return;
+    if (_selectedPickupPoint == null || _passengerLocation == null) {
+      _pickupValidation = null;
+      _pickupValidationError = null;
+      notifyListeners();
+      return;
+    }
+
+    _isValidatingPickup = true;
+    _pickupValidationError = null;
+    notifyListeners();
 
     try {
-      _pickupValidation = await bookingRepository.validatePickup(
+      final result = await bookingRepository.validatePickup(
         pickupPointId: _selectedPickupPoint!.id,
         latitude: _passengerLocation!.latitude,
         longitude: _passengerLocation!.longitude,
       );
+      _pickupValidation = result;
+      if (!result.isValid) {
+        _clearQuote();
+      }
     } catch (e) {
-      // Non-fatal pre-check; backend validation during booking creation is authoritative
+      // Fail closed when validation endpoint fails or returns an error
       _pickupValidation = null;
+      _pickupValidationError = e is ApiException
+          ? e.message
+          : 'Failed to validate pickup proximity: ${e.toString()}';
+      _clearQuote();
+    } finally {
+      _isValidatingPickup = false;
+      notifyListeners();
     }
-    notifyListeners();
   }
 
   /// Selects a destination point (e.g. from map tap) and validates against Gandhinagar boundary.
@@ -261,7 +298,20 @@ class BookingFlowProvider extends ChangeNotifier {
   /// Generates a 2-minute binding fare quote.
   Future<void> requestFareQuote() async {
     if (hasPendingSubmission) return;
-    if (_selectedPickupPoint == null || _selectedDestination == null) return;
+    if (_selectedPickupPoint == null ||
+        _passengerLocation == null ||
+        _pickupValidation?.isValid != true ||
+        _selectedDestination == null ||
+        _destinationValidation?.isInsideServiceRegion != true) {
+      if (_passengerLocation == null) {
+        _quoteError = 'Actual GPS location is required to request a fare quote.';
+      } else if (_pickupValidation?.isValid != true) {
+        _quoteError =
+            'You must be within the 150m authorized pickup geofence to request a fare quote.';
+      }
+      notifyListeners();
+      return;
+    }
 
     _isLoadingQuote = true;
     _quoteError = null;
@@ -330,8 +380,9 @@ class BookingFlowProvider extends ChangeNotifier {
     } else {
       // FIRST ATTEMPT: Validate preconditions and save immutable request snapshot
       if (!canSubmitBooking) return false;
-      if (_passengerLocation == null) {
-        _submissionError = 'Passenger pickup coordinate is missing.';
+      if (_passengerLocation == null || _pickupValidation?.isValid != true) {
+        _submissionError =
+            'A verified pickup location within the 150m geofence is required.';
         notifyListeners();
         return false;
       }
@@ -493,6 +544,7 @@ class BookingFlowProvider extends ChangeNotifier {
     _upfrontConsentAgreed = false;
     _currentIdempotencyKey = null;
     _pendingRequestSnapshot = null;
+    _pickupValidationError = null;
     notifyListeners();
     return true;
   }

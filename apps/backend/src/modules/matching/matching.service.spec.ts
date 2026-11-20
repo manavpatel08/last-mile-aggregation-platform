@@ -573,6 +573,27 @@ describe('MatchingService Integration & Invariant Tests', () => {
       const b1Db = await prisma.booking.findUnique({ where: { id: b1.bookingId } });
       expect(b1Db!.status).toBe('MATCHED');
     });
+
+    it('should release Redis lease in finally block if PostgreSQL batch registration fails', async () => {
+      const releaseSpy = vi.spyOn(matchingService, 'releaseLease');
+      vi.spyOn(matchingService, 'registerActiveBatch').mockRejectedValueOnce(
+        new Error('Simulated PostgreSQL registration failure'),
+      );
+
+      const summary = await matchingService.processMatchingCycle('PDEU Main Gate');
+
+      expect(summary).not.toBeNull();
+      expect(summary!.skippedReason).toContain('Simulated PostgreSQL registration failure');
+      expect(releaseSpy).toHaveBeenCalledWith(
+        LEASE_KEY_PDEU,
+        expect.any(String),
+      );
+
+      // Verify Redis lease is immediately available and not leaked
+      const token = await matchingService.acquireLease(LEASE_KEY_PDEU, 30000);
+      expect(token).not.toBeNull();
+      await matchingService.releaseLease(LEASE_KEY_PDEU, token!);
+    });
   });
 
   describe('FIFO Seed Selection & Spatial KNN Shortlisting', () => {

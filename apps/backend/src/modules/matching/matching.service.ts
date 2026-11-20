@@ -181,15 +181,15 @@ export class MatchingService {
     const batchId = randomUUID();
     let totalEligibleCount = 0;
 
-    // 2b. Register active batch in PostgreSQL establishing a durable database-level fencing epoch
-    await this.registerActiveBatch(
-      pickupPoint.id,
-      batchId,
-      leaseToken,
-      LEASE_TTL_MS,
-    );
-
     try {
+      // 2b. Register active batch in PostgreSQL establishing a durable database-level fencing epoch
+      await this.registerActiveBatch(
+        pickupPoint.id,
+        batchId,
+        leaseToken,
+        LEASE_TTL_MS,
+      );
+
       // 3. Extract eligible candidate pool (ordered FIFO by created_at ASC)
       const eligiblePool = await this.queryEligibleBookings(pickupPoint.id);
       totalEligibleCount = eligiblePool.length;

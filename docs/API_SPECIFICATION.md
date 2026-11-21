@@ -552,7 +552,7 @@ Idempotency-Key: <unique-uuid-or-client-nonce>
 - **Method & Path:** `POST /api/v1/admin/cancellation-fees/:id/waive`
 - **Auth:** Bearer Token (`ADMIN`)
 - **Request Body:** `{ "waiverReason": "Verified campus medical emergency" }`
-- **State Transition:** Sets fee status `'WAIVED'`, logs action in `admin_audit_logs`.
+- **State Transition:** Sets fee status `'WAIVED'`, records `waived_by_user_id`, `waiver_reason`, and `waived_at` on `cancellation_fees` as authoritative audit record, and emits `CANCELLATION_FEE_WAIVED` outbox event.
 
 ---
 

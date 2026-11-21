@@ -65,7 +65,9 @@ describe('PrismaService (Database & PostGIS Integration)', () => {
     expect(indexNames).toContain('idx_unique_active_group_assignment');
     expect(indexNames).toContain('idx_unique_single_pending_offer_per_group');
     expect(indexNames).toContain('idx_unique_driver_offer_per_group_version');
-    expect(indexNames).toContain('idx_unique_collected_booking_fee');
+    expect(indexNames).toContain('idx_unique_cancellation_fee_per_booking');
+    expect(indexNames).toContain('idx_unique_cash_collection_trip_passenger');
+    expect(indexNames).toContain('idx_cancellation_fees_collected_booking');
     // Spatial GiST
     expect(indexNames).toContain('idx_pickup_points_center_gist');
     expect(indexNames).toContain('idx_service_zones_boundary_gist');

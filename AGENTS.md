@@ -103,8 +103,9 @@ When generating Prisma migrations or executing raw SQL queries, you must guarant
    `CREATE UNIQUE INDEX idx_unique_single_pending_offer_per_group ON driver_dispatch_offers (ride_group_id) WHERE status = 'PENDING';`
 6. **Scoped Driver Offer Exclusion:**
    `CREATE UNIQUE INDEX idx_unique_driver_offer_per_group_version ON driver_dispatch_offers (ride_group_id, group_version, dispatch_attempt_id, driver_id);`
-7. **No Duplicate Fee Collection:**
-   `CREATE UNIQUE INDEX idx_unique_collected_booking_fee ON cancellation_fees (collected_booking_id) WHERE status = 'COLLECTED';`
+7. **Single Cancellation Fee per Booking and Single Cash Collection per Journey:**
+   `CREATE UNIQUE INDEX idx_unique_cancellation_fee_per_booking ON cancellation_fees (original_booking_id);`
+   `CREATE UNIQUE INDEX idx_unique_cash_collection_trip_passenger ON cash_collections (trip_passenger_id);`
 8. **Group Capacity Limits:** A shared group must maintain between 2 and 4 passengers while active for dispatch.
 9. **Ownership Protection:** A passenger can never cancel or query another passenger's booking.
 10. **Driver Eligibility:** Only administrator-approved (`verification_status = 'APPROVED'`), online (`is_online = true`), unsuspended drivers can receive or accept offers.

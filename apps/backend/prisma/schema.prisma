@@ -251,7 +251,7 @@ model Booking {
   batchBookings            MatchingBatchBooking[]
   groupMembers             GroupMember[]
   tripPassengers           TripPassenger[]
-  cancellationFeesIncurred CancellationFee[]        @relation("OriginalBookingFees")
+  cancellationFeeIncurred  CancellationFee?        @relation("OriginalBookingFees")
   cancellationFeesCollected CancellationFee[]       @relation("CollectedBookingFees")
 
   @@index([passengerId, status])
@@ -490,7 +490,7 @@ model TripPassenger {
   boardingVerification BoardingVerification?
   fareAdjustments      FareAdjustment[]
   refundRecords        RefundRecord[]
-  cashCollections      CashCollection[]
+  cashCollection       CashCollection?
 
   @@index([tripId, status])
   @@index([passengerId, status])
@@ -613,7 +613,7 @@ model RefundRecord {
 model CancellationFee {
   id                 String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   passengerId        String    @map("passenger_id") @db.Uuid
-  originalBookingId  String    @map("original_booking_id") @db.Uuid
+  originalBookingId  String    @unique(map: "idx_unique_cancellation_fee_per_booking") @map("original_booking_id") @db.Uuid
   amountPaise        Int       @default(3000) @map("amount_paise")
   status             String    @default("OUTSTANDING") @map("status") @db.VarChar(50)
   collectedBookingId String?   @map("collected_booking_id") @db.Uuid
@@ -636,7 +636,7 @@ model CashCollection {
   id                      String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   tripId                  String   @map("trip_id") @db.Uuid
   driverId                String   @map("driver_id") @db.Uuid
-  tripPassengerId         String   @map("trip_passenger_id") @db.Uuid
+  tripPassengerId         String   @unique(map: "idx_unique_cash_collection_trip_passenger") @map("trip_passenger_id") @db.Uuid
   totalCashCollectedPaise Int      @map("total_cash_collected_paise")
   paymentStatus           String   @default("PAID") @map("payment_status") @db.VarChar(50)
   confirmedAt             DateTime @default(now()) @map("confirmed_at") @db.Timestamptz(6)

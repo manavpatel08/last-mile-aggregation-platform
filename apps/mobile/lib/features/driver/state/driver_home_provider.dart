@@ -633,11 +633,14 @@ class DriverHomeProvider extends ChangeNotifier {
       return false;
     }
 
+    final isRetryOfUnresolved = _unresolvedOfferId == offerId;
     final offerIndex = _offers.indexWhere((o) => o.id == offerId);
-    if (offerIndex == -1) return false;
+    if (offerIndex == -1 && !isRetryOfUnresolved) return false;
 
-    final targetOffer = _offers[offerIndex];
-    if (targetOffer.isActionPending || targetOffer.isExpired) return false;
+    if (offerIndex != -1) {
+      final targetOffer = _offers[offerIndex];
+      if (targetOffer.isActionPending || targetOffer.isExpired) return false;
+    }
 
     final sessionGen = _sessionGeneration;
     final sessionUser = _currentUserId;
@@ -645,13 +648,15 @@ class DriverHomeProvider extends ChangeNotifier {
 
     _isProcessingAction = true;
     _actionSuccessMessage = null;
-    _offers = [
-      for (int i = 0; i < _offers.length; i++)
-        if (i == offerIndex)
-          _offers[i].copyWith(status: DispatchOfferStatus.accepting)
-        else
-          _offers[i],
-    ];
+    if (offerIndex != -1) {
+      _offers = [
+        for (int i = 0; i < _offers.length; i++)
+          if (i == offerIndex)
+            _offers[i].copyWith(status: DispatchOfferStatus.accepting)
+          else
+            _offers[i],
+      ];
+    }
     notifyListeners();
 
     final idempotencyKey = _offerIdempotencyKeys.putIfAbsent(
@@ -748,6 +753,14 @@ class DriverHomeProvider extends ChangeNotifier {
         notifyListeners();
       }
     }
+  }
+
+  /// Retries accepting the current unresolved offer using the original offer ID
+  /// and identical idempotency key, even if the offer is no longer in pending offers.
+  Future<bool> retryUnresolvedOffer({DriverRepository? repository}) async {
+    final unresolvedId = _unresolvedOfferId;
+    if (unresolvedId == null) return false;
+    return acceptOffer(unresolvedId, repository: repository);
   }
 
   /// Driver explicitly rejects a dispatch offer (`POST /api/v1/drivers/offers/:id/reject`).

@@ -389,22 +389,26 @@ void main() {
       expect(provider.isProcessingAction, isFalse);
     });
 
-    test('ambiguous accept retry: reuses identical Idempotency-Key and succeeds upon authoritative 200', () async {
+    test('ambiguous acceptance followed by empty pending-offer list can still be retried with identical key and original offer ID', () async {
       fakeRepo.statusResponse = approvedOnlineStatus;
       fakeRepo.offersResponse = [sampleOffer1];
       await provider.loadDashboard(verificationStatus: 'APPROVED', userId: 'user-1');
+      expect(provider.offers.length, 1);
 
-      // First call throws network error
+      // First call throws network error, and server accepted it so pending offers is now empty
       fakeRepo.shouldThrowOnAcceptOffer = true;
       fakeRepo.acceptOfferException = const ApiException(
         statusCode: null,
         errorCode: 'NETWORK_UNAVAILABLE',
         message: 'Network connection lost.',
       );
+      fakeRepo.offersResponse = const []; // Pending offers is now empty!
 
       final f1 = await provider.acceptOffer('off-101');
       expect(f1, isFalse);
       expect(provider.unresolvedOfferId, 'off-101');
+      expect(provider.offers, isEmpty); // Offer card disappeared from pending list!
+      expect(provider.inboxState, DispatchInboxState.empty);
       expect(
         provider.offersError,
         'Acceptance outcome could not be confirmed. Please check your network and retry.',
@@ -412,7 +416,7 @@ void main() {
       final firstKey = fakeRepo.lastAcceptedIdempotencyKey;
       expect(firstKey, isNotNull);
 
-      // Driver retries acceptance with authoritative 200 response
+      // Driver retries acceptance despite the offer card no longer existing in pending offers
       fakeRepo.shouldThrowOnAcceptOffer = false;
       fakeRepo.acceptOfferException = null;
       fakeRepo.acceptOfferResponse = const AcceptOfferResponse(
@@ -427,12 +431,49 @@ void main() {
 
       final f2 = await provider.acceptOffer('off-101');
       expect(f2, isTrue);
-      expect(provider.unresolvedOfferId, isNull);
+      expect(provider.unresolvedOfferId, isNull); // Authoritative 200 resolves the operation
       expect(provider.actionSuccessMessage, 'Offer accepted successfully!');
+      expect(provider.operationalStatus, 'RESERVED');
       final secondKey = fakeRepo.lastAcceptedIdempotencyKey;
 
-      // Verifies exact same idempotency key was reused for the retry!
+      // Verifies exact same idempotency key and offer ID were reused for the retry!
+      expect(fakeRepo.lastAcceptedOfferId, 'off-101');
       expect(secondKey, equals(firstKey));
+    });
+
+    test('retryUnresolvedOffer delegates to acceptOffer for the unresolved offer', () async {
+      fakeRepo.statusResponse = approvedOnlineStatus;
+      fakeRepo.offersResponse = [sampleOffer1];
+      await provider.loadDashboard(verificationStatus: 'APPROVED', userId: 'user-1');
+
+      fakeRepo.shouldThrowOnAcceptOffer = true;
+      fakeRepo.acceptOfferException = const ApiException(
+        statusCode: 504,
+        errorCode: 'GATEWAY_TIMEOUT',
+        message: 'Gateway timeout',
+      );
+      fakeRepo.offersResponse = const [];
+
+      final f1 = await provider.acceptOffer('off-101');
+      expect(f1, isFalse);
+      expect(provider.unresolvedOfferId, 'off-101');
+
+      fakeRepo.shouldThrowOnAcceptOffer = false;
+      fakeRepo.acceptOfferException = null;
+      fakeRepo.acceptOfferResponse = const AcceptOfferResponse(
+        assignmentId: 'asgn-1',
+        tripId: 'trip-1',
+        rideGroupId: 'grp-101',
+        passengerCount: 2,
+        totalEstimatedFare: '32.00',
+        navigationRoute: NavigationRouteData(geometry: {}, stops: []),
+      );
+      fakeRepo.statusResponse = approvedReservedStatus;
+
+      final f2 = await provider.retryUnresolvedOffer();
+      expect(f2, isTrue);
+      expect(provider.unresolvedOfferId, isNull);
+      expect(fakeRepo.lastAcceptedOfferId, 'off-101');
     });
 
     test('unresolved acceptance blocks starting conflicting acceptance of another offer', () async {

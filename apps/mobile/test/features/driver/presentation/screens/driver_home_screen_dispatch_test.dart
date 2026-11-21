@@ -688,6 +688,111 @@ void main() {
       expect(find.text('Offer accepted successfully!'), findsOneWidget);
     });
 
+    testWidgets('ambiguous acceptance followed by empty pending offers displays unresolved retry card and tapping retry succeeds', (tester) async {
+      final tokenStore = AuthTokenStore();
+      final secureStorage = SecureTokenStorage.inMemory({
+        SecureTokenStorage.refreshTokenKey: 'existing-refresh-token',
+      });
+      final authRepo = FakeAuthRepository(currentUser: approvedDriverUser);
+      final driverRepo = FakeDriverRepository(
+        statusResponse: const DriverStatusResponse(
+          id: 'dp-approved-1',
+          verificationStatus: 'APPROVED',
+          operationalStatus: 'AVAILABLE',
+          isOnline: true,
+          vehiclesCount: 1,
+        ),
+        offersResponse: [sampleOffer],
+        shouldThrowOnAcceptOffer: true,
+        acceptOfferException: const ApiException(
+          statusCode: null,
+          errorCode: 'NETWORK_UNAVAILABLE',
+          message: 'Network connection lost.',
+        ),
+        vehiclesResponse: [sampleVehicle],
+      );
+
+      final authProvider = AuthProvider(
+        authRepository: authRepo,
+        googleSignInService: FakeGoogleSignInService(),
+        tokenStore: tokenStore,
+        secureStorage: secureStorage,
+      );
+      await authProvider.restoreSession();
+
+      final homeProvider = DriverHomeProvider(
+        driverRepository: driverRepo,
+        locationTracker: const NoOpDriverLocationTracker(),
+      );
+      addTearDown(homeProvider.dispose);
+
+      await tester.pumpWidget(
+        LastMileApp(
+          config: testConfig,
+          authProvider: authProvider,
+          tokenStore: tokenStore,
+          secureStorage: secureStorage,
+          authRepository: authRepo,
+          driverRepository: driverRepo,
+          driverHomeProvider: homeProvider,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Tap accept button
+      final acceptBtn = find.byKey(const Key('dispatch_offer_accept_button_off-real-123'));
+      await tester.ensureVisible(acceptBtn);
+
+      // On the server, pending offers becomes empty after attempt
+      driverRepo.offersResponse = const [];
+
+      await tester.tap(acceptBtn);
+      await tester.pumpAndSettle();
+
+      expect(driverRepo.acceptOfferCallCount, 1);
+      final firstKey = driverRepo.lastAcceptedIdempotencyKey;
+      expect(firstKey, isNotNull);
+
+      // Offer card disappeared from pending list, but unresolved retry card is displayed
+      expect(find.byKey(const Key('driver_offers_unresolved_card')), findsOneWidget);
+      expect(find.byKey(const Key('driver_offers_retry_accept_button')), findsOneWidget);
+      expect(find.text('Offer Acceptance Pending Confirmation'), findsOneWidget);
+
+      // Now server connectivity recovers and retry returns authoritative 200 response
+      driverRepo.shouldThrowOnAcceptOffer = false;
+      driverRepo.acceptOfferException = null;
+      driverRepo.acceptOfferResponse = const AcceptOfferResponse(
+        assignmentId: 'asgn-real-123',
+        tripId: 'trip-real-123',
+        rideGroupId: 'grp-real-123',
+        passengerCount: 3,
+        totalEstimatedFare: '48.00',
+        navigationRoute: NavigationRouteData(geometry: {}, stops: []),
+      );
+      driverRepo.statusResponse = const DriverStatusResponse(
+        id: 'dp-approved-1',
+        verificationStatus: 'APPROVED',
+        operationalStatus: 'RESERVED',
+        isOnline: true,
+        vehiclesCount: 1,
+      );
+
+      // Tap Retry Acceptance button on unresolved card
+      final retryBtn = find.byKey(const Key('driver_offers_retry_accept_button'));
+      await tester.tap(retryBtn);
+      await tester.pumpAndSettle();
+
+      // Confirms retry occurred with identical offer ID and idempotency key
+      expect(driverRepo.acceptOfferCallCount, 2);
+      expect(driverRepo.lastAcceptedOfferId, 'off-real-123');
+      expect(driverRepo.lastAcceptedIdempotencyKey, equals(firstKey));
+
+      // Unresolved card is now resolved and cleared
+      expect(find.byKey(const Key('driver_offers_unresolved_card')), findsNothing);
+      expect(find.byKey(const Key('driver_offer_accepted_snackbar')), findsOneWidget);
+      expect(find.text('Offer accepted successfully!'), findsOneWidget);
+    });
+
     testWidgets('rejecting an offer invokes rejectOffer with Idempotency-Key and removes offer', (tester) async {
       final tokenStore = AuthTokenStore();
       final secureStorage = SecureTokenStorage.inMemory({

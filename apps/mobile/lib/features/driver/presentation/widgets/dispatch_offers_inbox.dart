@@ -21,6 +21,8 @@ class DispatchOffersInbox extends StatelessWidget {
     this.onRetry,
     this.onAcceptOffer,
     this.onRejectOffer,
+    this.unresolvedOfferId,
+    this.onRetryAccept,
   });
 
   /// The current presentation state of the dispatch inbox.
@@ -40,6 +42,12 @@ class DispatchOffersInbox extends StatelessWidget {
 
   /// Callback when driver declines an offer.
   final ValueChanged<String>? onRejectOffer;
+
+  /// Optional offer ID whose acceptance was attempted but remains unconfirmed.
+  final String? unresolvedOfferId;
+
+  /// Optional callback to retry accepting the unresolved offer.
+  final ValueChanged<String>? onRetryAccept;
 
   @override
   Widget build(BuildContext context) {
@@ -106,6 +114,10 @@ class DispatchOffersInbox extends StatelessWidget {
   }
 
   Widget _buildContent(BuildContext context) {
+    if (unresolvedOfferId != null && !offers.any((o) => o.id == unresolvedOfferId)) {
+      return _buildUnresolvedCard(context);
+    }
+
     final textTheme = Theme.of(context).textTheme;
 
     switch (state) {
@@ -339,5 +351,64 @@ class DispatchOffersInbox extends StatelessWidget {
               .toList(),
         );
     }
+  }
+
+  Widget _buildUnresolvedCard(BuildContext context) {
+    final textTheme = Theme.of(context).textTheme;
+
+    return Card(
+      key: const Key('driver_offers_unresolved_card'),
+      elevation: 0,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(14),
+        side: BorderSide(color: AppColors.warning.withValues(alpha: 0.5)),
+      ),
+      color: AppColors.warning.withValues(alpha: 0.08),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(
+                  Icons.sync_problem_outlined,
+                  color: AppColors.warning,
+                  size: 22,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Offer Acceptance Pending Confirmation',
+                    style: textTheme.titleSmall?.copyWith(
+                      fontWeight: FontWeight.bold,
+                      color: AppColors.textPrimary,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            Text(
+              errorMessage ??
+                  'Acceptance outcome could not be confirmed. Please check your network and retry.',
+              style: textTheme.bodySmall?.copyWith(
+                color: AppColors.textPrimary,
+              ),
+            ),
+            const SizedBox(height: 12),
+            FilledButton.icon(
+              key: const Key('driver_offers_retry_accept_button'),
+              onPressed: () {
+                final handler = onRetryAccept ?? onAcceptOffer;
+                handler?.call(unresolvedOfferId!);
+              },
+              icon: const Icon(Icons.refresh, size: 16),
+              label: const Text('Retry Acceptance'),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }

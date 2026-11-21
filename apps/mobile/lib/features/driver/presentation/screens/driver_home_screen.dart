@@ -126,6 +126,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen>
     final success = await provider.acceptOffer(offerId, repository: repo);
     if (!mounted) return;
     if (success) {
+      ScaffoldMessenger.of(context).hideCurrentSnackBar();
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           key: const Key('driver_offer_accepted_snackbar'),
@@ -136,11 +137,21 @@ class _DriverHomeScreenState extends State<DriverHomeScreen>
         ),
       );
     } else if (provider.offersError != null) {
+      ScaffoldMessenger.of(context).hideCurrentSnackBar();
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           key: const Key('driver_offer_error_snackbar'),
           content: Text(provider.offersError!),
           backgroundColor: AppColors.error,
+          action: provider.unresolvedOfferId != null
+              ? SnackBarAction(
+                  key: const Key('driver_offer_error_retry_action'),
+                  label: 'Retry',
+                  textColor: Colors.white,
+                  onPressed: () =>
+                      _handleAcceptOffer(provider.unresolvedOfferId!),
+                )
+              : null,
         ),
       );
     }
@@ -169,6 +180,15 @@ class _DriverHomeScreenState extends State<DriverHomeScreen>
           key: const Key('driver_offer_error_snackbar'),
           content: Text(provider.offersError!),
           backgroundColor: AppColors.error,
+          action: provider.unresolvedOfferId != null
+              ? SnackBarAction(
+                  key: const Key('driver_offer_error_retry_action'),
+                  label: 'Retry',
+                  textColor: Colors.white,
+                  onPressed: () =>
+                      _handleAcceptOffer(provider.unresolvedOfferId!),
+                )
+              : null,
         ),
       );
     }
@@ -702,6 +722,8 @@ class _DriverHomeScreenState extends State<DriverHomeScreen>
                     state: driverProvider.inboxState,
                     offers: driverProvider.offers,
                     errorMessage: driverProvider.offersError,
+                    unresolvedOfferId: driverProvider.unresolvedOfferId,
+                    onRetryAccept: _handleAcceptOffer,
                     onRetry: () {
                       DriverRepository? repo;
                       try {

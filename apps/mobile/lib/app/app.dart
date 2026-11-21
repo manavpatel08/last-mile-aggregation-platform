@@ -93,6 +93,15 @@ class _LastMileAppState extends State<LastMileApp> {
   late final bool _ownsAuthProvider;
   late final ApiClient _apiClient;
   late final GoRouter _router;
+  String? _lastAuthUserId;
+
+  void _handleAuthChange() {
+    final currentUserId = _authProvider.user?.id;
+    if (currentUserId != _lastAuthUserId || !_authProvider.isAuthenticated) {
+      _lastAuthUserId = currentUserId;
+      _driverHomeProvider.clear();
+    }
+  }
 
   @override
   void initState() {
@@ -174,10 +183,14 @@ class _LastMileAppState extends State<LastMileApp> {
       appModeProvider: _appModeProvider,
       authProvider: _authProvider,
     );
+
+    _lastAuthUserId = _authProvider.user?.id;
+    _authProvider.addListener(_handleAuthChange);
   }
 
   @override
   void dispose() {
+    _authProvider.removeListener(_handleAuthChange);
     _router.dispose();
     if (_ownsAppModeProvider) {
       _appModeProvider.dispose();

@@ -46,8 +46,21 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
     }
     context.read<DriverHomeProvider>().loadDashboard(
       verificationStatus: verificationStatus,
+      userId: user?.id,
       repository: repo,
     );
+  }
+
+  Future<void> _handleRefreshApplicationStatus() async {
+    final onboardingProvider = context.read<DriverOnboardingProvider>();
+    final authProvider = context.read<AuthProvider>();
+    final success = await onboardingProvider.retryProfileSync(
+      authProvider: authProvider,
+    );
+    if (!mounted) return;
+    if (success) {
+      _loadDashboard();
+    }
   }
 
   Color _colorForOperationalStatus(String status) {
@@ -136,7 +149,10 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
             key: const Key('logout_button'),
             icon: const Icon(Icons.logout),
             tooltip: 'Sign out',
-            onPressed: () => context.read<AuthProvider>().logout(),
+            onPressed: () {
+              context.read<DriverHomeProvider>().clear();
+              context.read<AuthProvider>().logout();
+            },
           ),
           const SizedBox(width: 8),
         ],
@@ -151,6 +167,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
             } catch (_) {}
             await context.read<DriverHomeProvider>().refreshDashboard(
               verificationStatus: verificationStatus,
+              userId: user?.id,
               repository: repo,
             );
           },
@@ -206,11 +223,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
                         ),
                         onPressed: onboardingProvider.isSubmitting
                             ? null
-                            : () async {
-                                await onboardingProvider.retryProfileSync(
-                                  authProvider: context.read<AuthProvider>(),
-                                );
-                              },
+                            : _handleRefreshApplicationStatus,
                         icon: onboardingProvider.isSubmitting
                             ? const SizedBox(
                                 width: 16,
@@ -569,7 +582,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
                   ],
                 ),
                 const SizedBox(height: 12),
-                if (driverProvider.vehicles.isEmpty) ...[
+                if (driverProvider.hasLoaded && driverProvider.vehicles.isEmpty) ...[
                   Card(
                     key: const Key('driver_empty_vehicles_card'),
                     elevation: 0,
@@ -611,7 +624,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
                       ),
                     ),
                   ),
-                ] else ...[
+                ] else if (driverProvider.vehicles.isNotEmpty) ...[
                   for (final vehicle in driverProvider.vehicles) ...[
                     Card(
                       key: Key('driver_vehicle_card_${vehicle.id}'),

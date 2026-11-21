@@ -10,6 +10,7 @@ import 'package:lastmile_mobile/features/auth/state/auth_provider.dart';
 import 'package:lastmile_mobile/features/driver/models/driver_status_response.dart';
 import 'package:lastmile_mobile/features/driver/models/driver_vehicle.dart';
 import 'package:lastmile_mobile/features/driver/state/driver_home_provider.dart';
+import 'package:lastmile_mobile/features/driver/state/driver_onboarding_provider.dart';
 
 import '../../../../helpers/test_fakes.dart';
 
@@ -562,6 +563,355 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(authProvider.isAuthenticated, isFalse);
+    });
+
+    testWidgets('cross-account isolation: data from first driver is never displayed to second driver', (tester) async {
+      final tokenStore = AuthTokenStore();
+      final secureStorage = SecureTokenStorage.inMemory({
+        SecureTokenStorage.refreshTokenKey: 'existing-refresh-token',
+      });
+      final authRepo = FakeAuthRepository(currentUser: approvedDriverUser);
+      final driverRepo = FakeDriverRepository(
+        statusResponse: const DriverStatusResponse(
+          id: 'dp-approved-1',
+          verificationStatus: 'APPROVED',
+          operationalStatus: 'AVAILABLE',
+          isOnline: true,
+          vehiclesCount: 1,
+        ),
+        vehiclesResponse: [sampleVehicle],
+      );
+
+      final authProvider = AuthProvider(
+        authRepository: authRepo,
+        googleSignInService: FakeGoogleSignInService(),
+        tokenStore: tokenStore,
+        secureStorage: secureStorage,
+      );
+      await authProvider.restoreSession();
+
+      final homeProvider = DriverHomeProvider(driverRepository: driverRepo);
+
+      await tester.pumpWidget(
+        LastMileApp(
+          config: testConfig,
+          authProvider: authProvider,
+          tokenStore: tokenStore,
+          secureStorage: secureStorage,
+          authRepository: authRepo,
+          driverRepository: driverRepo,
+          driverHomeProvider: homeProvider,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Driver 1 data is displayed
+      expect(find.text('GJ-01-AB-1234'), findsOneWidget);
+      expect(find.text('Mahindra Treo'), findsOneWidget);
+      expect(find.text('AVAILABLE'), findsAtLeastNWidgets(1));
+
+      // Driver 1 logs out
+      await tester.tap(find.byKey(const Key('logout_button')));
+      await tester.pumpAndSettle();
+
+      // On login screen; verify driver provider state was cleared
+      expect(find.byKey(const Key('google_sign_in_button')), findsOneWidget);
+      expect(homeProvider.status, isNull);
+      expect(homeProvider.vehicles, isEmpty);
+      expect(homeProvider.hasLoaded, isFalse);
+
+      // Prepare Driver 2 with a different vehicle and PENDING status
+      const driver2User = AuthUser(
+        id: 'driver-user-2',
+        email: 'driver2@pdeu.ac.in',
+        fullName: 'Driver Two',
+        role: 'DRIVER',
+        roles: ['DRIVER'],
+        driverVerificationStatus: 'PENDING',
+        driverProfile: DriverProfile(
+          id: 'dp-user-2',
+          licenseNumber: 'GJ-02-2023-0099999',
+          verificationStatus: 'PENDING',
+          operationalStatus: 'OFFLINE',
+          isOnline: false,
+        ),
+      );
+      const driver2Vehicle = DriverVehicle(
+        id: 'veh-driver-2',
+        driverProfileId: 'dp-user-2',
+        registrationNumber: 'GJ-02-CD-5678',
+        vehicleType: 'E_RICKSHAW',
+        passengerCapacity: 4,
+        makeModel: 'Mayuri Deluxe',
+        isActive: true,
+      );
+
+      driverRepo.statusResponse = null;
+      driverRepo.vehiclesResponse = [driver2Vehicle];
+      authRepo.currentUser = driver2User;
+
+      // Sign in as Driver 2
+      await tester.tap(find.byKey(const Key('google_sign_in_button')));
+      await tester.pumpAndSettle();
+
+      // CRITICAL ASSERTION: Driver 1 data is NEVER displayed to Driver 2!
+      expect(find.text('GJ-01-AB-1234'), findsNothing);
+      expect(find.text('Mahindra Treo'), findsNothing);
+      expect(find.text('AVAILABLE'), findsNothing);
+
+      // Driver 2's dashboard is displayed
+      expect(find.text('Driver Verification: PENDING'), findsOneWidget);
+      await tester.scrollUntilVisible(
+        find.text('GJ-02-CD-5678'),
+        200,
+        scrollable: find.byType(Scrollable).first,
+      );
+      expect(find.text('GJ-02-CD-5678'), findsOneWidget);
+      expect(find.text('Mayuri Deluxe'), findsOneWidget);
+    });
+
+    testWidgets('non-approved driver initial vehicle fetch failure displays error banner and does not display empty vehicles card', (tester) async {
+      final tokenStore = AuthTokenStore();
+      final secureStorage = SecureTokenStorage.inMemory({
+        SecureTokenStorage.refreshTokenKey: 'existing-refresh-token',
+      });
+      final authRepo = FakeAuthRepository(currentUser: pendingDriverUser);
+      final driverRepo = FakeDriverRepository(
+        shouldThrowOnVehicles: true,
+        vehiclesException: const ApiException(
+          statusCode: 500,
+          errorCode: 'SERVER_ERROR',
+          message: 'Failed to retrieve registered vehicles',
+        ),
+      );
+
+      final authProvider = AuthProvider(
+        authRepository: authRepo,
+        googleSignInService: FakeGoogleSignInService(),
+        tokenStore: tokenStore,
+        secureStorage: secureStorage,
+      );
+      await authProvider.restoreSession();
+
+      final homeProvider = DriverHomeProvider(driverRepository: driverRepo);
+
+      await tester.pumpWidget(
+        LastMileApp(
+          config: testConfig,
+          authProvider: authProvider,
+          tokenStore: tokenStore,
+          secureStorage: secureStorage,
+          authRepository: authRepo,
+          driverRepository: driverRepo,
+          driverHomeProvider: homeProvider,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Error banner is displayed with clear message
+      expect(find.byKey(const Key('driver_dashboard_error_banner')), findsOneWidget);
+      expect(find.text('Failed to retrieve registered vehicles'), findsOneWidget);
+
+      // Must NOT display "No Registered Vehicles" as though API succeeded with 0 vehicles!
+      expect(find.byKey(const Key('driver_empty_vehicles_card')), findsNothing);
+      expect(find.text('No Registered Vehicles'), findsNothing);
+
+      // Retry button is available
+      final retryButton = find.byKey(const Key('driver_dashboard_retry_button'));
+      expect(retryButton, findsOneWidget);
+
+      // Status endpoint must never have been called for PENDING driver
+      expect(driverRepo.getStatusCallCount, 0);
+
+      // Heal repository and tap retry
+      driverRepo.shouldThrowOnVehicles = false;
+      driverRepo.vehiclesException = null;
+      driverRepo.vehiclesResponse = [sampleVehicle];
+
+      await tester.tap(retryButton);
+      await tester.pumpAndSettle();
+
+      // Error banner dismissed, vehicle card appears
+      expect(find.byKey(const Key('driver_dashboard_error_banner')), findsNothing);
+      await tester.scrollUntilVisible(
+        find.text('GJ-01-AB-1234'),
+        200,
+        scrollable: find.byType(Scrollable).first,
+      );
+      expect(find.text('GJ-01-AB-1234'), findsOneWidget);
+    });
+
+    testWidgets('non-approved driver refresh vehicle fetch failure displays error banner and preserves existing vehicle card', (tester) async {
+      final tokenStore = AuthTokenStore();
+      final secureStorage = SecureTokenStorage.inMemory({
+        SecureTokenStorage.refreshTokenKey: 'existing-refresh-token',
+      });
+      final authRepo = FakeAuthRepository(currentUser: pendingDriverUser);
+      final driverRepo = FakeDriverRepository(
+        vehiclesResponse: [sampleVehicle],
+      );
+
+      final authProvider = AuthProvider(
+        authRepository: authRepo,
+        googleSignInService: FakeGoogleSignInService(),
+        tokenStore: tokenStore,
+        secureStorage: secureStorage,
+      );
+      await authProvider.restoreSession();
+
+      final homeProvider = DriverHomeProvider(driverRepository: driverRepo);
+
+      await tester.pumpWidget(
+        LastMileApp(
+          config: testConfig,
+          authProvider: authProvider,
+          tokenStore: tokenStore,
+          secureStorage: secureStorage,
+          authRepository: authRepo,
+          driverRepository: driverRepo,
+          driverHomeProvider: homeProvider,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Initial vehicle loaded
+      expect(homeProvider.hasLoaded, isTrue);
+      expect(homeProvider.vehicles.length, 1);
+
+      // Trigger refresh failure
+      driverRepo.shouldThrowOnVehicles = true;
+      driverRepo.vehiclesException = const ApiException(
+        statusCode: 503,
+        errorCode: 'SERVICE_UNAVAILABLE',
+        message: 'Vehicle service temporarily down',
+      );
+
+      // Perform swipe down to trigger refresh
+      await tester.fling(
+        find.byKey(const Key('driver_dashboard_refresh_indicator')),
+        const Offset(0, 300),
+        1000,
+      );
+      await tester.pumpAndSettle();
+
+      // Error banner is displayed
+      expect(find.byKey(const Key('driver_dashboard_error_banner')), findsOneWidget);
+      expect(find.text('Vehicle service temporarily down'), findsOneWidget);
+
+      // Existing vehicle data must be preserved and still visible
+      await tester.scrollUntilVisible(
+        find.text('GJ-01-AB-1234'),
+        200,
+        scrollable: find.byType(Scrollable).first,
+      );
+      expect(find.text('GJ-01-AB-1234'), findsOneWidget);
+
+      // getDriverStatus must NEVER be called for PENDING driver
+      expect(driverRepo.getStatusCallCount, 0);
+    });
+
+    testWidgets('successful profile sync transitions driver from PENDING to APPROVED and reloads dashboard', (tester) async {
+      final tokenStore = AuthTokenStore();
+      final secureStorage = SecureTokenStorage.inMemory({
+        SecureTokenStorage.refreshTokenKey: 'existing-refresh-token',
+      });
+      final authRepo = FakeAuthRepository(currentUser: pendingDriverUser);
+      final driverRepo = FakeDriverRepository(
+        vehiclesResponse: [sampleVehicle],
+        statusResponse: const DriverStatusResponse(
+          id: 'dp-pending-1',
+          verificationStatus: 'APPROVED',
+          operationalStatus: 'AVAILABLE',
+          isOnline: true,
+          vehiclesCount: 1,
+        ),
+      );
+
+      final authProvider = AuthProvider(
+        authRepository: authRepo,
+        googleSignInService: FakeGoogleSignInService(),
+        tokenStore: tokenStore,
+        secureStorage: secureStorage,
+      );
+      await authProvider.restoreSession();
+
+      final onboardingProvider = DriverOnboardingProvider(driverRepository: driverRepo);
+      onboardingProvider.setProfileRefreshPending(true);
+
+      final homeProvider = DriverHomeProvider(driverRepository: driverRepo);
+
+      await tester.pumpWidget(
+        LastMileApp(
+          config: testConfig,
+          authProvider: authProvider,
+          tokenStore: tokenStore,
+          secureStorage: secureStorage,
+          authRepository: authRepo,
+          driverRepository: driverRepo,
+          driverOnboardingProvider: onboardingProvider,
+          driverHomeProvider: homeProvider,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Pending sync banner and PENDING driver banner are visible
+      expect(find.byKey(const Key('pending_sync_banner')), findsOneWidget);
+      expect(find.byKey(const Key('refresh_application_status_button')), findsOneWidget);
+      expect(find.text('Driver Verification: PENDING'), findsOneWidget);
+
+      await tester.scrollUntilVisible(
+        find.byKey(const Key('driver_operational_status_disabled')),
+        100,
+        scrollable: find.byType(Scrollable).first,
+      );
+      expect(find.byKey(const Key('driver_operational_status_disabled')), findsOneWidget);
+
+      // getDriverStatus must not have been called yet
+      expect(driverRepo.getStatusCallCount, 0);
+
+      // Admin approves driver on backend: update currentUser in auth repo
+      const newlyApprovedDriver = AuthUser(
+        id: 'driver-pending-1',
+        email: 'driver.pending@pdeu.ac.in',
+        fullName: 'Pending Driver',
+        role: 'DRIVER',
+        roles: ['DRIVER'],
+        driverVerificationStatus: 'APPROVED',
+        driverProfile: DriverProfile(
+          id: 'dp-pending-1',
+          licenseNumber: 'GJ-01-2023-0011111',
+          verificationStatus: 'APPROVED',
+          operationalStatus: 'AVAILABLE',
+          isOnline: true,
+        ),
+      );
+      authRepo.currentUser = newlyApprovedDriver;
+
+      // Scroll back up to the top so refresh button is fully visible
+      await tester.fling(find.byType(Scrollable).first, const Offset(0, 500), 1000);
+      await tester.pumpAndSettle();
+
+      // Tap "Refresh Application Status"
+      await tester.tap(find.byKey(const Key('refresh_application_status_button')));
+      await tester.pumpAndSettle();
+
+      // Pending sync banner and warning banner are dismissed
+      expect(find.byKey(const Key('pending_sync_banner')), findsNothing);
+      expect(find.text('Driver Verification: PENDING'), findsNothing);
+
+      // Dashboard now reflects APPROVED state
+      await tester.scrollUntilVisible(
+        find.byKey(const Key('driver_operational_status')),
+        100,
+        scrollable: find.byType(Scrollable).first,
+      );
+      expect(find.byKey(const Key('driver_operational_status')), findsOneWidget);
+      expect(find.text('AVAILABLE'), findsAtLeastNWidgets(1));
+      expect(find.byKey(const Key('driver_online_state')), findsOneWidget);
+      expect(find.text('Online'), findsOneWidget);
+
+      // getDriverStatus was called exactly once upon becoming APPROVED
+      expect(driverRepo.getStatusCallCount, 1);
     });
   });
 }

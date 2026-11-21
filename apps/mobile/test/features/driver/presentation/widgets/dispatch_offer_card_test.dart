@@ -30,13 +30,15 @@ void main() {
   }
 
   group('DispatchOfferCard Widget Tests', () {
-    testWidgets('renders all details for a single active offer with simple Pending status', (tester) async {
+    testWidgets('renders all details for a single active offer with Offer # identity and Pending status', (tester) async {
       await tester.pumpWidget(
         buildTestWidget(offer: DispatchOfferFixtures.sampleOffer1),
       );
 
       expect(find.byKey(const Key('dispatch_offer_card_grp-test-001')), findsOneWidget);
-      expect(find.text('Ride Group #grp-test-001'), findsOneWidget);
+      // Confirms offer identity is displayed as Offer # and not as Ride Group #
+      expect(find.text('Offer #grp-test-001'), findsOneWidget);
+      expect(find.textContaining('Ride Group'), findsNothing);
       expect(find.text('PDEU High-Rise Gate'), findsOneWidget);
       expect(find.text('Infocity Circle Corridor'), findsOneWidget);
       expect(find.text('3 riders'), findsOneWidget);
@@ -52,6 +54,21 @@ void main() {
       final rejectBtn = find.byKey(const Key('dispatch_offer_reject_button_grp-test-001'));
       expect(acceptBtn, findsOneWidget);
       expect(rejectBtn, findsOneWidget);
+    });
+
+    testWidgets('displays both offer ID and group ID when groupId is provided', (tester) async {
+      const offerWithGroup = DispatchOfferItem(
+        id: 'off-12345',
+        groupId: 'grp-99999',
+        pickupLocationName: 'Gate A',
+        dropoffLocationName: 'Gate B',
+        passengerCount: 3,
+        estimatedEarnings: '₹45.00',
+      );
+
+      await tester.pumpWidget(buildTestWidget(offer: offerWithGroup));
+
+      expect(find.text('Offer #off-12345 • Group #grp-99999'), findsOneWidget);
     });
 
     testWidgets('renders expired state and disables action buttons', (tester) async {
@@ -116,7 +133,7 @@ void main() {
       expect(find.byType(CircularProgressIndicator), findsOneWidget);
     });
 
-    testWidgets('invokes onAccept callback when Accept button is tapped', (tester) async {
+    testWidgets('invokes onAccept callback with offer id when Accept button is tapped', (tester) async {
       String? acceptedId;
       await tester.pumpWidget(
         buildTestWidget(
@@ -133,7 +150,7 @@ void main() {
       expect(acceptedId, 'grp-test-001');
     });
 
-    testWidgets('invokes onReject callback when Decline button is tapped', (tester) async {
+    testWidgets('invokes onReject callback with offer id when Decline button is tapped', (tester) async {
       String? rejectedId;
       await tester.pumpWidget(
         buildTestWidget(
@@ -181,12 +198,68 @@ void main() {
 
       await tester.pumpWidget(buildTestWidget(offer: minimalOffer));
 
-      expect(find.text('Ride Group #grp-minimal-001'), findsOneWidget);
+      expect(find.text('Offer #grp-minimal-001'), findsOneWidget);
       expect(find.text('Pending'), findsOneWidget);
       expect(find.text('2 riders'), findsOneWidget);
       expect(find.text('₹20.00'), findsOneWidget);
       expect(find.textContaining('km'), findsNothing);
       expect(find.textContaining('detour'), findsNothing);
+    });
+
+    testWidgets('responsive layout: renders cleanly without overflow at 360px width with UUID ID and all fields', (tester) async {
+      tester.view.physicalSize = const Size(360, 800);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+
+      const uuidOffer = DispatchOfferItem(
+        id: '9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d',
+        pickupLocationName: 'PDEU High-Rise Campus Gate 1',
+        dropoffLocationName: 'Infocity Circle Commercial Hub Corridor',
+        passengerCount: 4,
+        estimatedEarnings: '₹64.50',
+        estimatedDistance: '3.4 km',
+        detourPercentage: 18,
+        status: DispatchOfferStatus.pending,
+      );
+
+      await tester.pumpWidget(buildTestWidget(offer: uuidOffer));
+      expect(tester.takeException(), isNull);
+      expect(find.byKey(const Key('dispatch_offer_card_9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d')), findsOneWidget);
+      expect(find.text('4 riders'), findsOneWidget);
+      expect(find.text('3.4 km'), findsOneWidget);
+      expect(find.text('+18% detour'), findsOneWidget);
+      expect(find.text('₹64.50'), findsOneWidget);
+    });
+
+    testWidgets('responsive layout: renders cleanly without overflow at 320px width with UUID ID and all fields', (tester) async {
+      tester.view.physicalSize = const Size(320, 800);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+
+      const uuidOffer = DispatchOfferItem(
+        id: '9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d',
+        pickupLocationName: 'PDEU High-Rise Campus Gate 1',
+        dropoffLocationName: 'Infocity Circle Commercial Hub Corridor',
+        passengerCount: 4,
+        estimatedEarnings: '₹64.50',
+        estimatedDistance: '3.4 km',
+        detourPercentage: 18,
+        status: DispatchOfferStatus.pending,
+      );
+
+      await tester.pumpWidget(buildTestWidget(offer: uuidOffer));
+      expect(tester.takeException(), isNull);
+      expect(find.byKey(const Key('dispatch_offer_card_9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d')), findsOneWidget);
+      expect(find.text('4 riders'), findsOneWidget);
+      expect(find.text('3.4 km'), findsOneWidget);
+      expect(find.text('+18% detour'), findsOneWidget);
+      expect(find.text('₹64.50'), findsOneWidget);
     });
   });
 }

@@ -11,15 +11,24 @@ import '../../../../core/theme/app_colors.dart';
 class DriverAvailabilityCard extends StatelessWidget {
   const DriverAvailabilityCard({
     super.key,
-    this.isOnline = false,
+    this.isOnline,
   });
 
-  /// Authoritative server online state (defaults to `false` in Phase 1).
-  final bool isOnline;
+  /// Authoritative server online state (null if status is unavailable).
+  final bool? isOnline;
 
   @override
   Widget build(BuildContext context) {
     final textTheme = Theme.of(context).textTheme;
+
+    final String statusBadgeLabel;
+    if (isOnline == true) {
+      statusBadgeLabel = 'Online (Disabled)';
+    } else if (isOnline == false) {
+      statusBadgeLabel = 'Offline (Disabled)';
+    } else {
+      statusBadgeLabel = 'Status unavailable';
+    }
 
     return Card(
       key: const Key('driver_availability_card'),
@@ -70,7 +79,7 @@ class DriverAvailabilityCard extends StatelessWidget {
                     borderRadius: BorderRadius.circular(6),
                   ),
                   child: Text(
-                    isOnline ? 'Online (Disabled)' : 'Offline (Disabled)',
+                    statusBadgeLabel,
                     style: textTheme.bodySmall?.copyWith(
                       color: AppColors.textSecondary,
                       fontWeight: FontWeight.bold,
@@ -107,7 +116,7 @@ class DriverAvailabilityCard extends StatelessWidget {
                 const SizedBox(width: 12),
                 Switch(
                   key: const Key('driver_availability_switch'),
-                  value: isOnline,
+                  value: isOnline == true,
                   // Intentionally null in Phase 1: backend endpoint is not yet connected.
                   onChanged: null,
                 ),

@@ -2,6 +2,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:lastmile_mobile/app/app.dart';
 import 'package:lastmile_mobile/core/config/app_config.dart';
+import 'package:lastmile_mobile/core/network/api_exception.dart';
 import 'package:lastmile_mobile/core/network/auth_token_store.dart';
 import 'package:lastmile_mobile/core/storage/secure_token_storage.dart';
 import 'package:lastmile_mobile/features/auth/models/auth_user.dart';
@@ -387,6 +388,123 @@ void main() {
       expect(homeProvider.status, isNull);
       expect(homeProvider.vehicles, isEmpty);
       expect(homeProvider.currentUserId, isNull);
+    });
+
+    testWidgets('initial status-fetch failure displays Status unavailable on dashboard and availability card', (tester) async {
+      final tokenStore = AuthTokenStore();
+      final secureStorage = SecureTokenStorage.inMemory({
+        SecureTokenStorage.refreshTokenKey: 'existing-refresh-token',
+      });
+      final authRepo = FakeAuthRepository(currentUser: approvedDriverUser);
+      final driverRepo = FakeDriverRepository(
+        shouldThrowOnStatus: true,
+        statusException: const ApiException(
+          statusCode: 500,
+          errorCode: 'SERVER_ERROR',
+          message: 'Status endpoint failed',
+        ),
+        vehiclesResponse: [sampleVehicle],
+      );
+
+      final authProvider = AuthProvider(
+        authRepository: authRepo,
+        googleSignInService: FakeGoogleSignInService(),
+        tokenStore: tokenStore,
+        secureStorage: secureStorage,
+      );
+      await authProvider.restoreSession();
+
+      final homeProvider = DriverHomeProvider(driverRepository: driverRepo);
+
+      await tester.pumpWidget(
+        LastMileApp(
+          config: testConfig,
+          authProvider: authProvider,
+          tokenStore: tokenStore,
+          secureStorage: secureStorage,
+          authRepository: authRepo,
+          driverRepository: driverRepo,
+          driverHomeProvider: homeProvider,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Operational status and Server connection display Status unavailable
+      expect(find.byKey(const Key('driver_operational_status_unavailable')), findsOneWidget);
+      expect(find.byKey(const Key('driver_online_state_unavailable')), findsOneWidget);
+
+      // Driver Availability badge displays Status unavailable
+      final badgeFinder = find.byKey(const Key('driver_availability_status_badge'));
+      expect(badgeFinder, findsOneWidget);
+      expect(find.descendant(of: badgeFinder, matching: find.text('Status unavailable')), findsOneWidget);
+
+      // Switch remains disabled
+      final switchFinder = find.byKey(const Key('driver_availability_switch'));
+      expect(switchFinder, findsOneWidget);
+      final switchWidget = tester.widget<Switch>(switchFinder);
+      expect(switchWidget.value, isFalse);
+      expect(switchWidget.onChanged, isNull);
+
+      // Verify neither Offline nor Online is falsely claimed
+      expect(find.text('Offline'), findsNothing);
+      expect(find.text('Online'), findsNothing);
+    });
+
+    testWidgets('authoritative response with isOnline=false confirms and displays Offline', (tester) async {
+      final tokenStore = AuthTokenStore();
+      final secureStorage = SecureTokenStorage.inMemory({
+        SecureTokenStorage.refreshTokenKey: 'existing-refresh-token',
+      });
+      final authRepo = FakeAuthRepository(currentUser: approvedDriverUser);
+      final driverRepo = FakeDriverRepository(
+        statusResponse: const DriverStatusResponse(
+          id: 'dp-approved-1',
+          verificationStatus: 'APPROVED',
+          operationalStatus: 'OFFLINE',
+          isOnline: false,
+          vehiclesCount: 1,
+        ),
+        vehiclesResponse: [sampleVehicle],
+      );
+
+      final authProvider = AuthProvider(
+        authRepository: authRepo,
+        googleSignInService: FakeGoogleSignInService(),
+        tokenStore: tokenStore,
+        secureStorage: secureStorage,
+      );
+      await authProvider.restoreSession();
+
+      final homeProvider = DriverHomeProvider(driverRepository: driverRepo);
+
+      await tester.pumpWidget(
+        LastMileApp(
+          config: testConfig,
+          authProvider: authProvider,
+          tokenStore: tokenStore,
+          secureStorage: secureStorage,
+          authRepository: authRepo,
+          driverRepository: driverRepo,
+          driverHomeProvider: homeProvider,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Confirmed offline from server
+      expect(find.byKey(const Key('driver_online_state')), findsOneWidget);
+      expect(find.text('Offline'), findsOneWidget);
+      expect(find.byKey(const Key('driver_operational_status')), findsOneWidget);
+      expect(find.text('OFFLINE'), findsOneWidget);
+
+      // Availability card displays Offline (Disabled)
+      final badgeFinder = find.byKey(const Key('driver_availability_status_badge'));
+      expect(find.descendant(of: badgeFinder, matching: find.text('Offline (Disabled)')), findsOneWidget);
+
+      // Switch is disabled with false value
+      final switchFinder = find.byKey(const Key('driver_availability_switch'));
+      final switchWidget = tester.widget<Switch>(switchFinder);
+      expect(switchWidget.value, isFalse);
+      expect(switchWidget.onChanged, isNull);
     });
   });
 }

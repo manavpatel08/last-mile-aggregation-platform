@@ -4,7 +4,7 @@ import 'package:lastmile_mobile/core/theme/app_theme.dart';
 import 'package:lastmile_mobile/features/driver/presentation/widgets/driver_availability_card.dart';
 
 void main() {
-  Widget buildTestWidget({bool isOnline = false}) {
+  Widget buildTestWidget({bool? isOnline}) {
     return MaterialApp(
       theme: AppTheme.lightTheme,
       home: Scaffold(
@@ -35,15 +35,31 @@ void main() {
           reason: 'Switch must be disabled in Phase 1 because backend endpoint is not yet connected.');
     });
 
-    testWidgets('displays offline badge when isOnline is false', (tester) async {
+    testWidgets('displays Status unavailable badge when isOnline is null', (tester) async {
+      await tester.pumpWidget(buildTestWidget(isOnline: null));
+
+      final badgeFinder = find.byKey(const Key('driver_availability_status_badge'));
+      expect(badgeFinder, findsOneWidget);
+      expect(find.descendant(of: badgeFinder, matching: find.text('Status unavailable')), findsOneWidget);
+
+      final switchWidget = tester.widget<Switch>(find.byKey(const Key('driver_availability_switch')));
+      expect(switchWidget.value, isFalse);
+      expect(switchWidget.onChanged, isNull);
+    });
+
+    testWidgets('displays offline badge only when an authoritative response confirms isOnline == false', (tester) async {
       await tester.pumpWidget(buildTestWidget(isOnline: false));
 
       final badgeFinder = find.byKey(const Key('driver_availability_status_badge'));
       expect(badgeFinder, findsOneWidget);
       expect(find.descendant(of: badgeFinder, matching: find.text('Offline (Disabled)')), findsOneWidget);
+
+      final switchWidget = tester.widget<Switch>(find.byKey(const Key('driver_availability_switch')));
+      expect(switchWidget.value, isFalse);
+      expect(switchWidget.onChanged, isNull);
     });
 
-    testWidgets('displays online badge when isOnline is true while switch remains disabled', (tester) async {
+    testWidgets('displays online badge only when an authoritative response confirms isOnline == true', (tester) async {
       await tester.pumpWidget(buildTestWidget(isOnline: true));
 
       final badgeFinder = find.byKey(const Key('driver_availability_status_badge'));

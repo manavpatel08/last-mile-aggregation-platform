@@ -41,6 +41,7 @@ enum DispatchInboxState {
 class DispatchOfferItem {
   const DispatchOfferItem({
     required this.id,
+    this.groupId,
     required this.pickupLocationName,
     required this.dropoffLocationName,
     required this.passengerCount,
@@ -50,8 +51,11 @@ class DispatchOfferItem {
     this.status = DispatchOfferStatus.pending,
   });
 
-  /// Unique offer or group identifier.
+  /// Unique dispatch offer identifier passed to accept/reject actions.
   final String id;
+
+  /// Optional display identifier for the associated ride group.
+  final String? groupId;
 
   /// User-friendly name of the group pickup point (e.g. "PDEU High-Rise Gate").
   final String pickupLocationName;

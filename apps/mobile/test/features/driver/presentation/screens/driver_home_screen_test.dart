@@ -405,6 +405,13 @@ void main() {
       expect(find.text('Failed to load driver dashboard'), findsOneWidget);
       expect(find.text('Status endpoint unreachable'), findsOneWidget);
 
+      // Verify missing status is NOT interpreted as OFFLINE or Offline
+      expect(find.byKey(const Key('driver_operational_status_unavailable')), findsOneWidget);
+      expect(find.byKey(const Key('driver_online_state_unavailable')), findsOneWidget);
+      expect(find.text('Status unavailable'), findsAtLeastNWidgets(2));
+      expect(find.text('Offline'), findsNothing);
+      expect(find.text('Online'), findsNothing);
+
       final retryButton = find.byKey(const Key('driver_dashboard_retry_button'));
       expect(retryButton, findsOneWidget);
 

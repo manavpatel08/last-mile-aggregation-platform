@@ -66,7 +66,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
     }
   }
 
-  Color _colorForOperationalStatus(String status) {
+  Color _colorForOperationalStatus(String? status) {
     switch (status) {
       case 'AVAILABLE':
         return AppColors.success;
@@ -470,28 +470,39 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
                               ),
                             ),
                             if (isApproved) ...[
-                              Container(
-                                key: const Key('driver_operational_status'),
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 8,
-                                  vertical: 3,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: _colorForOperationalStatus(
-                                    driverProvider.operationalStatus,
-                                  ).withValues(alpha: 0.15),
-                                  borderRadius: BorderRadius.circular(6),
-                                ),
-                                child: Text(
-                                  driverProvider.operationalStatus,
-                                  style: textTheme.bodySmall?.copyWith(
+                              if (driverProvider.hasStatus && driverProvider.operationalStatus != null) ...[
+                                Container(
+                                  key: const Key('driver_operational_status'),
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 8,
+                                    vertical: 3,
+                                  ),
+                                  decoration: BoxDecoration(
                                     color: _colorForOperationalStatus(
                                       driverProvider.operationalStatus,
+                                    ).withValues(alpha: 0.15),
+                                    borderRadius: BorderRadius.circular(6),
+                                  ),
+                                  child: Text(
+                                    driverProvider.operationalStatus!,
+                                    style: textTheme.bodySmall?.copyWith(
+                                      color: _colorForOperationalStatus(
+                                        driverProvider.operationalStatus,
+                                      ),
+                                      fontWeight: FontWeight.bold,
                                     ),
-                                    fontWeight: FontWeight.bold,
                                   ),
                                 ),
-                              ),
+                              ] else ...[
+                                Text(
+                                  'Status unavailable',
+                                  key: const Key('driver_operational_status_unavailable'),
+                                  style: textTheme.bodySmall?.copyWith(
+                                    color: AppColors.textSecondary,
+                                    fontStyle: FontStyle.italic,
+                                  ),
+                                ),
+                              ],
                             ] else ...[
                               Text(
                                 'Disabled',
@@ -515,31 +526,42 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
                               ),
                             ),
                             if (isApproved) ...[
-                              Row(
-                                key: const Key('driver_online_state'),
-                                children: [
-                                  Container(
-                                    width: 8,
-                                    height: 8,
-                                    decoration: BoxDecoration(
-                                      shape: BoxShape.circle,
-                                      color: driverProvider.isOnline
-                                          ? AppColors.success
-                                          : AppColors.textSecondary,
+                              if (driverProvider.hasStatus && driverProvider.isOnline != null) ...[
+                                Row(
+                                  key: const Key('driver_online_state'),
+                                  children: [
+                                    Container(
+                                      width: 8,
+                                      height: 8,
+                                      decoration: BoxDecoration(
+                                        shape: BoxShape.circle,
+                                        color: driverProvider.isOnline == true
+                                            ? AppColors.success
+                                            : AppColors.textSecondary,
+                                      ),
                                     ),
-                                  ),
-                                  const SizedBox(width: 6),
-                                  Text(
-                                    driverProvider.isOnline ? 'Online' : 'Offline',
-                                    style: textTheme.bodySmall?.copyWith(
-                                      color: driverProvider.isOnline
-                                          ? AppColors.success
-                                          : AppColors.textSecondary,
-                                      fontWeight: FontWeight.bold,
+                                    const SizedBox(width: 6),
+                                    Text(
+                                      driverProvider.isOnline == true ? 'Online' : 'Offline',
+                                      style: textTheme.bodySmall?.copyWith(
+                                        color: driverProvider.isOnline == true
+                                            ? AppColors.success
+                                            : AppColors.textSecondary,
+                                        fontWeight: FontWeight.bold,
+                                      ),
                                     ),
+                                  ],
+                                ),
+                              ] else ...[
+                                Text(
+                                  'Status unavailable',
+                                  key: const Key('driver_online_state_unavailable'),
+                                  style: textTheme.bodySmall?.copyWith(
+                                    color: AppColors.textSecondary,
+                                    fontStyle: FontStyle.italic,
                                   ),
-                                ],
-                              ),
+                                ),
+                              ],
                             ] else ...[
                               Text(
                                 'Offline (Not Approved)',

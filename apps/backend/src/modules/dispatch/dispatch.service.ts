@@ -2,15 +2,29 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  ForbiddenException,
+  ConflictException,
+  Optional,
 } from '@nestjs/common';
+import { InjectQueue } from '@nestjs/bullmq';
+import type { Queue } from 'bullmq';
+import * as crypto from 'node:crypto';
 import { PrismaService } from '../../infrastructure/prisma/prisma.service.js';
 import { DriversService } from '../drivers/drivers.service.js';
 import { RoutingService } from '../routing/routing.service.js';
+import { QUEUES } from '../../common/constants/index.js';
+import { fenceAndCompleteIdempotentTransaction } from '../../common/interceptors/idempotency.interceptor.js';
+import type { IdempotencyClaimContext } from '../../common/interceptors/idempotency.interceptor.js';
 import {
   CandidateDriver,
   DispatchResult,
+  DispatchTimeoutJobPayload,
+  PendingOfferSummary,
+  AcceptOfferResponseData,
   DRIVER_OFFER_TIMEOUT_MS,
+  DISPATCH_TIMEOUT_JOB_NAME,
 } from './dispatch.interfaces.js';
+import { RejectOfferDto } from './dto/reject-offer.dto.js';
 
 /**
  * ============================================================================
@@ -22,7 +36,7 @@ import {
  *    Enforced at DB level by partial unique index:
  *    `idx_unique_single_pending_offer_per_group ON driver_dispatch_offers (ride_group_id) WHERE status = 'PENDING'`
  *
- * 2. Multi-Offer Capability: An available driver MAY receive multiple pending offers for different groups.
+ * 2. Multi-Offer Capability (ADR-018): An available driver MAY receive multiple pending offers for different groups.
  *    Acceptance of one group atomically withdraws all other pending offers for that driver.
  *
  * 3. Scoped Driver Exclusion: A driver who times out or rejects an offer is excluded strictly for
@@ -40,14 +54,17 @@ import {
  *    - DB transaction is kept minimal: locks the ride group row with `SELECT ... FOR UPDATE`,
  *      inserts the attempt + offer, and updates group status to DISPATCHING.
  *
- * 6. Row-Lock Strategy for Driver Reservation (Phase 4 Preparation):
- *    When a driver accepts an offer in Phase 4:
+ * 6. Row-Lock Order & Driver Reservation (Phase 4):
+ *    When a driver accepts an offer:
  *    a. Lock ride group row: `SELECT id, status, group_version FROM ride_groups WHERE id = :id FOR UPDATE`
- *    b. Atomic CAS on driver operational status:
- *       `UPDATE driver_profiles SET operational_status = 'RESERVED' WHERE id = :driverId AND operational_status = 'AVAILABLE'`
- *       If 0 rows affected -> throw ConflictException('DRIVER_UNAVAILABLE').
- *    c. Transition offer to ACCEPTED, create driver_assignments record (RESERVED).
- *    d. Withdraw conflicting offers atomically:
+ *    b. Lock driver profile and Atomic CAS on driver operational status:
+ *       `UPDATE driver_profiles SET operational_status = 'RESERVED' WHERE id = :driverId AND operational_status = 'AVAILABLE' AND is_online = true`
+ *       If 0 rows affected -> throw ConflictException('OFFER_ALREADY_TAKEN').
+ *    c. Lock driver dispatch offer: `SELECT id, status, expires_at FROM driver_dispatch_offers WHERE id = :id FOR UPDATE`
+ *    d. Transition offer to ACCEPTED, create driver_assignments record (RESERVED).
+ *    e. Materialize Trip (CREATED) and trip_passengers (WAITING) with 4-digit hashed OTPs.
+ *    f. Transition ride_groups and bookings to DRIVER_ASSIGNED.
+ *    g. Withdraw conflicting offers atomically:
  *       - Pending offers for other groups to this driver -> WITHDRAWN
  *       - Pending offers for this group to other drivers -> WITHDRAWN
  * ============================================================================
@@ -60,6 +77,9 @@ export class DispatchService {
     private readonly prisma: PrismaService,
     private readonly driversService: DriversService,
     private readonly routingService: RoutingService,
+    @Optional()
+    @InjectQueue(QUEUES.DISPATCH)
+    private readonly dispatchQueue?: Queue<DispatchTimeoutJobPayload>,
   ) {}
 
   /**
@@ -311,20 +331,58 @@ export class DispatchService {
   }
 
   /**
+   * Schedules a delayed 20-second timeout BullMQ job for an offer.
+   * Guarantees deterministic job identity (dispatch-timeout-<offerId>) for deduplication.
+   */
+  async scheduleOfferTimeoutJob(
+    payload: DispatchTimeoutJobPayload,
+  ): Promise<void> {
+    if (!this.dispatchQueue) {
+      this.logger.debug(
+        `Dispatch queue not configured; skipping delayed BullMQ job for offer ${payload.offerId}`,
+      );
+      return;
+    }
+
+    try {
+      await this.dispatchQueue.add(
+        DISPATCH_TIMEOUT_JOB_NAME,
+        payload,
+        {
+          delay: DRIVER_OFFER_TIMEOUT_MS,
+          jobId: `dispatch-timeout-${payload.offerId}`,
+          removeOnComplete: 100,
+          removeOnFail: 50,
+        },
+      );
+      this.logger.log(
+        `Scheduled 20s delayed timeout job on dispatch-queue for offer ${payload.offerId}`,
+      );
+    } catch (err: any) {
+      this.logger.error(
+        `Failed to enqueue BullMQ timeout job for offer ${payload.offerId}: ${err?.message}`,
+      );
+    }
+  }
+
+  /**
    * Initiates sequential 1-to-1 dispatch for a ride group.
    *
    * Flow:
    * 1. Validates ride group status ('READY_FOR_DISPATCH' or 'DISPATCHING').
    * 2. Checks for existing active pending offer (short-circuit idempotency).
    * 3. Finds and ranks eligible candidate drivers via OSRM outside the DB transaction.
-   * 4. Atomically reserves the offer in a short PostgreSQL transaction:
+   * 4. If no candidates: marks active attempt EXHAUSTED (fleet exhaustion).
+   * 5. Atomically reserves the offer in a short PostgreSQL transaction:
    *    - Acquires row lock on ride group (`FOR UPDATE`).
    *    - Verifies group status under lock.
    *    - Re-verifies absence of pending offers.
    *    - Creates or retrieves active DispatchAttempt.
    *    - Inserts DriverDispatchOffer with 20-second timeout.
+   *    - Inserts DISPATCH_OFFER_CREATED outbox event atomically.
    *    - Updates RideGroup status to 'DISPATCHING'.
-   * 5. Passenger bookings remain in 'MATCHED' status throughout dispatch.
+   * 6. Schedules delayed 20-second BullMQ timeout job after commit.
+   * 7. Passenger bookings remain in 'MATCHED' status throughout dispatch.
    */
   async initiateDispatchForGroup(rideGroupId: string): Promise<DispatchResult> {
     // 1. Fetch ride group details
@@ -401,19 +459,42 @@ export class DispatchService {
       this.logger.warn(
         `No eligible ranked candidate drivers found for ride group ${rideGroupId}`,
       );
+
+      // Fleet exhaustion: Mark active attempt EXHAUSTED if one exists
+      if (activeAttempt) {
+        await this.prisma.dispatchAttempt.update({
+          where: { id: activeAttempt.id },
+          data: { status: 'EXHAUSTED' },
+        });
+
+        await this.prisma.outboxEvent.create({
+          data: {
+            eventType: 'DISPATCH_ATTEMPT_EXHAUSTED',
+            aggregateType: 'DISPATCH_ATTEMPT',
+            aggregateId: activeAttempt.id,
+            payload: {
+              dispatchAttemptId: activeAttempt.id,
+              rideGroupId,
+              groupVersion: rideGroup.groupVersion,
+              exhaustedAt: new Date().toISOString(),
+            },
+          },
+        });
+      }
+
       return {
         success: false,
-        reason: 'NO_ELIGIBLE_DRIVERS',
-        message:
-          'No eligible candidate drivers available with valid OSRM routes',
+        reason: 'FLEET_EXHAUSTED',
+        message: 'All eligible candidate drivers have been exhausted',
       };
     }
 
     const rank1Driver = rankedCandidates[0];
 
     // 6. Execute short atomic PostgreSQL persistence transaction
+    let dispatchResult: DispatchResult;
     try {
-      return await this.prisma.$transaction(async (tx) => {
+      dispatchResult = await this.prisma.$transaction(async (tx) => {
         // a. Row lock on ride_groups
         const lockedGroups = await tx.$queryRaw<
           Array<{
@@ -512,7 +593,24 @@ export class DispatchService {
           },
         });
 
-        // f. Update ride group status to DISPATCHING
+        // f. Persist durable outbox event atomically with the offer
+        await tx.outboxEvent.create({
+          data: {
+            eventType: 'DISPATCH_OFFER_CREATED',
+            aggregateType: 'DRIVER_DISPATCH_OFFER',
+            aggregateId: offer.id,
+            payload: {
+              offerId: offer.id,
+              rideGroupId,
+              driverId: rank1Driver.driverId,
+              groupVersion: lockedGroup.group_version,
+              dispatchAttemptId: attempt.id,
+              expiresAt: expiresAt.toISOString(),
+            },
+          },
+        });
+
+        // g. Update ride group status to DISPATCHING
         if (lockedGroup.status !== 'DISPATCHING') {
           await tx.rideGroup.update({
             where: { id: rideGroupId },
@@ -527,6 +625,7 @@ export class DispatchService {
           driverId: rank1Driver.driverId,
           etaSec: rank1Driver.etaSec,
           expiresAt,
+          isExistingOffer: false,
         };
       });
     } catch (error: any) {
@@ -554,5 +653,858 @@ export class DispatchService {
       }
       throw error;
     }
+
+    // 7. Schedule BullMQ delayed timeout job for new offer
+    if (
+      dispatchResult.success &&
+      !dispatchResult.isExistingOffer &&
+      dispatchResult.offerId &&
+      dispatchResult.attemptId &&
+      dispatchResult.driverId
+    ) {
+      await this.scheduleOfferTimeoutJob({
+        offerId: dispatchResult.offerId,
+        rideGroupId,
+        driverId: dispatchResult.driverId,
+        groupVersion: rideGroup.groupVersion,
+        dispatchAttemptId: dispatchResult.attemptId,
+      });
+    }
+
+    return dispatchResult;
+  }
+
+  /**
+   * Handles 20-second offer timeout from BullMQ delayed job.
+   *
+   * Invariants:
+   * 1. Acquires row locks: ride_groups -> driver_dispatch_offers.
+   * 2. If offer is not PENDING, or group version / attempt changed -> safe no-op.
+   * 3. Atomically sets offer status = 'EXPIRED'.
+   * 4. Cascades sequentially to next ranked driver without dissolving group.
+   */
+  async handleOfferTimeout(payload: DispatchTimeoutJobPayload): Promise<{
+    expired: boolean;
+    cascaded: boolean;
+    nextOfferId?: string;
+    reason?: string;
+  }> {
+    const { offerId, rideGroupId, groupVersion, dispatchAttemptId } = payload;
+
+    const expireResult = await this.prisma.$transaction(async (tx) => {
+      // 1. Lock ride group row
+      const lockedGroups = await tx.$queryRaw<
+        Array<{ id: string; status: string; group_version: number }>
+      >`
+        SELECT id, status, group_version
+        FROM ride_groups
+        WHERE id = ${rideGroupId}::uuid
+        FOR UPDATE
+      `;
+
+      if (!lockedGroups || lockedGroups.length === 0) {
+        return { shouldCascade: false, reason: 'RIDE_GROUP_NOT_FOUND' };
+      }
+
+      const lockedGroup = lockedGroups[0];
+
+      // If group version has incremented, this timeout job is stale
+      if (lockedGroup.group_version !== groupVersion) {
+        this.logger.debug(
+          `Timeout job stale for offer ${offerId}: group version changed (${lockedGroup.group_version} vs ${groupVersion})`,
+        );
+        return { shouldCascade: false, reason: 'STALE_GROUP_VERSION' };
+      }
+
+      // 2. Lock driver dispatch offer row
+      const lockedOffers = await tx.$queryRaw<
+        Array<{
+          id: string;
+          status: string;
+          group_version: number;
+          dispatch_attempt_id: string;
+          expires_at: Date;
+          driver_id: string;
+        }>
+      >`
+        SELECT id, status, group_version, dispatch_attempt_id, expires_at, driver_id
+        FROM driver_dispatch_offers
+        WHERE id = ${offerId}::uuid
+        FOR UPDATE
+      `;
+
+      if (!lockedOffers || lockedOffers.length === 0) {
+        return { shouldCascade: false, reason: 'OFFER_NOT_FOUND' };
+      }
+
+      const lockedOffer = lockedOffers[0];
+
+      // Never expire non-PENDING offers (ACCEPTED, REJECTED, WITHDRAWN, EXPIRED)
+      if (lockedOffer.status !== 'PENDING') {
+        this.logger.debug(
+          `Offer ${offerId} status is '${lockedOffer.status}', skipping timeout expiry`,
+        );
+        return {
+          shouldCascade: false,
+          reason: `OFFER_STATUS_${lockedOffer.status}`,
+        };
+      }
+
+      // Check if dispatch attempt is still ACTIVE
+      const attempt = await tx.dispatchAttempt.findUnique({
+        where: { id: dispatchAttemptId },
+      });
+
+      if (!attempt || attempt.status !== 'ACTIVE') {
+        this.logger.debug(
+          `Dispatch attempt ${dispatchAttemptId} is '${attempt?.status}', skipping cascade`,
+        );
+        return { shouldCascade: false, reason: 'ATTEMPT_NOT_ACTIVE' };
+      }
+
+      // Atomically mark offer EXPIRED
+      await tx.driverDispatchOffer.update({
+        where: { id: offerId },
+        data: {
+          status: 'EXPIRED',
+          respondedAt: new Date(),
+        },
+      });
+
+      // Record outbox event
+      await tx.outboxEvent.create({
+        data: {
+          eventType: 'DISPATCH_OFFER_EXPIRED',
+          aggregateType: 'DRIVER_DISPATCH_OFFER',
+          aggregateId: offerId,
+          payload: {
+            offerId,
+            rideGroupId,
+            driverId: lockedOffer.driver_id,
+            groupVersion,
+            dispatchAttemptId,
+            expiredAt: new Date().toISOString(),
+          },
+        },
+      });
+
+      return { shouldCascade: true, driverId: lockedOffer.driver_id };
+    });
+
+    if (!expireResult.shouldCascade) {
+      return { expired: false, cascaded: false, reason: expireResult.reason };
+    }
+
+    // 3. Cascade sequentially to next candidate driver (OUTSIDE DB transaction)
+    this.logger.log(
+      `Offer ${offerId} expired; cascading to next candidate driver for group ${rideGroupId}`,
+    );
+    const cascadeResult = await this.initiateDispatchForGroup(rideGroupId);
+
+    return {
+      expired: true,
+      cascaded: cascadeResult.success,
+      nextOfferId: cascadeResult.offerId,
+      reason: cascadeResult.reason,
+    };
+  }
+
+  /**
+   * Retrieves all currently pending, unexpired offers for the authenticated driver.
+   * Multi-offer compliant (ADR-018): returns all valid offers for different groups.
+   */
+  async getPendingOffersForDriver(
+    userId: string,
+  ): Promise<PendingOfferSummary[]> {
+    const driver = await this.prisma.driverProfile.findUnique({
+      where: { userId },
+    });
+
+    if (!driver) {
+      throw new NotFoundException({
+        errorCode: 'DRIVER_NOT_FOUND',
+        message: 'Driver profile not found',
+      });
+    }
+
+    if (driver.verificationStatus !== 'APPROVED') {
+      throw new ForbiddenException({
+        errorCode: 'DRIVER_NOT_APPROVED',
+        message: 'Driver profile is not approved',
+      });
+    }
+
+    const now = new Date();
+    const pendingOffers = await this.prisma.driverDispatchOffer.findMany({
+      where: {
+        driverId: driver.id,
+        status: 'PENDING',
+        expiresAt: { gt: now },
+      },
+      include: {
+        rideGroup: {
+          include: {
+            pickupPoint: {
+              select: {
+                id: true,
+                name: true,
+              },
+            },
+            members: {
+              where: { isActiveMember: true },
+              select: { id: true, dropoffSequenceOrder: true },
+            },
+            routeVersions: {
+              orderBy: { versionNumber: 'desc' },
+              take: 1,
+              select: {
+                totalDistanceMeters: true,
+                totalDurationSec: true,
+              },
+            },
+          },
+        },
+      },
+      orderBy: {
+        expiresAt: 'asc',
+      },
+    });
+
+    return pendingOffers.map((offer) => {
+      const remainingSeconds = Math.max(
+        0,
+        Math.round((offer.expiresAt.getTime() - Date.now()) / 1000),
+      );
+      const activeMembersCount = offer.rideGroup.members.length;
+      const latestRoute = offer.rideGroup.routeVersions[0];
+
+      return {
+        offerId: offer.id,
+        dispatchAttemptId: offer.dispatchAttemptId,
+        rideGroupId: offer.rideGroupId,
+        groupVersion: offer.groupVersion,
+        pickupPoint: {
+          id: offer.rideGroup.pickupPoint.id,
+          name: offer.rideGroup.pickupPoint.name,
+        },
+        passengerCount: activeMembersCount,
+        totalEstimatedFare: (
+          offer.rideGroup.totalSharedFarePaise / 100
+        ).toFixed(2),
+        totalDistanceMeters:
+          latestRoute?.totalDistanceMeters ??
+          offer.rideGroup.totalRouteDistanceMeters,
+        totalDurationSec:
+          latestRoute?.totalDurationSec ??
+          offer.rideGroup.totalRouteDurationSec,
+        offeredAt: offer.offeredAt.toISOString(),
+        expiresAt: offer.expiresAt.toISOString(),
+        remainingSeconds,
+      };
+    });
+  }
+
+  /**
+   * Driver explicitly rejects an offer.
+   * Atomically sets offer to 'REJECTED' and triggers immediate cascade to Rank #2 driver.
+   */
+  async rejectOffer(
+    userId: string,
+    offerId: string,
+    dto?: RejectOfferDto,
+    claim?: IdempotencyClaimContext,
+  ): Promise<{ success: boolean; message: string }> {
+    const driver = await this.prisma.driverProfile.findUnique({
+      where: { userId },
+    });
+
+    if (!driver) {
+      throw new NotFoundException({
+        errorCode: 'DRIVER_NOT_FOUND',
+        message: 'Driver profile not found',
+      });
+    }
+
+    if (driver.verificationStatus !== 'APPROVED') {
+      throw new ForbiddenException({
+        errorCode: 'DRIVER_NOT_APPROVED',
+        message: 'Driver profile is not approved',
+      });
+    }
+
+    let rideGroupIdToCascade: string | null = null;
+
+    await this.prisma.$transaction(async (tx) => {
+      // 1. Lock offer row
+      const lockedOffers = await tx.$queryRaw<
+        Array<{
+          id: string;
+          status: string;
+          driver_id: string;
+          ride_group_id: string;
+          group_version: number;
+          dispatch_attempt_id: string;
+          expires_at: Date;
+        }>
+      >`
+        SELECT id, status, driver_id, ride_group_id, group_version, dispatch_attempt_id, expires_at
+        FROM driver_dispatch_offers
+        WHERE id = ${offerId}::uuid
+        FOR UPDATE
+      `;
+
+      if (!lockedOffers || lockedOffers.length === 0) {
+        throw new NotFoundException({
+          errorCode: 'OFFER_NOT_FOUND',
+          message: 'Dispatch offer not found',
+        });
+      }
+
+      const lockedOffer = lockedOffers[0];
+
+      if (lockedOffer.driver_id !== driver.id) {
+        throw new ForbiddenException({
+          errorCode: 'FORBIDDEN_OFFER_ACCESS',
+          message: 'Offer belongs to another driver',
+        });
+      }
+
+      // Idempotent retry: already rejected
+      if (lockedOffer.status === 'REJECTED') {
+        await fenceAndCompleteIdempotentTransaction(
+          tx,
+          claim,
+          { success: true, message: 'Offer already rejected' },
+          200,
+        );
+        return;
+      }
+
+      if (lockedOffer.status !== 'PENDING') {
+        throw new ConflictException({
+          errorCode: 'OFFER_NOT_PENDING',
+          message: `Offer cannot be rejected in status '${lockedOffer.status}'`,
+        });
+      }
+
+      if (new Date() >= new Date(lockedOffer.expires_at)) {
+        throw new ConflictException({
+          errorCode: 'OFFER_EXPIRED',
+          message: 'Offer has expired',
+        });
+      }
+
+      // Update offer to REJECTED
+      await tx.driverDispatchOffer.update({
+        where: { id: offerId },
+        data: {
+          status: 'REJECTED',
+          respondedAt: new Date(),
+        },
+      });
+
+      // Record outbox event
+      await tx.outboxEvent.create({
+        data: {
+          eventType: 'DISPATCH_OFFER_REJECTED',
+          aggregateType: 'DRIVER_DISPATCH_OFFER',
+          aggregateId: offerId,
+          payload: {
+            offerId,
+            rideGroupId: lockedOffer.ride_group_id,
+            driverId: driver.id,
+            groupVersion: lockedOffer.group_version,
+            dispatchAttemptId: lockedOffer.dispatch_attempt_id,
+            reason: dto?.reason ?? null,
+            rejectedAt: new Date().toISOString(),
+          },
+        },
+      });
+
+      rideGroupIdToCascade = lockedOffer.ride_group_id;
+
+      // Complete idempotency claim
+      await fenceAndCompleteIdempotentTransaction(
+        tx,
+        claim,
+        { success: true, message: 'Offer rejected successfully' },
+        200,
+      );
+    });
+
+    // 2. Cascade sequentially to next candidate driver (OUTSIDE DB transaction)
+    if (rideGroupIdToCascade) {
+      await this.initiateDispatchForGroup(rideGroupIdToCascade);
+    }
+
+    return { success: true, message: 'Offer rejected successfully' };
+  }
+
+  /**
+   * Driver accepts a dispatch offer.
+   *
+   * Atomic Reservation Guarantee:
+   * 1. Lock ride_groups row FOR UPDATE.
+   * 2. Lock driver_profiles row FOR UPDATE + Atomic CAS (operational_status = 'AVAILABLE' -> 'RESERVED').
+   * 3. Lock driver_dispatch_offers row FOR UPDATE.
+   * 4. Transition offer to ACCEPTED.
+   * 5. Create driver_assignments record (RESERVED).
+   * 6. Transition ride_groups to DRIVER_ASSIGNED.
+   * 7. Materialize Trip (CREATED) and trip_status_history.
+   * 8. Transition bookings to DRIVER_ASSIGNED and materialize trip_passengers with 4-digit hashed OTPs.
+   * 9. Withdraw competing offers for same group and driver's other offers across groups (ADR-018).
+   * 10. Persist DISPATCH_OFFER_ACCEPTED and TRIP_CREATED outbox events.
+   * 11. Complete idempotency claim.
+   */
+  async acceptOffer(
+    userId: string,
+    offerId: string,
+    claim?: IdempotencyClaimContext,
+  ): Promise<AcceptOfferResponseData> {
+    const driver = await this.prisma.driverProfile.findUnique({
+      where: { userId },
+      include: {
+        vehicles: { where: { isActive: true } },
+      },
+    });
+
+    if (!driver) {
+      throw new NotFoundException({
+        errorCode: 'DRIVER_NOT_FOUND',
+        message: 'Driver profile not found',
+      });
+    }
+
+    if (driver.verificationStatus !== 'APPROVED') {
+      throw new ForbiddenException({
+        errorCode: 'DRIVER_NOT_APPROVED',
+        message: 'Driver profile is not approved',
+      });
+    }
+
+    // Verify driver has no existing active assignment
+    const existingAssignment = await this.prisma.driverAssignment.findFirst({
+      where: {
+        driverId: driver.id,
+        status: { in: ['RESERVED', 'ACTIVE'] },
+      },
+    });
+
+    if (existingAssignment) {
+      throw new ConflictException({
+        errorCode: 'DRIVER_ALREADY_ASSIGNED',
+        message: 'Driver already has an active assignment',
+      });
+    }
+
+    // Identify offers to cascade after commit (multi-offer withdrawal)
+    const withdrawnGroupIds: string[] = [];
+
+    const responseData = await this.prisma.$transaction(async (tx) => {
+      // Step 1: Pre-fetch offer basic details
+      const offerBasic = await tx.driverDispatchOffer.findUnique({
+        where: { id: offerId },
+        select: { rideGroupId: true, driverId: true },
+      });
+
+      if (!offerBasic) {
+        throw new NotFoundException({
+          errorCode: 'OFFER_NOT_FOUND',
+          message: 'Dispatch offer not found',
+        });
+      }
+
+      if (offerBasic.driverId !== driver.id) {
+        throw new ForbiddenException({
+          errorCode: 'FORBIDDEN_OFFER_ACCESS',
+          message: 'Offer belongs to another driver',
+        });
+      }
+
+      // Step 2: Lock ride_groups row
+      const lockedGroups = await tx.$queryRaw<
+        Array<{
+          id: string;
+          status: string;
+          group_version: number;
+          total_shared_fare_paise: number;
+        }>
+      >`
+        SELECT id, status, group_version, total_shared_fare_paise
+        FROM ride_groups
+        WHERE id = ${offerBasic.rideGroupId}::uuid
+        FOR UPDATE
+      `;
+
+      if (!lockedGroups || lockedGroups.length === 0) {
+        throw new NotFoundException({
+          errorCode: 'RIDE_GROUP_NOT_FOUND',
+          message: 'Ride group not found',
+        });
+      }
+
+      const lockedGroup = lockedGroups[0];
+
+      if (
+        lockedGroup.status !== 'DISPATCHING' &&
+        lockedGroup.status !== 'READY_FOR_DISPATCH'
+      ) {
+        throw new ConflictException({
+          errorCode: 'OFFER_ALREADY_TAKEN',
+          message: `Ride group is no longer in dispatching state (status=${lockedGroup.status})`,
+        });
+      }
+
+      // Step 3: Lock driver_profiles row and execute Atomic CAS
+      const lockedDrivers = await tx.$queryRaw<
+        Array<{
+          id: string;
+          operational_status: string;
+          is_online: boolean;
+        }>
+      >`
+        SELECT id, operational_status, is_online
+        FROM driver_profiles
+        WHERE id = ${driver.id}::uuid
+        FOR UPDATE
+      `;
+
+      if (!lockedDrivers || lockedDrivers.length === 0) {
+        throw new NotFoundException('Driver profile not found during lock');
+      }
+
+      const updateDriverResult = await tx.$executeRaw`
+        UPDATE driver_profiles
+        SET operational_status = 'RESERVED',
+            updated_at = NOW()
+        WHERE id = ${driver.id}::uuid
+          AND operational_status = 'AVAILABLE'
+          AND is_online = true
+      `;
+
+      if (updateDriverResult === 0) {
+        throw new ConflictException({
+          errorCode: 'OFFER_ALREADY_TAKEN',
+          message: 'Driver is no longer available or is offline',
+        });
+      }
+
+      // Step 4: Lock driver_dispatch_offers row
+      const lockedOffers = await tx.$queryRaw<
+        Array<{
+          id: string;
+          status: string;
+          group_version: number;
+          dispatch_attempt_id: string;
+          expires_at: Date;
+        }>
+      >`
+        SELECT id, status, group_version, dispatch_attempt_id, expires_at
+        FROM driver_dispatch_offers
+        WHERE id = ${offerId}::uuid
+        FOR UPDATE
+      `;
+
+      if (!lockedOffers || lockedOffers.length === 0) {
+        throw new NotFoundException('Offer not found during lock');
+      }
+
+      const lockedOffer = lockedOffers[0];
+
+      if (lockedOffer.status !== 'PENDING') {
+        throw new ConflictException({
+          errorCode: 'OFFER_ALREADY_TAKEN',
+          message: `Offer is no longer pending (status=${lockedOffer.status})`,
+        });
+      }
+
+      if (lockedOffer.group_version !== lockedGroup.group_version) {
+        throw new ConflictException({
+          errorCode: 'OFFER_ALREADY_TAKEN',
+          message: 'Ride group version changed before acceptance',
+        });
+      }
+
+      if (new Date() >= new Date(lockedOffer.expires_at)) {
+        throw new ConflictException({
+          errorCode: 'OFFER_EXPIRED',
+          message: 'Offer has expired',
+        });
+      }
+
+      // Step 5: Verify group members and vehicle capacity
+      const groupMembers = await tx.groupMember.findMany({
+        where: {
+          rideGroupId: lockedGroup.id,
+          isActiveMember: true,
+        },
+        include: {
+          booking: true,
+        },
+        orderBy: {
+          dropoffSequenceOrder: 'asc',
+        },
+      });
+
+      if (groupMembers.length === 0) {
+        throw new ConflictException({
+          errorCode: 'GROUP_EMPTY',
+          message: 'No active members in ride group',
+        });
+      }
+
+      const maxVehicleCapacity = Math.max(
+        ...driver.vehicles.map((v) => v.passengerCapacity),
+        0,
+      );
+
+      if (maxVehicleCapacity < groupMembers.length) {
+        throw new ConflictException({
+          errorCode: 'INSUFFICIENT_VEHICLE_CAPACITY',
+          message: `Vehicle capacity (${maxVehicleCapacity}) is less than group size (${groupMembers.length})`,
+        });
+      }
+
+      // Step 6: Mark winning offer ACCEPTED
+      await tx.driverDispatchOffer.update({
+        where: { id: offerId },
+        data: {
+          status: 'ACCEPTED',
+          respondedAt: new Date(),
+        },
+      });
+
+      // Step 7: Create DriverAssignment (status: RESERVED)
+      const assignment = await tx.driverAssignment.create({
+        data: {
+          dispatchAttemptId: lockedOffer.dispatch_attempt_id,
+          rideGroupId: lockedGroup.id,
+          driverId: driver.id,
+          status: 'RESERVED',
+          assignedAt: new Date(),
+        },
+      });
+
+      // Step 8: Update DispatchAttempt status to SUCCEEDED
+      await tx.dispatchAttempt.update({
+        where: { id: lockedOffer.dispatch_attempt_id },
+        data: { status: 'SUCCEEDED' },
+      });
+
+      // Step 9: Transition RideGroup to DRIVER_ASSIGNED
+      await tx.rideGroup.update({
+        where: { id: lockedGroup.id },
+        data: { status: 'DRIVER_ASSIGNED' },
+      });
+
+      // Step 10: Materialize Trip record
+      const trip = await tx.trip.create({
+        data: {
+          rideGroupId: lockedGroup.id,
+          driverAssignmentId: assignment.id,
+          activeDriverId: driver.id,
+          status: 'CREATED',
+        },
+      });
+
+      await tx.tripStatusHistory.create({
+        data: {
+          tripId: trip.id,
+          previousStatus: 'NONE',
+          newStatus: 'CREATED',
+          reason: 'Driver accepted dispatch offer; trip materialized',
+        },
+      });
+
+      // Step 11: Transition bookings, create trip passengers & 4-digit hashed OTPs
+      for (const member of groupMembers) {
+        const b = member.booking;
+
+        await tx.booking.update({
+          where: { id: b.id },
+          data: { status: 'DRIVER_ASSIGNED' },
+        });
+
+        await tx.bookingStatusHistory.create({
+          data: {
+            bookingId: b.id,
+            previousStatus: b.status,
+            newStatus: 'DRIVER_ASSIGNED',
+            reason:
+              'Driver accepted dispatch offer; driver assigned to ride group',
+          },
+        });
+
+        const tripPassenger = await tx.tripPassenger.create({
+          data: {
+            tripId: trip.id,
+            bookingId: b.id,
+            passengerId: b.passengerId,
+            status: 'WAITING',
+            finalRideFarePaise: member.allocatedFarePaise,
+            waitingChargePaise: 0,
+          },
+        });
+
+        const otp = crypto.randomInt(1000, 10000).toString();
+        const otpHash = crypto.createHash('sha256').update(otp).digest('hex');
+
+        await tx.boardingVerification.create({
+          data: {
+            tripPassengerId: tripPassenger.id,
+            otpHash,
+            maxAttempts: 3,
+            attemptsCount: 0,
+            expiresAt: new Date(Date.now() + 30 * 60 * 1000), // 30 min expiry
+          },
+        });
+      }
+
+      // Step 12: Multi-Offer Withdrawal (ADR-018)
+      // 12a: Withdraw competing pending offers for THIS group
+      await tx.driverDispatchOffer.updateMany({
+        where: {
+          rideGroupId: lockedGroup.id,
+          status: 'PENDING',
+          id: { not: offerId },
+        },
+        data: {
+          status: 'WITHDRAWN',
+          respondedAt: new Date(),
+        },
+      });
+
+      // 12b: Find and withdraw THIS driver's pending offers for OTHER groups
+      const driverOtherOffers = await tx.driverDispatchOffer.findMany({
+        where: {
+          driverId: driver.id,
+          status: 'PENDING',
+          id: { not: offerId },
+        },
+        select: { id: true, rideGroupId: true },
+      });
+
+      for (const o of (driverOtherOffers ?? [])) {
+        withdrawnGroupIds.push(o.rideGroupId);
+      }
+
+      await tx.driverDispatchOffer.updateMany({
+        where: {
+          driverId: driver.id,
+          status: 'PENDING',
+          id: { not: offerId },
+        },
+        data: {
+          status: 'WITHDRAWN',
+          respondedAt: new Date(),
+        },
+      });
+
+      // Step 13: Persist Outbox Events
+      await tx.outboxEvent.create({
+        data: {
+          eventType: 'DISPATCH_OFFER_ACCEPTED',
+          aggregateType: 'DRIVER_DISPATCH_OFFER',
+          aggregateId: offerId,
+          payload: {
+            offerId,
+            assignmentId: assignment.id,
+            tripId: trip.id,
+            driverId: driver.id,
+            rideGroupId: lockedGroup.id,
+            acceptedAt: new Date().toISOString(),
+          },
+        },
+      });
+
+      await tx.outboxEvent.create({
+        data: {
+          eventType: 'TRIP_CREATED',
+          aggregateType: 'TRIP',
+          aggregateId: trip.id,
+          payload: {
+            tripId: trip.id,
+            rideGroupId: lockedGroup.id,
+            driverId: driver.id,
+            driverAssignmentId: assignment.id,
+            passengerCount: groupMembers.length,
+            createdAt: new Date().toISOString(),
+          },
+        },
+      });
+
+      // Step 14: Route Geometry & Stops
+      const routeVersion = await tx.groupRouteVersion.findFirst({
+        where: {
+          rideGroupId: lockedGroup.id,
+          versionNumber: lockedGroup.group_version,
+        },
+      });
+
+      const stops = await tx.$queryRaw<
+        Array<{
+          id: string;
+          stop_order: number;
+          stop_type: string;
+          latitude: number;
+          longitude: number;
+        }>
+      >`
+        SELECT
+          s.id,
+          s.stop_order,
+          s.stop_type,
+          ST_Y(s.stop_location::geometry) as latitude,
+          ST_X(s.stop_location::geometry) as longitude
+        FROM group_route_stops s
+        WHERE s.group_route_version_id = ${
+          routeVersion?.id ?? '00000000-0000-0000-0000-000000000000'
+        }::uuid
+        ORDER BY s.stop_order ASC
+      `;
+
+      const response: AcceptOfferResponseData = {
+        assignmentId: assignment.id,
+        tripId: trip.id,
+        rideGroupId: lockedGroup.id,
+        passengerCount: groupMembers.length,
+        totalEstimatedFare: (
+          lockedGroup.total_shared_fare_paise / 100
+        ).toFixed(2),
+        navigationRoute: {
+          geometry: routeVersion?.routeGeometry ?? {},
+          stops: stops.map((s) => ({
+            stopOrder: s.stop_order,
+            stopType: s.stop_type,
+            latitude: Number(s.latitude),
+            longitude: Number(s.longitude),
+          })),
+        },
+      };
+
+      // Complete idempotency claim
+      await fenceAndCompleteIdempotentTransaction(
+        tx,
+        claim,
+        {
+          success: true,
+          data: response,
+        },
+        200,
+      );
+
+      return response;
+    });
+
+    // Step 15: Post-Commit Immediate Cascade for other groups whose offers were withdrawn
+    for (const gId of withdrawnGroupIds) {
+      this.initiateDispatchForGroup(gId).catch((err) => {
+        this.logger.warn(
+          `Post-withdrawal cascade for group ${gId} encountered error: ${err?.message}`,
+        );
+      });
+    }
+
+    return responseData;
   }
 }

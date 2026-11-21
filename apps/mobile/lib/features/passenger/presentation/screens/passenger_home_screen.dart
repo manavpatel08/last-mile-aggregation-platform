@@ -134,6 +134,17 @@ class _PassengerHomeScreenState extends State<PassengerHomeScreen> {
                   final repo = context.read<BookingRepository>();
                   passengerProvider.loadActiveBooking(repo);
                 },
+                onViewDetails: () async {
+                  await context.push(
+                    AppRoutes.passengerBookingDetailsPath(
+                      passengerProvider.activeBooking!.bookingId,
+                    ),
+                  );
+                  if (context.mounted) {
+                    final repo = context.read<BookingRepository>();
+                    passengerProvider.loadActiveBooking(repo);
+                  }
+                },
               ),
             ],
 

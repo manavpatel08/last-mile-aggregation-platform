@@ -1,7 +1,10 @@
 import '../../../core/network/api_client.dart';
 import '../../../core/network/api_exception.dart';
+import '../models/booking_cancellation_response.dart';
+import '../models/booking_details.dart';
 import '../models/booking_request.dart';
 import '../models/booking_response.dart';
+import '../models/cancellation_fee.dart';
 import '../models/fare_quote.dart';
 import '../models/location_validation.dart';
 import '../models/pickup_point.dart';
@@ -189,5 +192,111 @@ class ApiBookingRepository implements BookingRepository {
     }
 
     return BookingResponse.fromJson(data);
+  }
+
+  @override
+  Future<BookingDetails> getBookingDetails(String bookingId) async {
+    final response = await apiClient.get<Map<String, dynamic>>(
+      _resolvePath('bookings/$bookingId'),
+      requiresAuth: true,
+    );
+
+    final data = response.data?['data'];
+    if (data is! Map<String, dynamic>) {
+      throw const ApiException(
+        errorCode: 'INVALID_RESPONSE',
+        message: 'Invalid booking details response from backend.',
+      );
+    }
+
+    try {
+      return BookingDetails.fromJson(data);
+    } catch (e) {
+      throw ApiException(
+        errorCode: 'INVALID_RESPONSE',
+        message: 'Invalid booking details format: $e',
+      );
+    }
+  }
+
+  @override
+  Future<BookingCancellationResponse> cancelBooking({
+    required String bookingId,
+    String? reason,
+    required String idempotencyKey,
+  }) async {
+    final Map<String, dynamic> body = {};
+    if (reason != null && reason.trim().isNotEmpty) {
+      body['reason'] = reason.trim();
+    }
+
+    final response = await apiClient.post<Map<String, dynamic>>(
+      _resolvePath('bookings/$bookingId/cancel'),
+      data: body,
+      idempotencyKey: idempotencyKey,
+      requiresAuth: true,
+    );
+
+    final data = response.data?['data'];
+    if (data is! Map<String, dynamic>) {
+      throw const ApiException(
+        errorCode: 'INVALID_RESPONSE',
+        message: 'Invalid booking cancellation response from backend.',
+      );
+    }
+
+    final BookingCancellationResponse cancellation;
+    try {
+      cancellation = BookingCancellationResponse.fromJson(data);
+    } catch (e) {
+      throw ApiException(
+        errorCode: 'INVALID_RESPONSE',
+        message: 'Invalid booking cancellation response format: $e',
+      );
+    }
+
+    if (cancellation.bookingId != bookingId) {
+      throw ApiException(
+        errorCode: 'INVALID_RESPONSE',
+        message:
+            'Cancellation response booking ID "${cancellation.bookingId}" does not match requested booking ID "$bookingId".',
+      );
+    }
+
+    if (cancellation.status != 'CANCELLED') {
+      throw ApiException(
+        errorCode: 'INVALID_RESPONSE',
+        message:
+            'Cancellation response status "${cancellation.status}" is unexpected; expected "CANCELLED".',
+      );
+    }
+
+    return cancellation;
+  }
+
+  @override
+  Future<OutstandingCancellationFeesResponse>
+      getOutstandingCancellationFees() async {
+    final response = await apiClient.get<Map<String, dynamic>>(
+      _resolvePath('passengers/cancellation-fees/outstanding'),
+      requiresAuth: true,
+    );
+
+    final data = response.data?['data'];
+    if (data is! Map<String, dynamic>) {
+      throw const ApiException(
+        errorCode: 'INVALID_RESPONSE',
+        message: 'Invalid outstanding cancellation fees response from backend.',
+      );
+    }
+
+    try {
+      return OutstandingCancellationFeesResponse.fromJson(data);
+    } catch (e) {
+      throw ApiException(
+        errorCode: 'INVALID_RESPONSE',
+        message: 'Invalid outstanding cancellation fees response format: $e',
+      );
+    }
   }
 }

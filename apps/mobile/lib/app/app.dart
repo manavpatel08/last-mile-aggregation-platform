@@ -15,6 +15,7 @@ import '../features/auth/state/auth_provider.dart';
 import '../features/booking/data/api_booking_repository.dart';
 import '../features/booking/data/booking_repository.dart';
 import '../features/booking/services/passenger_location_service.dart';
+import '../features/booking/state/booking_details_provider.dart';
 import '../features/booking/state/booking_flow_provider.dart';
 import '../features/driver/data/api_driver_repository.dart';
 import '../features/driver/data/driver_repository.dart';
@@ -42,6 +43,8 @@ class LastMileApp extends StatefulWidget {
     this.bookingRepository,
     this.locationService,
     this.bookingFlowProvider,
+    this.bookingDetailsProvider,
+    this.passengerHomeProvider,
   });
 
   final AppConfig config;
@@ -57,6 +60,8 @@ class LastMileApp extends StatefulWidget {
   final BookingRepository? bookingRepository;
   final PassengerLocationService? locationService;
   final BookingFlowProvider? bookingFlowProvider;
+  final BookingDetailsProvider? bookingDetailsProvider;
+  final PassengerHomeProvider? passengerHomeProvider;
 
   @override
   State<LastMileApp> createState() => _LastMileAppState();
@@ -76,6 +81,10 @@ class _LastMileAppState extends State<LastMileApp> {
   late final PassengerLocationService _locationService;
   late final BookingFlowProvider _bookingFlowProvider;
   late final bool _ownsBookingFlowProvider;
+  late final BookingDetailsProvider _bookingDetailsProvider;
+  late final bool _ownsBookingDetailsProvider;
+  late final PassengerHomeProvider _passengerHomeProvider;
+  late final bool _ownsPassengerHomeProvider;
   late final AuthProvider _authProvider;
   late final bool _ownsAuthProvider;
   late final ApiClient _apiClient;
@@ -140,6 +149,19 @@ class _LastMileAppState extends State<LastMileApp> {
           locationService: _locationService,
         );
 
+    _ownsPassengerHomeProvider = widget.passengerHomeProvider == null;
+    _passengerHomeProvider =
+        widget.passengerHomeProvider ?? PassengerHomeProvider();
+
+    _ownsBookingDetailsProvider = widget.bookingDetailsProvider == null;
+    _bookingDetailsProvider = widget.bookingDetailsProvider ??
+        BookingDetailsProvider(
+          bookingRepository: _bookingRepository,
+          onCancellationConfirmed: () async {
+            await _passengerHomeProvider.loadActiveBooking(_bookingRepository);
+          },
+        );
+
     _router = AppRouter.createRouter(
       appModeProvider: _appModeProvider,
       authProvider: _authProvider,
@@ -161,6 +183,12 @@ class _LastMileAppState extends State<LastMileApp> {
     if (_ownsBookingFlowProvider) {
       _bookingFlowProvider.dispose();
     }
+    if (_ownsBookingDetailsProvider) {
+      _bookingDetailsProvider.dispose();
+    }
+    if (_ownsPassengerHomeProvider) {
+      _passengerHomeProvider.dispose();
+    }
     super.dispose();
   }
 
@@ -179,8 +207,8 @@ class _LastMileAppState extends State<LastMileApp> {
         Provider<PassengerLocationService>.value(value: _locationService),
         ChangeNotifierProvider<AppModeProvider>.value(value: _appModeProvider),
         ChangeNotifierProvider<AuthProvider>.value(value: _authProvider),
-        ChangeNotifierProvider<PassengerHomeProvider>(
-          create: (_) => PassengerHomeProvider(),
+        ChangeNotifierProvider<PassengerHomeProvider>.value(
+          value: _passengerHomeProvider,
         ),
         ChangeNotifierProvider<DriverHomeProvider>(
           create: (_) => DriverHomeProvider(),
@@ -190,6 +218,9 @@ class _LastMileAppState extends State<LastMileApp> {
         ),
         ChangeNotifierProvider<BookingFlowProvider>.value(
           value: _bookingFlowProvider,
+        ),
+        ChangeNotifierProvider<BookingDetailsProvider>.value(
+          value: _bookingDetailsProvider,
         ),
       ],
       child: MaterialApp.router(

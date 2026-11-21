@@ -1,5 +1,8 @@
+import '../models/booking_cancellation_response.dart';
+import '../models/booking_details.dart';
 import '../models/booking_request.dart';
 import '../models/booking_response.dart';
+import '../models/cancellation_fee.dart';
 import '../models/fare_quote.dart';
 import '../models/location_validation.dart';
 import '../models/pickup_point.dart';
@@ -41,4 +44,17 @@ abstract class BookingRepository {
 
   /// Retrieves the current active booking for the authenticated passenger, if any.
   Future<BookingResponse?> getActiveBooking();
+
+  /// Retrieves detailed booking information including full status history.
+  Future<BookingDetails> getBookingDetails(String bookingId);
+
+  /// Submits an idempotent cancellation request for a booking.
+  Future<BookingCancellationResponse> cancelBooking({
+    required String bookingId,
+    String? reason,
+    required String idempotencyKey,
+  });
+
+  /// Retrieves outstanding cancellation fees ledger for the authenticated passenger.
+  Future<OutstandingCancellationFeesResponse> getOutstandingCancellationFees();
 }

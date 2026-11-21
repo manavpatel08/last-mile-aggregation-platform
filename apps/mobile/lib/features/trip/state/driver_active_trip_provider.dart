@@ -15,10 +15,14 @@ class DriverActiveTripProvider extends ChangeNotifier {
   TripDetailModel? _trip;
   bool _isLoadingTrip = false;
   bool _isReportingArrival = false;
+  bool _isStartingTrip = false;
+  bool _isCompletingTrip = false;
   final Map<String, bool> _verifyingPassengers = {};
+  final Map<String, bool> _completingPassengers = {};
   final Map<String, String?> _passengerErrors = {};
   final Map<String, String> _idempotencyKeys = {};
   final Map<String, String> _lastAttemptedOtps = {};
+  final Map<String, CompletePassengerResponse> _completedDropOffs = {};
   String? _generalError;
   String? _generalSuccess;
   String? _currentTripId;
@@ -26,20 +30,36 @@ class DriverActiveTripProvider extends ChangeNotifier {
   TripDetailModel? get trip => _trip;
   bool get isLoadingTrip => _isLoadingTrip;
   bool get isReportingArrival => _isReportingArrival;
+  bool get isStartingTrip => _isStartingTrip;
+  bool get isCompletingTrip => _isCompletingTrip;
   String? get generalError => _generalError;
   String? get generalSuccess => _generalSuccess;
   String? get currentTripId => _currentTripId;
 
   List<TripPassengerModel> get passengers => _trip?.passengers ?? const [];
   bool get isAtPickup => _trip?.isAtPickup ?? false;
+  bool get isInProgress => _trip?.isInProgress ?? false;
+  bool get isCompleted => _trip?.isCompleted ?? false;
   bool get allPassengersBoarded =>
-      passengers.isNotEmpty && passengers.every((p) => p.isBoarded || p.isNoShow);
+      passengers.isNotEmpty &&
+      passengers.every((p) => p.isBoarded || p.isNoShow);
+  bool get canStartTrip => isAtPickup && allPassengersBoarded;
+  bool get canCompleteTrip =>
+      isInProgress &&
+      passengers.isNotEmpty &&
+      passengers.every((p) => p.isTerminal);
 
   bool isVerifying(String passengerId) =>
       _verifyingPassengers[passengerId] ?? false;
 
+  bool isCompletingPassenger(String passengerId) =>
+      _completingPassengers[passengerId] ?? false;
+
   String? errorForPassenger(String passengerId) =>
       _passengerErrors[passengerId];
+
+  CompletePassengerResponse? dropOffResult(String passengerId) =>
+      _completedDropOffs[passengerId];
 
   @visibleForTesting
   String? getIdempotencyKeyForPassenger(String passengerId) {
@@ -241,6 +261,183 @@ class DriverActiveTripProvider extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Starts the vehicle trip (`POST /api/v1/trips/:id/start`).
+  Future<bool> startTrip({TripRepository? repository}) async {
+    final repo = repository ?? _repository;
+    final tripId = _currentTripId ?? _trip?.tripId;
+
+    if (repo == null || tripId == null) {
+      _generalError = 'Cannot start trip: missing trip ID or repository.';
+      notifyListeners();
+      return false;
+    }
+
+    if (_isStartingTrip) return false;
+
+    _isStartingTrip = true;
+    _generalError = null;
+    _generalSuccess = null;
+    notifyListeners();
+
+    final idempotencyKey = _idempotencyKeys.putIfAbsent(
+      'start_$tripId',
+      () => const Uuid().v4(),
+    );
+
+    try {
+      final response = await repo.startTrip(
+        tripId: tripId,
+        idempotencyKey: idempotencyKey,
+      );
+
+      if (_trip != null) {
+        _trip = _trip!.copyWith(
+          status: response.status,
+          startedAt: response.startedAt ?? DateTime.now(),
+        );
+      }
+      _generalSuccess = 'Trip started! In transit to Gandhinagar.';
+      _idempotencyKeys.remove('start_$tripId');
+      return true;
+    } on ApiException catch (e) {
+      _generalError = e.message;
+      if (!e.isTransient) {
+        _idempotencyKeys.remove('start_$tripId');
+      }
+      return false;
+    } catch (e) {
+      _generalError = 'Failed to start trip. Please retry.';
+      return false;
+    } finally {
+      _isStartingTrip = false;
+      notifyListeners();
+    }
+  }
+
+  /// Completes an individual passenger's drop-off (`POST /api/v1/trips/:id/passengers/:passengerId/complete`).
+  Future<bool> completePassengerDropOff({
+    required String passengerId,
+    TripRepository? repository,
+  }) async {
+    final repo = repository ?? _repository;
+    final tripId = _currentTripId ?? _trip?.tripId;
+
+    if (repo == null || tripId == null) {
+      _passengerErrors[passengerId] = 'Trip details not initialized.';
+      notifyListeners();
+      return false;
+    }
+
+    if (_completingPassengers[passengerId] == true) return false;
+
+    _completingPassengers[passengerId] = true;
+    _passengerErrors[passengerId] = null;
+    _generalSuccess = null;
+    notifyListeners();
+
+    final keyIdentifier = 'complete_pass_${tripId}_$passengerId';
+    final idempotencyKey = _idempotencyKeys.putIfAbsent(
+      keyIdentifier,
+      () => const Uuid().v4(),
+    );
+
+    try {
+      final result = await repo.completePassengerDropOff(
+        tripId: tripId,
+        passengerId: passengerId,
+        idempotencyKey: idempotencyKey,
+      );
+
+      _completedDropOffs[passengerId] = result;
+
+      if (_trip != null) {
+        final updatedPassengers = _trip!.passengers.map((p) {
+          if (p.passengerId == passengerId || p.id == passengerId) {
+            return p.copyWith(
+              status: 'COMPLETED',
+              finalRideFarePaise: result.rideFarePaise,
+              waitingChargePaise: result.waitingChargePaise,
+              droppedOffAt: DateTime.now(),
+            );
+          }
+          return p;
+        }).toList();
+
+        _trip = _trip!.copyWith(passengers: updatedPassengers);
+      }
+      _generalSuccess = 'Drop-off completed for passenger!';
+      _passengerErrors[passengerId] = null;
+      _idempotencyKeys.remove(keyIdentifier);
+      return true;
+    } on ApiException catch (e) {
+      _passengerErrors[passengerId] = e.message;
+      if (!e.isTransient) {
+        _idempotencyKeys.remove(keyIdentifier);
+      }
+      return false;
+    } catch (e) {
+      _passengerErrors[passengerId] =
+          'Network error during drop-off completion. Please retry.';
+      return false;
+    } finally {
+      _completingPassengers[passengerId] = false;
+      notifyListeners();
+    }
+  }
+
+  /// Finalizes the overall vehicle trip (`POST /api/v1/trips/:id/complete`).
+  Future<bool> completeTrip({TripRepository? repository}) async {
+    final repo = repository ?? _repository;
+    final tripId = _currentTripId ?? _trip?.tripId;
+
+    if (repo == null || tripId == null) {
+      _generalError = 'Cannot complete trip: missing trip ID or repository.';
+      notifyListeners();
+      return false;
+    }
+
+    if (_isCompletingTrip) return false;
+
+    _isCompletingTrip = true;
+    _generalError = null;
+    _generalSuccess = null;
+    notifyListeners();
+
+    final idempotencyKey = _idempotencyKeys.putIfAbsent(
+      'complete_trip_$tripId',
+      () => const Uuid().v4(),
+    );
+
+    try {
+      final response = await repo.completeTrip(
+        tripId: tripId,
+        idempotencyKey: idempotencyKey,
+      );
+
+      if (_trip != null) {
+        _trip = _trip!.copyWith(
+          status: response.status,
+          completedAt: response.completedAt ?? DateTime.now(),
+        );
+      }
+      _generalSuccess = 'Trip completed successfully! All drop-offs finished.';
+      _idempotencyKeys.remove('complete_trip_$tripId');
+      return true;
+    } on ApiException catch (e) {
+      _generalError = e.message;
+      if (!e.isTransient) {
+        _idempotencyKeys.remove('complete_trip_$tripId');
+      }
+      return false;
+    } catch (e) {
+      _generalError = 'Failed to complete trip. Please retry.';
+      return false;
+    } finally {
+      _isCompletingTrip = false;
+      notifyListeners();
+    }
+  }
+
   void clearMessages() {
     _generalError = null;
     _generalSuccess = null;
@@ -251,8 +448,12 @@ class DriverActiveTripProvider extends ChangeNotifier {
     _trip = null;
     _isLoadingTrip = false;
     _isReportingArrival = false;
+    _isStartingTrip = false;
+    _isCompletingTrip = false;
     _verifyingPassengers.clear();
+    _completingPassengers.clear();
     _passengerErrors.clear();
+    _completedDropOffs.clear();
     _idempotencyKeys.clear();
     _lastAttemptedOtps.clear();
     _generalError = null;

@@ -23,6 +23,8 @@ import '../features/driver/services/driver_location_tracker.dart';
 import '../features/driver/state/driver_home_provider.dart';
 import '../features/driver/state/driver_onboarding_provider.dart';
 import '../features/passenger/state/passenger_home_provider.dart';
+import '../features/trip/data/api_trip_repository.dart';
+import '../features/trip/data/trip_repository.dart';
 import 'router/app_router.dart';
 import 'state/app_mode_provider.dart';
 
@@ -48,6 +50,7 @@ class LastMileApp extends StatefulWidget {
     this.bookingFlowProvider,
     this.bookingDetailsProvider,
     this.passengerHomeProvider,
+    this.tripRepository,
   });
 
   final AppConfig config;
@@ -67,6 +70,7 @@ class LastMileApp extends StatefulWidget {
   final BookingFlowProvider? bookingFlowProvider;
   final BookingDetailsProvider? bookingDetailsProvider;
   final PassengerHomeProvider? passengerHomeProvider;
+  final TripRepository? tripRepository;
 
   @override
   State<LastMileApp> createState() => _LastMileAppState();
@@ -92,6 +96,7 @@ class _LastMileAppState extends State<LastMileApp> {
   late final bool _ownsBookingDetailsProvider;
   late final PassengerHomeProvider _passengerHomeProvider;
   late final bool _ownsPassengerHomeProvider;
+  late final TripRepository _tripRepository;
   late final AuthProvider _authProvider;
   late final bool _ownsAuthProvider;
   late final ApiClient _apiClient;
@@ -185,6 +190,9 @@ class _LastMileAppState extends State<LastMileApp> {
           },
         );
 
+    _tripRepository =
+        widget.tripRepository ?? ApiTripRepository(apiClient: _apiClient);
+
     _router = AppRouter.createRouter(
       appModeProvider: _appModeProvider,
       authProvider: _authProvider,
@@ -234,6 +242,7 @@ class _LastMileAppState extends State<LastMileApp> {
         Provider<ApiClient>.value(value: _apiClient),
         Provider<DriverRepository>.value(value: _driverRepository),
         Provider<BookingRepository>.value(value: _bookingRepository),
+        Provider<TripRepository>.value(value: _tripRepository),
         Provider<PassengerLocationService>.value(value: _locationService),
         ChangeNotifierProvider<AppModeProvider>.value(value: _appModeProvider),
         ChangeNotifierProvider<AuthProvider>.value(value: _authProvider),

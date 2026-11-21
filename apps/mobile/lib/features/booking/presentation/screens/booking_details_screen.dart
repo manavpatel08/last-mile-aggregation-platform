@@ -1,6 +1,8 @@
 import 'package:material_ui/material_ui.dart';
+import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
 
+import '../../../../app/router/app_routes.dart';
 import '../../../../core/theme/app_colors.dart';
 import '../../models/booking_details.dart';
 import '../../models/booking_status_history.dart';
@@ -760,6 +762,39 @@ class _BookingDetailsScreenState extends State<BookingDetailsScreen> {
                 ),
 
                 const SizedBox(height: 24),
+
+                // Active Trip Navigation (if assigned, arrived, boarded, or in progress)
+                if (const [
+                  'DRIVER_ASSIGNED',
+                  'DRIVER_ARRIVED',
+                  'BOARDED',
+                  'IN_PROGRESS',
+                ].contains(booking.status)) ...[
+                  FilledButton.icon(
+                    key: const Key('booking_details_view_trip_button'),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: AppColors.primary,
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                    ),
+                    onPressed: () {
+                      context.push(
+                        AppRoutes.passengerActiveTripPath(widget.bookingId),
+                      );
+                    },
+                    icon: const Icon(Icons.confirmation_number_outlined),
+                    label: const Text(
+                      'View Boarding Pass & Trip',
+                      style: TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                ],
 
                 // Action Button: Cancel Booking (if cancellable and not blocked/reconciling)
                 if (booking.isCancellable && provider.canCancel) ...[

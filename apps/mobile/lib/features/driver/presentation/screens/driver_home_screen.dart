@@ -136,6 +136,14 @@ class _DriverHomeScreenState extends State<DriverHomeScreen>
           backgroundColor: AppColors.success,
         ),
       );
+      if (provider.activeTripId != null) {
+        await context.push(
+          AppRoutes.driverActiveTripPath(provider.activeTripId!),
+        );
+        if (mounted) {
+          _loadDashboard();
+        }
+      }
     } else if (provider.offersError != null) {
       ScaffoldMessenger.of(context).hideCurrentSnackBar();
       ScaffoldMessenger.of(context).showSnackBar(
@@ -536,6 +544,70 @@ class _DriverHomeScreenState extends State<DriverHomeScreen>
                   ),
                 ),
               ] else ...[
+                if (driverProvider.activeTripId != null) ...[
+                  const SizedBox(height: 16),
+                  Card(
+                    key: const Key('driver_active_trip_card'),
+                    elevation: 0,
+                    color: AppColors.primaryContainer.withValues(alpha: 0.2),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      side: BorderSide(
+                        color: AppColors.primary.withValues(alpha: 0.4),
+                      ),
+                    ),
+                    child: Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              const Icon(
+                                Icons.directions_car,
+                                color: AppColors.primary,
+                                size: 22,
+                              ),
+                              const SizedBox(width: 8),
+                              Text(
+                                'Active Assigned Trip',
+                                style: textTheme.titleSmall?.copyWith(
+                                  color: AppColors.primary,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            'Trip ID: ${driverProvider.activeTripId}',
+                            style: textTheme.bodySmall?.copyWith(
+                              fontFamily: 'monospace',
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          FilledButton.icon(
+                            key: const Key(
+                              'driver_home_open_active_trip_button',
+                            ),
+                            onPressed: () async {
+                              await context.push(
+                                AppRoutes.driverActiveTripPath(
+                                  driverProvider.activeTripId!,
+                                ),
+                              );
+                              if (mounted) {
+                                _loadDashboard();
+                              }
+                            },
+                            icon: const Icon(Icons.navigation, size: 18),
+                            label: const Text('Open Active Trip Screen'),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
                 const SizedBox(height: 20),
                 Text(
                   'Readiness & Operational Status',

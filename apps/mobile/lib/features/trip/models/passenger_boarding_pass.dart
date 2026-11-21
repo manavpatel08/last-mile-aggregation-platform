@@ -142,6 +142,26 @@ class PassengerBoardingPass {
       bookingStatus == 'COMPLETED';
   bool get isExpired => DateTime.now().isAfter(expiresAt);
 
+  PassengerBoardingPass copyWith({
+    String? bookingId,
+    String? passengerId,
+    String? tripId,
+    String? boardingOtp,
+    DateTime? expiresAt,
+    String? bookingStatus,
+    BoardingPassDriver? driver,
+  }) {
+    return PassengerBoardingPass(
+      bookingId: bookingId ?? this.bookingId,
+      passengerId: passengerId ?? this.passengerId,
+      tripId: tripId ?? this.tripId,
+      boardingOtp: boardingOtp ?? this.boardingOtp,
+      expiresAt: expiresAt ?? this.expiresAt,
+      bookingStatus: bookingStatus ?? this.bookingStatus,
+      driver: driver ?? this.driver,
+    );
+  }
+
   Map<String, dynamic> toJson() => {
         'bookingId': bookingId,
         'passengerId': passengerId,

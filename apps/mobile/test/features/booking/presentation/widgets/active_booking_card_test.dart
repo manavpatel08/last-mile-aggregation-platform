@@ -68,5 +68,66 @@ void main() {
 
       expect(find.byKey(const Key('active_booking_details_button')), findsNothing);
     });
+
+    testWidgets(
+        'renders view trip button when status is DRIVER_ASSIGNED, DRIVER_ARRIVED, BOARDED, or IN_PROGRESS',
+        (tester) async {
+      for (final status in [
+        'DRIVER_ASSIGNED',
+        'DRIVER_ARRIVED',
+        'BOARDED',
+        'IN_PROGRESS',
+      ]) {
+        final booking = BookingResponse(
+          bookingId: 'book-active-$status',
+          status: status,
+          agreedFareCeiling: '45.00',
+          maxWaitDeadline: DateTime(2026, 11, 20, 12, 30),
+        );
+
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: AppTheme.lightTheme,
+            home: Scaffold(
+              body: ActiveBookingCard(booking: booking),
+            ),
+          ),
+        );
+
+        expect(
+          find.byKey(const Key('active_booking_view_trip_button')),
+          findsOneWidget,
+          reason: 'View trip button must be visible for status $status',
+        );
+      }
+    });
+
+    testWidgets(
+        'does not render view trip button when status is REQUESTED or MATCHING',
+        (tester) async {
+      for (final status in ['REQUESTED', 'MATCHING']) {
+        final booking = BookingResponse(
+          bookingId: 'book-pending-$status',
+          status: status,
+          agreedFareCeiling: '40.00',
+          maxWaitDeadline: DateTime(2026, 11, 20, 12, 30),
+        );
+
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: AppTheme.lightTheme,
+            home: Scaffold(
+              body: ActiveBookingCard(booking: booking),
+            ),
+          ),
+        );
+
+        expect(
+          find.byKey(const Key('active_booking_view_trip_button')),
+          findsNothing,
+          reason: 'View trip button must NOT be visible for status $status',
+        );
+      }
+    });
   });
 }

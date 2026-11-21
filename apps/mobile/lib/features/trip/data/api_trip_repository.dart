@@ -107,4 +107,71 @@ class ApiTripRepository implements TripRepository {
 
     return VerifyBoardingResponse.fromJson(responseData);
   }
+
+  @override
+  Future<StartTripResponse> startTrip({
+    required String tripId,
+    required String idempotencyKey,
+  }) async {
+    final response = await apiClient.post<Map<String, dynamic>>(
+      _resolvePath('trips/$tripId/start'),
+      idempotencyKey: idempotencyKey,
+      requiresAuth: true,
+    );
+
+    final rawData = response.data?['data'];
+    if (rawData is! Map<String, dynamic>) {
+      throw const ApiException(
+        errorCode: 'INVALID_RESPONSE',
+        message: 'Invalid start trip response structure from backend.',
+      );
+    }
+
+    return StartTripResponse.fromJson(rawData);
+  }
+
+  @override
+  Future<CompletePassengerResponse> completePassengerDropOff({
+    required String tripId,
+    required String passengerId,
+    required String idempotencyKey,
+  }) async {
+    final response = await apiClient.post<Map<String, dynamic>>(
+      _resolvePath('trips/$tripId/passengers/$passengerId/complete'),
+      idempotencyKey: idempotencyKey,
+      requiresAuth: true,
+    );
+
+    final rawData = response.data?['data'];
+    if (rawData is! Map<String, dynamic>) {
+      throw const ApiException(
+        errorCode: 'INVALID_RESPONSE',
+        message: 'Invalid passenger completion response structure from backend.',
+      );
+    }
+
+    return CompletePassengerResponse.fromJson(rawData);
+  }
+
+  @override
+  Future<CompleteTripResponse> completeTrip({
+    required String tripId,
+    required String idempotencyKey,
+  }) async {
+    final response = await apiClient.post<Map<String, dynamic>>(
+      _resolvePath('trips/$tripId/complete'),
+      idempotencyKey: idempotencyKey,
+      requiresAuth: true,
+    );
+
+    final rawData = response.data?['data'];
+    if (rawData is! Map<String, dynamic>) {
+      throw const ApiException(
+        errorCode: 'INVALID_RESPONSE',
+        message: 'Invalid trip completion response structure from backend.',
+      );
+    }
+
+    return CompleteTripResponse.fromJson(rawData);
+  }
 }

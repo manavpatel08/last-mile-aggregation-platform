@@ -4,6 +4,7 @@ import 'package:uuid/uuid.dart';
 
 import '../../../core/network/api_exception.dart';
 import '../data/driver_repository.dart';
+import '../models/accept_offer_response.dart';
 import '../models/driver_dispatch_offer.dart';
 import '../models/driver_status_response.dart';
 import '../models/driver_vehicle.dart';
@@ -89,6 +90,8 @@ class DriverHomeProvider extends ChangeNotifier {
   bool _isProcessingAction = false;
   String? _unresolvedOfferId;
   final Map<String, String> _offerIdempotencyKeys = {};
+  String? _activeTripId;
+  AcceptOfferResponse? _lastAcceptedOffer;
 
   // Presentation Countdown Timer
   Timer? _countdownTimer;
@@ -114,6 +117,15 @@ class DriverHomeProvider extends ChangeNotifier {
   String? get actionSuccessMessage => _actionSuccessMessage;
   bool get isProcessingAction => _isProcessingAction;
   String? get unresolvedOfferId => _unresolvedOfferId;
+  String? get activeTripId => _activeTripId;
+  AcceptOfferResponse? get lastAcceptedOffer => _lastAcceptedOffer;
+
+  /// Clears active trip reference on trip completion or dismissal.
+  void clearActiveTrip() {
+    _activeTripId = null;
+    _lastAcceptedOffer = null;
+    notifyListeners();
+  }
 
   @visibleForTesting
   DriverLocationTracker get locationTracker => _locationTracker;
@@ -171,6 +183,8 @@ class DriverHomeProvider extends ChangeNotifier {
     _isProcessingAction = false;
     _unresolvedOfferId = null;
     _offerIdempotencyKeys.clear();
+    _activeTripId = null;
+    _lastAcceptedOffer = null;
     _cancelCountdownTimer();
     _locationTracker.stopTracking();
     notifyListeners();
@@ -199,6 +213,8 @@ class DriverHomeProvider extends ChangeNotifier {
     _isProcessingAction = false;
     _unresolvedOfferId = null;
     _offerIdempotencyKeys.clear();
+    _activeTripId = null;
+    _lastAcceptedOffer = null;
     _cancelCountdownTimer();
     _locationTracker.stopTracking();
     notifyListeners();
@@ -665,7 +681,7 @@ class DriverHomeProvider extends ChangeNotifier {
     );
 
     try {
-      await repo.acceptOffer(
+      final response = await repo.acceptOffer(
         offerId: offerId,
         idempotencyKey: idempotencyKey,
       );
@@ -679,6 +695,8 @@ class DriverHomeProvider extends ChangeNotifier {
       _offerIdempotencyKeys.remove(offerId);
       _actionSuccessMessage = 'Offer accepted successfully!';
       _offersError = null;
+      _activeTripId = response.tripId;
+      _lastAcceptedOffer = response;
 
       if (_status != null) {
         _status = DriverStatusResponse(

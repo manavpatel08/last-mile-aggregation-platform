@@ -1,6 +1,8 @@
 import 'package:material_ui/material_ui.dart';
+import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
 
+import '../../../../app/router/app_routes.dart';
 import '../../../../core/theme/app_colors.dart';
 import '../../data/trip_repository.dart';
 import '../../state/driver_active_trip_provider.dart';
@@ -75,6 +77,7 @@ class _DriverActiveTripScreenState extends State<DriverActiveTripScreen> {
       case 'DRIVER_EN_ROUTE':
         return AppColors.warning;
       case 'NO_SHOW':
+      case 'CANCELLED':
         return AppColors.error;
       default:
         return AppColors.textSecondary;
@@ -299,8 +302,119 @@ class _DriverActiveTripScreenState extends State<DriverActiveTripScreen> {
                       ),
                       const SizedBox(height: 16),
 
-                      // Arrived Button
-                      if (trip.isAtPickup)
+                      // Progression / Action Buttons
+                      if (trip.status == 'COMPLETED') ...[
+                        Container(
+                          width: double.infinity,
+                          padding: const EdgeInsets.symmetric(vertical: 14),
+                          decoration: BoxDecoration(
+                            color: AppColors.success.withValues(alpha: 0.15),
+                            borderRadius: BorderRadius.circular(10),
+                            border: Border.all(
+                              color: AppColors.success.withValues(alpha: 0.4),
+                            ),
+                          ),
+                          child: const Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Icon(
+                                Icons.check_circle,
+                                color: AppColors.success,
+                                size: 22,
+                              ),
+                              SizedBox(width: 8),
+                              Text(
+                                'Trip Completed',
+                                key: Key('trip_completed_status_indicator'),
+                                style: TextStyle(
+                                  color: AppColors.success,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 15,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        OutlinedButton.icon(
+                          key: const Key('return_home_button'),
+                          onPressed: () {
+                            if (Navigator.of(context).canPop()) {
+                              Navigator.of(context).pop();
+                            } else {
+                              context.go(AppRoutes.driverHome);
+                            }
+                          },
+                          icon: const Icon(Icons.home),
+                          label: const Text('Return to Driver Home'),
+                        ),
+                      ] else if (trip.isInProgress) ...[
+                        Container(
+                          width: double.infinity,
+                          padding: const EdgeInsets.symmetric(vertical: 12),
+                          decoration: BoxDecoration(
+                            color: AppColors.primary.withValues(alpha: 0.1),
+                            borderRadius: BorderRadius.circular(10),
+                            border: Border.all(
+                              color: AppColors.primary.withValues(alpha: 0.3),
+                            ),
+                          ),
+                          child: const Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Icon(
+                                Icons.navigation,
+                                color: AppColors.primary,
+                                size: 20,
+                              ),
+                              SizedBox(width: 8),
+                              Text(
+                                'Trip In Progress — Delivering Passengers',
+                                key: Key('trip_in_progress_indicator'),
+                                style: TextStyle(
+                                  color: AppColors.primary,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 14,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        if (provider.canCompleteTrip) ...[
+                          const SizedBox(height: 12),
+                          ElevatedButton.icon(
+                            key: const Key('finalize_trip_button'),
+                            onPressed: provider.isCompletingTrip
+                                ? null
+                                : () => provider.completeTrip(
+                                      repository: widget.repository,
+                                    ),
+                            icon: provider.isCompletingTrip
+                                ? const SizedBox(
+                                    width: 18,
+                                    height: 18,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      color: Colors.white,
+                                    ),
+                                  )
+                                : const Icon(Icons.flag),
+                            label: Text(
+                              provider.isCompletingTrip
+                                  ? 'Finalizing Trip...'
+                                  : 'Finalize Trip',
+                            ),
+                            style: ElevatedButton.styleFrom(
+                              padding: const EdgeInsets.symmetric(vertical: 14),
+                              backgroundColor: AppColors.success,
+                              foregroundColor: Colors.white,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ] else if (trip.isAtPickup) ...[
                         Container(
                           width: double.infinity,
                           padding: const EdgeInsets.symmetric(vertical: 14),
@@ -331,8 +445,42 @@ class _DriverActiveTripScreenState extends State<DriverActiveTripScreen> {
                               ),
                             ],
                           ),
-                        )
-                      else
+                        ),
+                        if (provider.canStartTrip) ...[
+                          const SizedBox(height: 12),
+                          ElevatedButton.icon(
+                            key: const Key('start_trip_button'),
+                            onPressed: provider.isStartingTrip
+                                ? null
+                                : () => provider.startTrip(
+                                      repository: widget.repository,
+                                    ),
+                            icon: provider.isStartingTrip
+                                ? const SizedBox(
+                                    width: 18,
+                                    height: 18,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      color: Colors.white,
+                                    ),
+                                  )
+                                : const Icon(Icons.navigation),
+                            label: Text(
+                              provider.isStartingTrip
+                                  ? 'Starting Trip...'
+                                  : 'Start Trip (Depart Hub)',
+                            ),
+                            style: ElevatedButton.styleFrom(
+                              padding: const EdgeInsets.symmetric(vertical: 14),
+                              backgroundColor: AppColors.primary,
+                              foregroundColor: Colors.white,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ] else ...[
                         ElevatedButton.icon(
                           key: const Key('driver_arrived_button'),
                           onPressed: provider.isReportingArrival
@@ -342,13 +490,13 @@ class _DriverActiveTripScreenState extends State<DriverActiveTripScreen> {
                                   ),
                           icon: provider.isReportingArrival
                               ? const SizedBox(
-                                  width: 18,
-                                  height: 18,
-                                  child: CircularProgressIndicator(
-                                    strokeWidth: 2,
-                                    color: Colors.white,
-                                  ),
-                                )
+                                    width: 18,
+                                    height: 18,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      color: Colors.white,
+                                    ),
+                                  )
                               : const Icon(Icons.location_on),
                           label: Text(
                             provider.isReportingArrival
@@ -364,6 +512,7 @@ class _DriverActiveTripScreenState extends State<DriverActiveTripScreen> {
                             ),
                           ),
                         ),
+                      ],
                       const SizedBox(height: 24),
 
                       // Passenger Manifest Title
@@ -448,8 +597,8 @@ class _DriverActiveTripScreenState extends State<DriverActiveTripScreen> {
                                 ),
                                 const Divider(height: 20),
 
-                                // If passenger is BOARDED
-                                if (passenger.isBoarded) ...[
+                                // If passenger is COMPLETED
+                                if (passenger.isCompleted) ...[
                                   Row(
                                     children: [
                                       const Icon(
@@ -459,9 +608,9 @@ class _DriverActiveTripScreenState extends State<DriverActiveTripScreen> {
                                       ),
                                       const SizedBox(width: 8),
                                       Text(
-                                        'Boarding Verified',
+                                        'Drop-Off Completed',
                                         key: Key(
-                                          'passenger_verified_label_${passenger.passengerId}',
+                                          'passenger_completed_label_${passenger.passengerId}',
                                         ),
                                         style: const TextStyle(
                                           color: AppColors.success,
@@ -469,8 +618,183 @@ class _DriverActiveTripScreenState extends State<DriverActiveTripScreen> {
                                           fontSize: 13,
                                         ),
                                       ),
+                                      const Spacer(),
+                                      Text(
+                                        '₹${(passenger.finalRideFarePaise / 100).toStringAsFixed(2)}',
+                                        key: Key(
+                                          'passenger_fare_${passenger.passengerId}',
+                                        ),
+                                        style: const TextStyle(
+                                          fontWeight: FontWeight.bold,
+                                          color: AppColors.textPrimary,
+                                        ),
+                                      ),
                                     ],
                                   ),
+                                  if (provider.dropOffResult(passenger.passengerId) != null) ...[
+                                    const SizedBox(height: 8),
+                                    Container(
+                                      key: Key(
+                                        'cash_breakdown_${passenger.passengerId}',
+                                      ),
+                                      padding: const EdgeInsets.all(8),
+                                      decoration: BoxDecoration(
+                                        color: AppColors.surface,
+                                        borderRadius: BorderRadius.circular(8),
+                                        border: Border.all(color: AppColors.border),
+                                      ),
+                                      child: Column(
+                                        crossAxisAlignment: CrossAxisAlignment.start,
+                                        children: [
+                                          Text(
+                                            'Ride Fare: ₹${provider.dropOffResult(passenger.passengerId)!.rideFare}',
+                                            style: const TextStyle(fontSize: 12),
+                                          ),
+                                          Text(
+                                            'Waiting Charge: ₹${provider.dropOffResult(passenger.passengerId)!.waitingCharge}',
+                                            style: const TextStyle(fontSize: 12),
+                                          ),
+                                          Text(
+                                            'Total Cash to Collect: ₹${provider.dropOffResult(passenger.passengerId)!.totalCashToCollect}',
+                                            style: const TextStyle(
+                                              fontSize: 12,
+                                              fontWeight: FontWeight.bold,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ],
+                                ] else if (passenger.isCancelled) ...[
+                                  Row(
+                                    children: [
+                                      const Icon(
+                                        Icons.cancel_outlined,
+                                        color: AppColors.error,
+                                        size: 20,
+                                      ),
+                                      const SizedBox(width: 8),
+                                      Text(
+                                        'Booking Cancelled',
+                                        key: Key(
+                                          'passenger_cancelled_label_${passenger.passengerId}',
+                                        ),
+                                        style: const TextStyle(
+                                          color: AppColors.error,
+                                          fontWeight: FontWeight.bold,
+                                          fontSize: 13,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ] else if (passenger.isNoShow) ...[
+                                  Row(
+                                    children: [
+                                      const Icon(
+                                        Icons.person_off_outlined,
+                                        color: AppColors.error,
+                                        size: 20,
+                                      ),
+                                      const SizedBox(width: 8),
+                                      Text(
+                                        'Marked No-Show',
+                                        key: Key(
+                                          'passenger_noshow_label_${passenger.passengerId}',
+                                        ),
+                                        style: const TextStyle(
+                                          color: AppColors.error,
+                                          fontWeight: FontWeight.bold,
+                                          fontSize: 13,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ] else if (passenger.isBoarded) ...[
+                                  if (trip.isInProgress) ...[
+                                    Row(
+                                      mainAxisAlignment:
+                                          MainAxisAlignment.spaceBetween,
+                                      children: [
+                                        const Row(
+                                          children: [
+                                            Icon(
+                                              Icons.directions_car,
+                                              color: AppColors.primary,
+                                              size: 20,
+                                            ),
+                                            SizedBox(width: 8),
+                                            Text(
+                                              'On Board',
+                                              style: TextStyle(
+                                                color: AppColors.primary,
+                                                fontWeight: FontWeight.bold,
+                                                fontSize: 13,
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                        ElevatedButton.icon(
+                                          key: Key(
+                                            'complete_drop_off_button_${passenger.passengerId}',
+                                          ),
+                                          onPressed: provider
+                                                  .isCompletingPassenger(
+                                                      passenger.passengerId)
+                                              ? null
+                                              : () => provider
+                                                  .completePassengerDropOff(
+                                                    passengerId:
+                                                        passenger.passengerId,
+                                                    repository:
+                                                        widget.repository,
+                                                  ),
+                                          icon: provider.isCompletingPassenger(
+                                                  passenger.passengerId)
+                                              ? const SizedBox(
+                                                  width: 14,
+                                                  height: 14,
+                                                  child:
+                                                      CircularProgressIndicator(
+                                                    strokeWidth: 2,
+                                                    color: Colors.white,
+                                                  ),
+                                                )
+                                              : const Icon(Icons.check,
+                                                  size: 16),
+                                          label:
+                                              const Text('Complete Drop-Off'),
+                                          style: ElevatedButton.styleFrom(
+                                            backgroundColor: AppColors.primary,
+                                            foregroundColor: Colors.white,
+                                            visualDensity:
+                                                VisualDensity.compact,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ] else ...[
+                                    Row(
+                                      children: [
+                                        const Icon(
+                                          Icons.check_circle,
+                                          color: AppColors.success,
+                                          size: 20,
+                                        ),
+                                        const SizedBox(width: 8),
+                                        Text(
+                                          'Boarding Verified',
+                                          key: Key(
+                                            'passenger_verified_label_${passenger.passengerId}',
+                                          ),
+                                          style: const TextStyle(
+                                            color: AppColors.success,
+                                            fontWeight: FontWeight.bold,
+                                            fontSize: 13,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ],
                                 ] else ...[
                                   // OTP Input & Verification Row
                                   Row(

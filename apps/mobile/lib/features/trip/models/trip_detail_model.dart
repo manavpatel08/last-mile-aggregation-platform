@@ -43,9 +43,12 @@ class TripPassengerModel {
   bool get isBoarded => status == 'BOARDED';
   bool get isNoShow => status == 'NO_SHOW';
   bool get isCompleted => status == 'COMPLETED';
+  bool get isCancelled => status == 'CANCELLED';
+  bool get isTerminal => isCompleted || isNoShow || isCancelled;
 
   TripPassengerModel copyWith({
     String? status,
+    int? finalRideFarePaise,
     int? waitingChargePaise,
     DateTime? boardedAt,
     DateTime? droppedOffAt,
@@ -55,7 +58,7 @@ class TripPassengerModel {
       passengerId: passengerId,
       bookingId: bookingId,
       status: status ?? this.status,
-      finalRideFarePaise: finalRideFarePaise,
+      finalRideFarePaise: finalRideFarePaise ?? this.finalRideFarePaise,
       waitingChargePaise: waitingChargePaise ?? this.waitingChargePaise,
       boardedAt: boardedAt ?? this.boardedAt,
       droppedOffAt: droppedOffAt ?? this.droppedOffAt,
@@ -269,5 +272,114 @@ class VerifyBoardingResponse {
         'passengerStatus': passengerStatus,
         'waitingChargePaise': waitingChargePaise,
         if (message != null) 'message': message,
+      };
+}
+
+/// Response returned by `POST /api/v1/trips/:id/start`.
+@immutable
+class StartTripResponse {
+  const StartTripResponse({
+    required this.tripId,
+    required this.status,
+    this.startedAt,
+  });
+
+  factory StartTripResponse.fromJson(Map<String, dynamic> json) {
+    return StartTripResponse(
+      tripId: json['tripId'] as String? ?? '',
+      status: json['status'] as String? ?? 'IN_PROGRESS',
+      startedAt: json['startedAt'] != null
+          ? DateTime.tryParse(json['startedAt'] as String)
+          : null,
+    );
+  }
+
+  final String tripId;
+  final String status;
+  final DateTime? startedAt;
+
+  Map<String, dynamic> toJson() => {
+        'tripId': tripId,
+        'status': status,
+        if (startedAt != null) 'startedAt': startedAt!.toIso8601String(),
+      };
+}
+
+/// Response returned by `POST /api/v1/trips/:id/passengers/:passengerId/complete`.
+@immutable
+class CompletePassengerResponse {
+  const CompletePassengerResponse({
+    required this.passengerId,
+    required this.status,
+    required this.rideFarePaise,
+    required this.rideFare,
+    required this.waitingChargePaise,
+    required this.waitingCharge,
+    required this.totalCashToCollectPaise,
+    required this.totalCashToCollect,
+  });
+
+  factory CompletePassengerResponse.fromJson(Map<String, dynamic> json) {
+    return CompletePassengerResponse(
+      passengerId: json['passengerId'] as String? ?? '',
+      status: json['status'] as String? ?? 'COMPLETED',
+      rideFarePaise: (json['rideFarePaise'] as num?)?.toInt() ?? 0,
+      rideFare: json['rideFare'] as String? ?? '0.00',
+      waitingChargePaise: (json['waitingChargePaise'] as num?)?.toInt() ?? 0,
+      waitingCharge: json['waitingCharge'] as String? ?? '0.00',
+      totalCashToCollectPaise:
+          (json['totalCashToCollectPaise'] as num?)?.toInt() ?? 0,
+      totalCashToCollect: json['totalCashToCollect'] as String? ?? '0.00',
+    );
+  }
+
+  final String passengerId;
+  final String status;
+  final int rideFarePaise;
+  final String rideFare;
+  final int waitingChargePaise;
+  final String waitingCharge;
+  final int totalCashToCollectPaise;
+  final String totalCashToCollect;
+
+  Map<String, dynamic> toJson() => {
+        'passengerId': passengerId,
+        'status': status,
+        'rideFarePaise': rideFarePaise,
+        'rideFare': rideFare,
+        'waitingChargePaise': waitingChargePaise,
+        'waitingCharge': waitingCharge,
+        'totalCashToCollectPaise': totalCashToCollectPaise,
+        'totalCashToCollect': totalCashToCollect,
+      };
+}
+
+/// Response returned by `POST /api/v1/trips/:id/complete`.
+@immutable
+class CompleteTripResponse {
+  const CompleteTripResponse({
+    required this.tripId,
+    required this.status,
+    this.completedAt,
+  });
+
+  factory CompleteTripResponse.fromJson(Map<String, dynamic> json) {
+    return CompleteTripResponse(
+      tripId: json['tripId'] as String? ?? '',
+      status: json['status'] as String? ?? 'COMPLETED',
+      completedAt: json['completedAt'] != null
+          ? DateTime.tryParse(json['completedAt'] as String)
+          : null,
+    );
+  }
+
+  final String tripId;
+  final String status;
+  final DateTime? completedAt;
+
+  Map<String, dynamic> toJson() => {
+        'tripId': tripId,
+        'status': status,
+        if (completedAt != null) 'completedAt': completedAt!.toIso8601String(),
       };
 }

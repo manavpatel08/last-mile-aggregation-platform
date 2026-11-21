@@ -506,6 +506,94 @@ void main() {
     });
 
     testWidgets(
+        'canStartTrip remains disabled when all passengers are NO_SHOW',
+        (tester) async {
+      final fakeRepo = _FakeTripRepository()
+        ..tripToReturn = TripDetailModel(
+          tripId: 'trip-prog-all-noshow',
+          rideGroupId: 'grp-1',
+          activeDriverId: 'driver-1',
+          status: 'AT_PICKUP',
+          driverArrivedAt: DateTime.now(),
+          passengers: const [
+            TripPassengerModel(
+              id: 'tp-1',
+              passengerId: 'p-1',
+              bookingId: 'book-1',
+              status: 'NO_SHOW',
+              finalRideFarePaise: 0,
+              waitingChargePaise: 0,
+            ),
+            TripPassengerModel(
+              id: 'tp-2',
+              passengerId: 'p-2',
+              bookingId: 'book-2',
+              status: 'NO_SHOW',
+              finalRideFarePaise: 0,
+              waitingChargePaise: 0,
+            ),
+          ],
+        );
+
+      await tester.pumpWidget(
+        buildTestWidget(
+          tripId: 'trip-prog-all-noshow',
+          repository: fakeRepo,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.byKey(const Key('start_trip_button')), findsNothing);
+    });
+
+    testWidgets(
+        'canStartTrip enables button when at least one passenger is BOARDED alongside a NO_SHOW passenger',
+        (tester) async {
+      final fakeRepo = _FakeTripRepository()
+        ..tripToReturn = TripDetailModel(
+          tripId: 'trip-prog-mixed-boarded',
+          rideGroupId: 'grp-1',
+          activeDriverId: 'driver-1',
+          status: 'AT_PICKUP',
+          driverArrivedAt: DateTime.now(),
+          passengers: const [
+            TripPassengerModel(
+              id: 'tp-1',
+              passengerId: 'p-1',
+              bookingId: 'book-1',
+              status: 'BOARDED',
+              finalRideFarePaise: 3800,
+              waitingChargePaise: 0,
+            ),
+            TripPassengerModel(
+              id: 'tp-2',
+              passengerId: 'p-2',
+              bookingId: 'book-2',
+              status: 'NO_SHOW',
+              finalRideFarePaise: 0,
+              waitingChargePaise: 0,
+            ),
+          ],
+        );
+
+      await tester.pumpWidget(
+        buildTestWidget(
+          tripId: 'trip-prog-mixed-boarded',
+          repository: fakeRepo,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.byKey(const Key('start_trip_button')), findsOneWidget);
+      expect(find.text('Start Trip (Depart Hub)'), findsOneWidget);
+
+      await tester.tap(find.byKey(const Key('start_trip_button')));
+      await tester.pumpAndSettle();
+
+      expect(fakeRepo.startTripCalls, 1);
+    });
+
+    testWidgets(
         'completing passenger drop-off records cash and displays breakdown',
         (tester) async {
       final fakeRepo = _FakeTripRepository()

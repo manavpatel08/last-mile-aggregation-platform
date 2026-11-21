@@ -554,5 +554,27 @@ void main() {
       expect(find.text('Trip In Progress — En Route'), findsOneWidget);
       expect(find.byKey(const Key('boarding_otp_display')), findsNothing);
     });
+
+    test(
+        'OTP recovery fallback populates actual passengerId from BookingDetails, not coordinate',
+        () async {
+      final fakeTripRepo = _FakeTripRepository()
+        ..errorToThrow = const ApiException(
+          message: 'OTP already consumed',
+          statusCode: 400,
+          errorCode: 'OTP_ALREADY_CONSUMED',
+        );
+      final fakeBookingRepo = _FakeBookingRepository();
+      final provider = PassengerActiveTripProvider(
+        repository: fakeTripRepo,
+        bookingRepository: fakeBookingRepo,
+      );
+
+      await provider.loadBoardingPass('book-test-pid');
+
+      expect(provider.boardingPass, isNotNull);
+      expect(provider.boardingPass!.passengerId, 'p-1');
+      expect(provider.boardingPass!.passengerId, isNot(contains('.')));
+    });
   });
 }

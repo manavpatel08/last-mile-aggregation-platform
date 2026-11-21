@@ -88,7 +88,7 @@ class PassengerActiveTripProvider extends ChangeNotifier {
             } else {
               _boardingPass = PassengerBoardingPass(
                 bookingId: bookingId,
-                passengerId: details.passengerPickupLocation?.latitude.toString() ?? '',
+                passengerId: details.passengerId ?? '',
                 tripId: '',
                 boardingOtp: '••••',
                 expiresAt: DateTime.now().add(const Duration(hours: 1)),

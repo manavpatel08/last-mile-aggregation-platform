@@ -42,7 +42,8 @@ class DriverActiveTripProvider extends ChangeNotifier {
   bool get isCompleted => _trip?.isCompleted ?? false;
   bool get allPassengersBoarded =>
       passengers.isNotEmpty &&
-      passengers.every((p) => p.isBoarded || p.isNoShow);
+      passengers.every((p) => p.isBoarded || p.isNoShow) &&
+      passengers.any((p) => p.isBoarded);
   bool get canStartTrip => isAtPickup && allPassengersBoarded;
   bool get canCompleteTrip =>
       isInProgress &&

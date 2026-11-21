@@ -16,6 +16,14 @@ class _FakeTripRepository implements TripRepository {
   int arriveCalls = 0;
   int verifyCalls = 0;
   String? lastVerifiedOtp;
+  final List<String> verifyIdempotencyKeys = [];
+  final List<String> verifyOtps = [];
+  Future<VerifyBoardingResponse> Function(
+    String tripId,
+    String passengerId,
+    String otp,
+    String idempotencyKey,
+  )? onVerifyBoarding;
 
   @override
   Future<TripDetailModel> getTripDetails(String tripId) async {
@@ -70,6 +78,11 @@ class _FakeTripRepository implements TripRepository {
   }) async {
     verifyCalls++;
     lastVerifiedOtp = otp;
+    verifyOtps.add(otp);
+    verifyIdempotencyKeys.add(idempotencyKey);
+    if (onVerifyBoarding != null) {
+      return onVerifyBoarding!(tripId, passengerId, otp, idempotencyKey);
+    }
     if (verifyError != null) throw verifyError!;
     return const VerifyBoardingResponse(
       success: true,
@@ -248,6 +261,142 @@ void main() {
         find.byKey(const Key('otp_input_p-1')),
         findsOneWidget,
       );
+    });
+  });
+
+  group('DriverActiveTripProvider - OTP Idempotency Retry Lifecycle', () {
+    test(
+        'Test 1 — Incorrect OTP followed by corrected OTP uses fresh key and succeeds',
+        () async {
+      final fakeRepo = _FakeTripRepository();
+      final provider = DriverActiveTripProvider(repository: fakeRepo);
+      await provider.loadTrip('trip-123');
+
+      // Attempt 1: Driver enters incorrect OTP "0000"
+      fakeRepo.onVerifyBoarding = (tripId, passengerId, otp, key) async {
+        throw const ApiException(
+          statusCode: 400,
+          errorCode: 'INVALID_OTP',
+          message: 'Invalid boarding OTP provided.',
+        );
+      };
+
+      final attempt1Success = await provider.verifyPassengerOtp(
+        passengerId: 'p-1',
+        otp: '0000',
+      );
+
+      expect(attempt1Success, isFalse);
+      expect(fakeRepo.verifyCalls, 1);
+      expect(fakeRepo.verifyOtps[0], '0000');
+      final firstKey = fakeRepo.verifyIdempotencyKeys[0];
+      expect(
+        provider.errorForPassenger('p-1'),
+        'Invalid boarding OTP provided.',
+      );
+
+      // Attempt 2: Driver enters corrected OTP "4821"
+      fakeRepo.onVerifyBoarding = (tripId, passengerId, otp, key) async {
+        return const VerifyBoardingResponse(
+          success: true,
+          passengerStatus: 'BOARDED',
+          waitingChargePaise: 0,
+        );
+      };
+
+      final attempt2Success = await provider.verifyPassengerOtp(
+        passengerId: 'p-1',
+        otp: '4821',
+      );
+
+      expect(attempt2Success, isTrue);
+      expect(fakeRepo.verifyCalls, 2);
+      expect(fakeRepo.verifyOtps[1], '4821');
+      final secondKey = fakeRepo.verifyIdempotencyKeys[1];
+
+      // Second attempt MUST use a distinct idempotency key
+      expect(secondKey, isNot(equals(firstKey)));
+
+      // Status of passenger must now be BOARDED
+      final passenger =
+          provider.passengers.firstWhere((p) => p.passengerId == 'p-1');
+      expect(passenger.status, 'BOARDED');
+      expect(passenger.isBoarded, isTrue);
+      expect(provider.errorForPassenger('p-1'), isNull);
+    });
+
+    test(
+        'Test 2 — Ambiguous network failure retains idempotency key across retry',
+        () async {
+      final fakeRepo = _FakeTripRepository();
+      final provider = DriverActiveTripProvider(repository: fakeRepo);
+      await provider.loadTrip('trip-123');
+
+      // Attempt 1: Simulated timeout / network dropout
+      fakeRepo.onVerifyBoarding = (tripId, passengerId, otp, key) async {
+        throw const ApiException(
+          statusCode: null,
+          errorCode: 'REQUEST_TIMEOUT',
+          message: 'The request timed out. Please try again.',
+        );
+      };
+
+      final attempt1Success = await provider.verifyPassengerOtp(
+        passengerId: 'p-1',
+        otp: '4821',
+      );
+
+      expect(attempt1Success, isFalse);
+      expect(fakeRepo.verifyCalls, 1);
+      final firstKey = fakeRepo.verifyIdempotencyKeys[0];
+
+      // Attempt 2: Retry the same logical OTP request "4821"
+      fakeRepo.onVerifyBoarding = (tripId, passengerId, otp, key) async {
+        return const VerifyBoardingResponse(
+          success: true,
+          passengerStatus: 'BOARDED',
+          waitingChargePaise: 0,
+        );
+      };
+
+      final attempt2Success = await provider.verifyPassengerOtp(
+        passengerId: 'p-1',
+        otp: '4821',
+      );
+
+      expect(attempt2Success, isTrue);
+      expect(fakeRepo.verifyCalls, 2);
+      final retryKey = fakeRepo.verifyIdempotencyKeys[1];
+
+      // Must reuse the exact same idempotency key for the same logical request after timeout
+      expect(retryKey, equals(firstKey));
+
+      final passenger =
+          provider.passengers.firstWhere((p) => p.passengerId == 'p-1');
+      expect(passenger.status, 'BOARDED');
+    });
+
+    test(
+        'Test 3 — Successful verification clears completed idempotency key',
+        () async {
+      final fakeRepo = _FakeTripRepository();
+      final provider = DriverActiveTripProvider(repository: fakeRepo);
+      await provider.loadTrip('trip-123');
+
+      final success = await provider.verifyPassengerOtp(
+        passengerId: 'p-1',
+        otp: '4821',
+      );
+
+      expect(success, isTrue);
+      expect(fakeRepo.verifyCalls, 1);
+      expect(
+        provider.passengers.firstWhere((p) => p.passengerId == 'p-1').isBoarded,
+        isTrue,
+      );
+
+      // Completed idempotency key is cleared appropriately
+      expect(provider.getIdempotencyKeyForPassenger('p-1'), isNull);
     });
   });
 }

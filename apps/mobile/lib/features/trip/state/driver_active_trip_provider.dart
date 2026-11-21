@@ -18,6 +18,7 @@ class DriverActiveTripProvider extends ChangeNotifier {
   final Map<String, bool> _verifyingPassengers = {};
   final Map<String, String?> _passengerErrors = {};
   final Map<String, String> _idempotencyKeys = {};
+  final Map<String, String> _lastAttemptedOtps = {};
   String? _generalError;
   String? _generalSuccess;
   String? _currentTripId;
@@ -39,6 +40,13 @@ class DriverActiveTripProvider extends ChangeNotifier {
 
   String? errorForPassenger(String passengerId) =>
       _passengerErrors[passengerId];
+
+  @visibleForTesting
+  String? getIdempotencyKeyForPassenger(String passengerId) {
+    final tripId = _currentTripId ?? _trip?.tripId;
+    if (tripId == null) return null;
+    return _idempotencyKeys['verify_${tripId}_$passengerId'];
+  }
 
   void setRepository(TripRepository repository) {
     _repository = repository;
@@ -113,6 +121,9 @@ class DriverActiveTripProvider extends ChangeNotifier {
       return true;
     } on ApiException catch (e) {
       _generalError = e.message;
+      if (!e.isTransient) {
+        _idempotencyKeys.remove('arrive_$tripId');
+      }
       return false;
     } catch (e) {
       _generalError = 'Arrival reporting failed. Please check GPS connection.';
@@ -151,6 +162,15 @@ class DriverActiveTripProvider extends ChangeNotifier {
     notifyListeners();
 
     final keyIdentifier = 'verify_${tripId}_$passengerId';
+
+    // If the user has changed the OTP from the previously attempted value,
+    // this constitutes a distinct logical request requiring a fresh key.
+    if (_lastAttemptedOtps.containsKey(keyIdentifier) &&
+        _lastAttemptedOtps[keyIdentifier] != trimmedOtp) {
+      _idempotencyKeys.remove(keyIdentifier);
+    }
+    _lastAttemptedOtps[keyIdentifier] = trimmedOtp;
+
     final idempotencyKey = _idempotencyKeys.putIfAbsent(
       keyIdentifier,
       () => const Uuid().v4(),
@@ -181,16 +201,32 @@ class DriverActiveTripProvider extends ChangeNotifier {
         }
         _generalSuccess = 'Passenger boarding verified successfully!';
         _passengerErrors[passengerId] = null;
+        // Successful verification permanently completes the operation.
         _idempotencyKeys.remove(keyIdentifier);
+        _lastAttemptedOtps.remove(keyIdentifier);
         return true;
       } else {
         _passengerErrors[passengerId] = result.message ?? 'Verification failed.';
+        // Non-success response is definitive: clear idempotency key so next attempt generates fresh key.
+        _idempotencyKeys.remove(keyIdentifier);
+        _lastAttemptedOtps.remove(keyIdentifier);
         return false;
       }
     } on ApiException catch (e) {
       _passengerErrors[passengerId] = e.message;
+      if (!e.isTransient) {
+        // Definitive backend response (e.g. 400 INVALID_OTP, 400 OTP_EXPIRED,
+        // 400 OTP_MAX_ATTEMPTS_EXCEEDED).
+        // Clear the idempotency key so the subsequent user attempt uses a fresh key.
+        _idempotencyKeys.remove(keyIdentifier);
+        _lastAttemptedOtps.remove(keyIdentifier);
+      }
+      // If e.isTransient is true (e.g. REQUEST_TIMEOUT, NETWORK_UNAVAILABLE, 5xx),
+      // do NOT clear the key. Retrying the same logical request reuses the key.
       return false;
     } catch (e) {
+      // Ambiguous non-ApiException or unknown transport error:
+      // Retain the idempotency key so retrying does not create duplicate attempts.
       _passengerErrors[passengerId] =
           'Network error during verification. Please retry.';
       return false;
@@ -218,6 +254,7 @@ class DriverActiveTripProvider extends ChangeNotifier {
     _verifyingPassengers.clear();
     _passengerErrors.clear();
     _idempotencyKeys.clear();
+    _lastAttemptedOtps.clear();
     _generalError = null;
     _generalSuccess = null;
     _currentTripId = null;

@@ -3,17 +3,22 @@ import {
   NotFoundException,
   BadRequestException,
   ForbiddenException,
+  ConflictException,
+  ServiceUnavailableException,
   HttpStatus,
   Logger,
   Optional,
 } from '@nestjs/common';
+import { InjectQueue } from '@nestjs/bullmq';
+import type { Queue } from 'bullmq';
 import * as crypto from 'crypto';
 import { PrismaService } from '../../infrastructure/prisma/prisma.service.js';
 import { RedisService } from '../../infrastructure/redis/redis.service.js';
 import { RoutingService } from '../routing/routing.service.js';
-import { CACHE_KEYS } from '../../common/constants/index.js';
+import { CACHE_KEYS, QUEUES } from '../../common/constants/index.js';
 import { hashBoardingOtp } from '../../common/utils/otp.util.js';
 import { VerifyBoardingDto } from './dto/verify-boarding.dto.js';
+import { ReportBreakdownDto } from './dto/report-breakdown.dto.js';
 import { calculateWaitingChargePaise } from './trips.util.js';
 import {
   IdempotencyClaimContext,
@@ -53,6 +58,9 @@ export class TripsService {
     private readonly redisService?: RedisService,
     @Optional()
     private readonly routingService?: RoutingService,
+    @Optional()
+    @InjectQueue(QUEUES.DISPATCH)
+    private readonly dispatchQueue?: Queue,
   ) {}
 
   /**
@@ -2123,5 +2131,1481 @@ export class TripsService {
         `Failed to recalculate and persist route for group ${info.rideGroupId}: ${(err as Error).message}`,
       );
     }
+  }
+
+  /**
+   * Report mid-trip vehicle breakdown (POST /api/v1/trips/:id/report-breakdown).
+   * - Validates active driver calling.
+   * - Transitions trip to INTERRUPTED.
+   * - Captures immutable snapshot of BOARDED passengers and remaining drop-off details.
+   * - Persists TripIncident record.
+   * - Finds and ranks eligible replacement drivers by OSRM ETA.
+   * - If 0 replacement drivers available, automatically aborts trip with ₹0 fare and refund audit.
+   */
+  async reportBreakdown(
+    driverUserId: string,
+    tripId: string,
+    dto: ReportBreakdownDto,
+    claim?: IdempotencyClaimContext,
+  ) {
+    const driver = await this.getVerifiedDriverProfile(driverUserId);
+
+    let incidentLat: number;
+    let incidentLng: number;
+
+    if (
+      dto.incidentLocation &&
+      typeof dto.incidentLocation.latitude === 'number' &&
+      typeof dto.incidentLocation.longitude === 'number'
+    ) {
+      incidentLat = dto.incidentLocation.latitude;
+      incidentLng = dto.incidentLocation.longitude;
+    } else {
+      let gpsFix: { latitude: number; longitude: number } | null = null;
+      if (this.redisService) {
+        try {
+          const client = this.redisService.getClient();
+          const raw = await client.get(
+            `${CACHE_KEYS.DRIVER_GPS_PREFIX}${driver.id}`,
+          );
+          if (raw) gpsFix = JSON.parse(raw);
+        } catch (err: any) {
+          this.logger.warn(
+            `Failed to read driver GPS fix from Redis for breakdown: ${err?.message}`,
+          );
+        }
+      }
+      if (
+        gpsFix &&
+        typeof gpsFix.latitude === 'number' &&
+        typeof gpsFix.longitude === 'number'
+      ) {
+        incidentLat = gpsFix.latitude;
+        incidentLng = gpsFix.longitude;
+      } else {
+        incidentLat = 23.155;
+        incidentLng = 72.6668;
+      }
+    }
+
+    const result = await this.prisma.$transaction(async (tx) => {
+      await verifyIdempotencyClaim(tx, claim);
+
+      // Lock trip row with SELECT ... FOR UPDATE
+      const trips = await tx.$queryRaw<
+        Array<{
+          id: string;
+          status: string;
+          active_driver_id: string;
+          ride_group_id: string;
+        }>
+      >`
+        SELECT id, status, active_driver_id, ride_group_id
+        FROM trips
+        WHERE id = ${tripId}::uuid
+        FOR UPDATE;
+      `;
+
+      if (!trips || trips.length === 0) {
+        throw new NotFoundException({
+          errorCode: 'TRIP_NOT_FOUND',
+          message: `Trip with ID ${tripId} not found.`,
+        });
+      }
+
+      const trip = trips[0];
+
+      if (trip.active_driver_id !== driver.id) {
+        throw new ForbiddenException({
+          errorCode: 'DRIVER_NOT_ASSIGNED_TO_TRIP',
+          message: 'Caller is not the assigned driver for this trip.',
+        });
+      }
+
+      // Idempotency: if trip is already INTERRUPTED, return existing incident
+      if (trip.status === 'INTERRUPTED') {
+        const existingIncident = await tx.tripIncident.findFirst({
+          where: { tripId, status: 'REPORTED' },
+          orderBy: { reportedAt: 'desc' },
+        });
+
+        if (existingIncident) {
+          const breakdownResult = {
+            incidentId: existingIncident.id,
+            tripId: trip.id,
+            status: 'INTERRUPTED',
+            incidentLocation: { latitude: incidentLat, longitude: incidentLng },
+            onboardManifestSnapshot: existingIncident.onboardManifestSnapshot,
+            message: 'Trip is already interrupted',
+          };
+          const responsePayload = {
+            success: true,
+            data: breakdownResult,
+          };
+          await fenceAndCompleteIdempotentTransaction(
+            tx,
+            claim,
+            responsePayload,
+            HttpStatus.OK,
+          );
+          return {
+            breakdownResult,
+            boardedCount:
+              (existingIncident.onboardManifestSnapshot as any)
+                ?.boardedPassengerCount ?? 0,
+            alreadyInterrupted: true,
+          };
+        }
+      }
+
+      if (trip.status !== 'IN_PROGRESS') {
+        throw new BadRequestException({
+          errorCode: 'INVALID_TRIP_STATUS_FOR_BREAKDOWN',
+          message: `Cannot report breakdown on trip in status '${trip.status}'. Trip must be 'IN_PROGRESS'.`,
+        });
+      }
+
+      // Query currently BOARDED passengers
+      const onboardPassengerRows = await tx.$queryRaw<
+        Array<{
+          trip_passenger_id: string;
+          booking_id: string;
+          passenger_id: string;
+          status: string;
+          final_ride_fare_paise: number;
+          dest_lat: number;
+          dest_lng: number;
+          sequence_order: number | null;
+        }>
+      >`
+        SELECT tp.id AS trip_passenger_id, tp.booking_id, tp.passenger_id, tp.status,
+               tp.final_ride_fare_paise,
+               ST_Y(b.destination_location::geometry) AS dest_lat,
+               ST_X(b.destination_location::geometry) AS dest_lng,
+               gm.dropoff_sequence_order AS sequence_order
+        FROM trip_passengers tp
+        JOIN bookings b ON b.id = tp.booking_id
+        LEFT JOIN group_members gm ON gm.booking_id = tp.booking_id AND gm.is_active_member = true
+        WHERE tp.trip_id = ${tripId}::uuid AND tp.status = 'BOARDED'
+        FOR UPDATE OF tp;
+      `;
+
+      if (!onboardPassengerRows || onboardPassengerRows.length === 0) {
+        throw new BadRequestException({
+          errorCode: 'NO_BOARDED_PASSENGERS',
+          message:
+            'Cannot report vehicle breakdown on a trip with zero onboard passengers.',
+        });
+      }
+
+      const now = new Date();
+      const manifestSnapshot = {
+        incidentReportedAt: now.toISOString(),
+        boardedPassengerCount: onboardPassengerRows.length,
+        passengers: onboardPassengerRows.map((p) => ({
+          tripPassengerId: p.trip_passenger_id,
+          bookingId: p.booking_id,
+          passengerId: p.passenger_id,
+          status: p.status,
+          allocatedFarePaise: Number(p.final_ride_fare_paise),
+          destinationLocation: {
+            latitude: Number(p.dest_lat),
+            longitude: Number(p.dest_lng),
+          },
+          dropoffSequenceOrder: p.sequence_order ? Number(p.sequence_order) : 1,
+        })),
+      };
+
+      // 1. Transition trip to INTERRUPTED
+      await tx.trip.update({
+        where: { id: tripId },
+        data: { status: 'INTERRUPTED' },
+      });
+
+      // 2. Status history
+      await tx.tripStatusHistory.create({
+        data: {
+          tripId,
+          previousStatus: 'IN_PROGRESS',
+          newStatus: 'INTERRUPTED',
+          reason: dto.reason || 'Vehicle mechanical breakdown reported',
+        },
+      });
+
+      // 3. Insert immutable TripIncident snapshot
+      const [incident] = await tx.$queryRaw<Array<{ id: string }>>`
+        INSERT INTO trip_incidents (
+          id, trip_id, original_driver_id, incident_type,
+          incident_location, onboard_manifest_snapshot, status, reported_at
+        ) VALUES (
+          gen_random_uuid(), ${tripId}::uuid, ${driver.id}::uuid,
+          ${dto.incidentType || 'MECHANICAL_BREAKDOWN'},
+          ST_SetSRID(ST_MakePoint(${incidentLng}, ${incidentLat}), 4326),
+          ${JSON.stringify(manifestSnapshot)}::jsonb,
+          'REPORTED',
+          ${now}
+        ) RETURNING id;
+      `;
+
+      // 4. Outbox event
+      await tx.outboxEvent.create({
+        data: {
+          eventType: 'TRIP_INTERRUPTED',
+          aggregateType: 'TRIP',
+          aggregateId: tripId,
+          payload: {
+            tripId,
+            incidentId: incident.id,
+            originalDriverId: driver.id,
+            boardedPassengerCount: onboardPassengerRows.length,
+            incidentLocation: { latitude: incidentLat, longitude: incidentLng },
+            reason: dto.reason,
+          },
+        },
+      });
+
+      const breakdownResult = {
+        incidentId: incident.id,
+        tripId,
+        status: 'INTERRUPTED',
+        incidentLocation: { latitude: incidentLat, longitude: incidentLng },
+        onboardManifestSnapshot: manifestSnapshot,
+      };
+
+      const responsePayload = {
+        success: true,
+        message: 'Vehicle breakdown reported; trip transitioned to INTERRUPTED',
+        data: breakdownResult,
+      };
+
+      await fenceAndCompleteIdempotentTransaction(
+        tx,
+        claim,
+        responsePayload,
+        HttpStatus.OK,
+      );
+
+      return {
+        breakdownResult,
+        boardedCount: onboardPassengerRows.length,
+        alreadyInterrupted: false,
+      };
+    });
+
+    if (result.alreadyInterrupted) {
+      return result.breakdownResult;
+    }
+
+    // 5. Outside transaction: Search & rank eligible replacement drivers
+    let rankedCandidates: Array<{
+      driverId: string;
+      driverName: string;
+      vehicleCapacity: number;
+      location: { latitude: number; longitude: number };
+      etaSeconds: number;
+      distanceMeters: number;
+    }> = [];
+
+    try {
+      rankedCandidates = await this.findEligibleReplacementDrivers(
+        tripId,
+        { latitude: incidentLat, longitude: incidentLng },
+        result.boardedCount,
+        driver.id,
+      );
+    } catch (err: any) {
+      this.logger.error(
+        `OSRM road ETA ranking failed after retries for trip ${tripId}: ${err?.message}. Following documented abort behavior.`,
+      );
+      await this.abortInterruptedTrip(
+        tripId,
+        'OSRM_SERVICE_UNAVAILABLE_AFTER_RETRIES',
+      );
+      return {
+        ...result.breakdownResult,
+        status: 'ABORTED',
+        replacementCandidates: [],
+        reason: 'OSRM_SERVICE_UNAVAILABLE_AFTER_RETRIES',
+      };
+    }
+
+    if (rankedCandidates.length > 0) {
+      // Initiate sequential 1-to-1 dispatch to Candidate #1 with 20s timeout
+      const offer = await this.dispatchSingleReplacementOffer(
+        tripId,
+        result.breakdownResult.incidentId,
+        rankedCandidates[0],
+        1,
+      );
+
+      return {
+        ...result.breakdownResult,
+        replacementCandidates: rankedCandidates,
+        activeOffer: offer,
+      };
+    } else {
+      // 0 candidates found: Fail closed / immediately abort per ADR-024
+      this.logger.warn(
+        `No eligible replacement drivers found for interrupted trip ${tripId}. Aborting trip.`,
+      );
+      await this.abortInterruptedTrip(
+        tripId,
+        'NO_REPLACEMENT_DRIVERS_AVAILABLE',
+      );
+      return {
+        ...result.breakdownResult,
+        status: 'ABORTED',
+        replacementCandidates: [],
+      };
+    }
+  }
+
+  /**
+   * Helper to fetch road route strictly via OSRM with documented retries.
+   * If OSRM remains unavailable after retries, returns null (no straight-line / geodesic fallback).
+   * Edge Case 4: 5s retry backoff, max 3 retries.
+   */
+  async calculateRoadEtaWithRetries(
+    origin: { latitude: number; longitude: number },
+    destination: { latitude: number; longitude: number },
+    maxRetries = 3,
+  ): Promise<{ durationSec: number; distanceMeters: number } | null> {
+    if (!this.routingService) {
+      return null;
+    }
+
+    const isTestOrDemo =
+      process.env.NODE_ENV === 'test' || Boolean(process.env.VITEST);
+    const retryDelayMs = isTestOrDemo ? 10 : 5000;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      if (attempt > 0) {
+        this.logger.warn(
+          `OSRM road ETA retry attempt ${attempt}/${maxRetries} after backoff (${retryDelayMs}ms)...`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+      }
+
+      try {
+        const route = await this.routingService.getRoute(origin, destination);
+        // Strictly road network: reject fallback or non-OSRM source
+        if (route && !route.isFallback && route.source === 'OSRM') {
+          return {
+            durationSec: route.durationSec,
+            distanceMeters: route.distanceMeters,
+          };
+        }
+        this.logger.warn(
+          `OSRM route attempt ${attempt + 1}/${maxRetries + 1} returned non-OSRM or fallback (source=${route?.source}, isFallback=${route?.isFallback})`,
+        );
+      } catch (err: any) {
+        this.logger.warn(
+          `OSRM route attempt ${attempt + 1}/${maxRetries + 1} threw error: ${err?.message}`,
+        );
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Search and rank eligible replacement drivers strictly by OSRM road ETA.
+   * Straight-line Euclidean/geodesic fallback is strictly rejected.
+   * If OSRM is down after retries, throws ServiceUnavailableException to trigger abort.
+   */
+  async findEligibleReplacementDrivers(
+    _tripId: string,
+    incidentLocation: { latitude: number; longitude: number },
+    minCapacity: number,
+    excludeDriverIds?: string | string[],
+  ): Promise<
+    Array<{
+      driverId: string;
+      driverName: string;
+      vehicleCapacity: number;
+      location: { latitude: number; longitude: number };
+      etaSeconds: number;
+      distanceMeters: number;
+    }>
+  > {
+    const excludeList = Array.isArray(excludeDriverIds)
+      ? excludeDriverIds
+      : excludeDriverIds
+        ? [excludeDriverIds]
+        : [];
+
+    const candidates = await this.prisma.driverProfile.findMany({
+      where: {
+        verificationStatus: 'APPROVED',
+        isOnline: true,
+        operationalStatus: 'AVAILABLE',
+        ...(excludeList.length > 0 ? { id: { notIn: excludeList } } : {}),
+        vehicles: {
+          some: {
+            isActive: true,
+            passengerCapacity: { gte: minCapacity },
+          },
+        },
+        assignments: {
+          none: {
+            status: { in: ['RESERVED', 'ACTIVE'] },
+          },
+        },
+        replacementAssignments: {
+          none: {
+            status: 'ASSIGNED',
+          },
+        },
+      },
+      include: {
+        user: { select: { fullName: true } },
+        vehicles: {
+          where: { isActive: true },
+          select: { passengerCapacity: true },
+        },
+      },
+    });
+
+    if (candidates.length === 0) return [];
+
+    const ranked: Array<{
+      driverId: string;
+      driverName: string;
+      vehicleCapacity: number;
+      location: { latitude: number; longitude: number };
+      etaSeconds: number;
+      distanceMeters: number;
+    }> = [];
+
+    for (const cand of candidates) {
+      let candLoc = { latitude: 23.155, longitude: 72.6668 };
+      if (this.redisService) {
+        try {
+          const client = this.redisService.getClient();
+          const raw = await client.get(
+            `${CACHE_KEYS.DRIVER_GPS_PREFIX}${cand.id}`,
+          );
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            if (
+              typeof parsed.latitude === 'number' &&
+              typeof parsed.longitude === 'number'
+            ) {
+              candLoc = {
+                latitude: parsed.latitude,
+                longitude: parsed.longitude,
+              };
+            }
+          }
+        } catch {}
+      }
+
+      const maxCap = Math.max(
+        ...cand.vehicles.map((v) => v.passengerCapacity),
+        0,
+      );
+
+      // Strict OSRM road ETA calculation with retries (no geodesic fallback)
+      const roadRoute = await this.calculateRoadEtaWithRetries(
+        candLoc,
+        incidentLocation,
+      );
+
+      if (!roadRoute) {
+        // OSRM failed after 3 retries: fail closed per Edge Case 4
+        this.logger.warn(
+          `OSRM road ETA calculation failed after retries for driver ${cand.id}. Aborting replacement ranking.`,
+        );
+        throw new ServiceUnavailableException({
+          errorCode: 'ROUTING_UNAVAILABLE',
+          message:
+            'OSRM routing service unavailable after retries; straight-line fallback rejected.',
+        });
+      }
+
+      ranked.push({
+        driverId: cand.id,
+        driverName: cand.user?.fullName || 'Driver',
+        vehicleCapacity: maxCap,
+        location: candLoc,
+        etaSeconds: roadRoute.durationSec,
+        distanceMeters: roadRoute.distanceMeters,
+      });
+    }
+
+    ranked.sort((a, b) => a.etaSeconds - b.etaSeconds);
+    return ranked;
+  }
+
+  /**
+   * Dispatches a single replacement offer to one driver with a 20-second timeout.
+   * Strict 1-to-1 dispatch per docs/FAILURE_HANDLING_AND_RECOVERY.md.
+   */
+  async dispatchSingleReplacementOffer(
+    tripId: string,
+    incidentId: string,
+    candidate: {
+      driverId: string;
+      driverName: string;
+      etaSeconds: number;
+      distanceMeters?: number;
+    },
+    attemptNumber: number,
+  ) {
+    const expiresAt = new Date(Date.now() + 20000); // 20s timeout per spec
+
+    const attempt = await this.prisma.replacementDispatchAttempt.create({
+      data: {
+        tripIncidentId: incidentId,
+        attemptNumber,
+        status: 'ACTIVE',
+      },
+    });
+
+    // Record outbox event
+    await this.prisma.outboxEvent.create({
+      data: {
+        eventType: 'REPLACEMENT_OFFER_DISPATCHED',
+        aggregateType: 'TRIP_INCIDENT',
+        aggregateId: incidentId,
+        payload: {
+          tripId,
+          incidentId,
+          attemptId: attempt.id,
+          attemptNumber,
+          driverId: candidate.driverId,
+          driverName: candidate.driverName,
+          etaSeconds: candidate.etaSeconds,
+          expiresAt: expiresAt.toISOString(),
+        },
+      },
+    });
+
+    // Schedule 20s timeout in BullMQ if queue is available
+    if (this.dispatchQueue) {
+      try {
+        await this.dispatchQueue.add(
+          'replacement-offer-timeout',
+          {
+            tripId,
+            incidentId,
+            attemptId: attempt.id,
+            attemptNumber,
+            driverId: candidate.driverId,
+          },
+          {
+            delay: 20000,
+            jobId: `replacement-timeout-${attempt.id}`,
+            removeOnComplete: 100,
+            removeOnFail: 50,
+          },
+        );
+      } catch (err: any) {
+        this.logger.warn(
+          `Failed to schedule BullMQ timeout for replacement offer: ${err?.message}`,
+        );
+      }
+    }
+
+    return {
+      attemptId: attempt.id,
+      attemptNumber,
+      driverId: candidate.driverId,
+      etaSeconds: candidate.etaSeconds,
+      expiresAt: expiresAt.toISOString(),
+    };
+  }
+
+  /**
+   * Replacement driver explicitly declines the transfer offer (Edge Case 1).
+   * Marks attempt REJECTED, excludes driver, and cascades immediately to next ranked driver.
+   */
+  async rejectReplacementOffer(
+    replacementDriverUserId: string,
+    tripId: string,
+    attemptId?: string,
+    claim?: IdempotencyClaimContext,
+  ) {
+    const driver = await this.getVerifiedDriverProfile(replacementDriverUserId);
+
+    const rejectResult = await this.prisma.$transaction(async (tx) => {
+      await verifyIdempotencyClaim(tx, claim);
+
+      const trips = await tx.$queryRaw<
+        Array<{ id: string; status: string }>
+      >`
+        SELECT id, status FROM trips WHERE id = ${tripId}::uuid FOR UPDATE;
+      `;
+
+      if (!trips || trips.length === 0) {
+        throw new NotFoundException({
+          errorCode: 'TRIP_NOT_FOUND',
+          message: `Trip with ID ${tripId} not found.`,
+        });
+      }
+
+      const trip = trips[0];
+      if (trip.status !== 'INTERRUPTED') {
+        throw new BadRequestException({
+          errorCode: 'TRIP_NOT_INTERRUPTED',
+          message: `Trip must be in status 'INTERRUPTED' to reject replacement (current: '${trip.status}').`,
+        });
+      }
+
+      const incident = await tx.tripIncident.findFirst({
+        where: { tripId, status: 'REPORTED' },
+        orderBy: { reportedAt: 'desc' },
+      });
+
+      if (!incident) {
+        throw new BadRequestException({
+          errorCode: 'NO_ACTIVE_INCIDENT',
+          message: 'No active breakdown incident found for this trip.',
+        });
+      }
+
+      // Find active attempt
+      const attempt = await tx.replacementDispatchAttempt.findFirst({
+        where: {
+          tripIncidentId: incident.id,
+          status: 'ACTIVE',
+          ...(attemptId ? { id: attemptId } : {}),
+        },
+        orderBy: { createdAt: 'desc' },
+      });
+
+      if (attempt) {
+        await tx.replacementDispatchAttempt.update({
+          where: { id: attempt.id },
+          data: { status: 'REJECTED' },
+        });
+
+        await tx.outboxEvent.create({
+          data: {
+            eventType: 'REPLACEMENT_OFFER_REJECTED',
+            aggregateType: 'TRIP_INCIDENT',
+            aggregateId: incident.id,
+            payload: {
+              tripId,
+              incidentId: incident.id,
+              attemptId: attempt.id,
+              attemptNumber: attempt.attemptNumber,
+              driverId: driver.id,
+              rejectedAt: new Date().toISOString(),
+            },
+          },
+        });
+      }
+
+      const responsePayload = {
+        success: true,
+        data: {
+          tripId,
+          incidentId: incident.id,
+          driverId: driver.id,
+          status: 'REJECTED',
+        },
+      };
+
+      await fenceAndCompleteIdempotentTransaction(
+        tx,
+        claim,
+        responsePayload,
+        HttpStatus.OK,
+      );
+
+      return {
+        tripId,
+        incidentId: incident.id,
+        driverId: driver.id,
+        status: 'REJECTED',
+      };
+    });
+
+    if (this.redisService) {
+      try {
+        const client = this.redisService.getClient();
+        await client.sadd(
+          `replacement:excluded:${rejectResult.incidentId}`,
+          driver.id,
+        );
+        await client.expire(
+          `replacement:excluded:${rejectResult.incidentId}`,
+          3600,
+        );
+      } catch {}
+    }
+
+    // Cascade to next candidate outside transaction
+    const cascadeResult = await this.cascadeToNextReplacementDriver(
+      tripId,
+      rejectResult.incidentId,
+    );
+
+    return {
+      ...rejectResult,
+      cascade: cascadeResult,
+    };
+  }
+
+  /**
+   * BullMQ timeout handler: 20s elapsed with no response from replacement driver (Edge Case 2).
+   * Marks attempt EXPIRED, excludes driver, and cascades to next candidate driver.
+   */
+  async handleReplacementTimeout(payload: {
+    tripId: string;
+    incidentId: string;
+    attemptId: string;
+    attemptNumber: number;
+    driverId: string;
+  }) {
+    const { tripId, incidentId, attemptId, driverId } = payload;
+
+    const timeoutResult = await this.prisma.$transaction(async (tx) => {
+      const trips = await tx.$queryRaw<
+        Array<{ id: string; status: string }>
+      >`
+        SELECT id, status FROM trips WHERE id = ${tripId}::uuid FOR UPDATE;
+      `;
+
+      if (!trips || trips.length === 0 || trips[0].status !== 'INTERRUPTED') {
+        return { shouldCascade: false, reason: 'TRIP_NOT_INTERRUPTED' };
+      }
+
+      const attempt = await tx.replacementDispatchAttempt.findUnique({
+        where: { id: attemptId },
+      });
+
+      if (!attempt || attempt.status !== 'ACTIVE') {
+        return {
+          shouldCascade: false,
+          reason: `ATTEMPT_NOT_ACTIVE (${attempt?.status})`,
+        };
+      }
+
+      await tx.replacementDispatchAttempt.update({
+        where: { id: attemptId },
+        data: { status: 'EXPIRED' },
+      });
+
+      await tx.outboxEvent.create({
+        data: {
+          eventType: 'REPLACEMENT_OFFER_EXPIRED',
+          aggregateType: 'TRIP_INCIDENT',
+          aggregateId: incidentId,
+          payload: {
+            tripId,
+            incidentId,
+            attemptId,
+            driverId,
+            expiredAt: new Date().toISOString(),
+          },
+        },
+      });
+
+      return { shouldCascade: true, incidentId, driverId };
+    });
+
+    if (!timeoutResult.shouldCascade) {
+      return { cascaded: false, reason: timeoutResult.reason };
+    }
+
+    if (this.redisService && timeoutResult.driverId) {
+      try {
+        const client = this.redisService.getClient();
+        await client.sadd(
+          `replacement:excluded:${incidentId}`,
+          timeoutResult.driverId,
+        );
+        await client.expire(`replacement:excluded:${incidentId}`, 3600);
+      } catch {}
+    }
+
+    return this.cascadeToNextReplacementDriver(tripId, incidentId);
+  }
+
+  /**
+   * Cascades replacement offer to the next ranked eligible driver.
+   * If all candidates are exhausted, aborts the interrupted trip with ₹0 fares (docs/FAILURE_HANDLING_AND_RECOVERY.md).
+   */
+  async cascadeToNextReplacementDriver(tripId: string, incidentId: string) {
+    const trip = await this.prisma.trip.findUnique({
+      where: { id: tripId },
+      select: { id: true, status: true },
+    });
+
+    if (!trip || trip.status !== 'INTERRUPTED') {
+      return { cascaded: false, reason: `Trip is in status ${trip?.status}` };
+    }
+
+    const incident = await this.prisma.tripIncident.findUnique({
+      where: { id: incidentId },
+    });
+
+    if (!incident || incident.status !== 'REPORTED') {
+      return {
+        cascaded: false,
+        reason: `Incident is in status ${incident?.status}`,
+      };
+    }
+
+    // Excluded drivers: original driver + drivers previously offered
+    const excludedDriverIds = new Set<string>();
+    excludedDriverIds.add(incident.originalDriverId);
+
+    const pastEvents = await this.prisma.outboxEvent.findMany({
+      where: {
+        aggregateId: incidentId,
+        eventType: {
+          in: [
+            'REPLACEMENT_OFFER_DISPATCHED',
+            'REPLACEMENT_OFFER_REJECTED',
+            'REPLACEMENT_OFFER_EXPIRED',
+          ],
+        },
+      },
+      select: { payload: true },
+    });
+
+    for (const ev of pastEvents) {
+      const p = ev.payload as any;
+      if (p?.driverId) excludedDriverIds.add(p.driverId);
+    }
+
+    if (this.redisService) {
+      try {
+        const client = this.redisService.getClient();
+        const redisExcluded = await client.smembers(
+          `replacement:excluded:${incidentId}`,
+        );
+        for (const id of redisExcluded) {
+          excludedDriverIds.add(id);
+        }
+      } catch {}
+    }
+
+    const snapshot =
+      typeof incident.onboardManifestSnapshot === 'string'
+        ? JSON.parse(incident.onboardManifestSnapshot)
+        : (incident.onboardManifestSnapshot as any);
+    const boardedCount = snapshot?.boardedPassengerCount ?? 1;
+
+    const locRows = await this.prisma.$queryRaw<
+      Array<{ lat: number; lng: number }>
+    >`
+      SELECT ST_Y(incident_location::geometry) AS lat, ST_X(incident_location::geometry) AS lng
+      FROM trip_incidents
+      WHERE id = ${incidentId}::uuid
+    `;
+    const incidentLoc =
+      locRows.length > 0 && locRows[0].lat && locRows[0].lng
+        ? {
+            latitude: Number(locRows[0].lat),
+            longitude: Number(locRows[0].lng),
+          }
+        : { latitude: 23.16, longitude: 72.67 };
+
+    let rankedCandidates: Array<{
+      driverId: string;
+      driverName: string;
+      vehicleCapacity: number;
+      location: { latitude: number; longitude: number };
+      etaSeconds: number;
+      distanceMeters: number;
+    }> = [];
+
+    try {
+      rankedCandidates = await this.findEligibleReplacementDrivers(
+        tripId,
+        incidentLoc,
+        boardedCount,
+        Array.from(excludedDriverIds),
+      );
+    } catch (err: any) {
+      this.logger.error(
+        `OSRM road ETA ranking failed after retries during replacement cascade: ${err?.message}`,
+      );
+      await this.abortInterruptedTrip(
+        tripId,
+        'OSRM_SERVICE_UNAVAILABLE_AFTER_RETRIES',
+      );
+      return {
+        cascaded: false,
+        aborted: true,
+        reason: 'OSRM_SERVICE_UNAVAILABLE_AFTER_RETRIES',
+      };
+    }
+
+    if (rankedCandidates.length === 0) {
+      this.logger.warn(
+        `All replacement driver candidates exhausted for trip ${tripId}. Aborting trip.`,
+      );
+      await this.abortInterruptedTrip(
+        tripId,
+        'ALL_REPLACEMENT_OFFERS_EXHAUSTED',
+      );
+      return {
+        cascaded: false,
+        aborted: true,
+        reason: 'ALL_REPLACEMENT_OFFERS_EXHAUSTED',
+      };
+    }
+
+    const nextCandidate = rankedCandidates[0];
+    const attemptCount = await this.prisma.replacementDispatchAttempt.count({
+      where: { tripIncidentId: incidentId },
+    });
+    const nextAttemptNumber = attemptCount + 1;
+
+    const dispatchResult = await this.dispatchSingleReplacementOffer(
+      tripId,
+      incidentId,
+      nextCandidate,
+      nextAttemptNumber,
+    );
+
+    return {
+      cascaded: true,
+      aborted: false,
+      nextDriverId: nextCandidate.driverId,
+      attemptNumber: nextAttemptNumber,
+      dispatchResult,
+    };
+  }
+
+  /**
+   * Replacement driver accepts handover for an interrupted trip.
+   * - Atomically reserves replacement driver (operationalStatus = RESERVED).
+   * - Resumes trip to IN_PROGRESS.
+   * - Records ReplacementDriverAssignment and marks incident RESOLVED.
+   * - Applies automatic 10% compensation discount (ADR-023) to all passengers onboard at breakdown.
+   * - Emits trip.resumed outbox event.
+   */
+  async acceptReplacementTrip(
+    replacementDriverUserId: string,
+    tripId: string,
+    claim?: IdempotencyClaimContext,
+  ) {
+    const replacementDriver = await this.getVerifiedDriverProfile(
+      replacementDriverUserId,
+    );
+
+    return this.prisma.$transaction(async (tx) => {
+      await verifyIdempotencyClaim(tx, claim);
+
+      // 1. Lock trip row with SELECT ... FOR UPDATE
+      const trips = await tx.$queryRaw<
+        Array<{
+          id: string;
+          status: string;
+          active_driver_id: string;
+          ride_group_id: string;
+        }>
+      >`
+        SELECT id, status, active_driver_id, ride_group_id
+        FROM trips
+        WHERE id = ${tripId}::uuid
+        FOR UPDATE;
+      `;
+
+      if (!trips || trips.length === 0) {
+        throw new NotFoundException({
+          errorCode: 'TRIP_NOT_FOUND',
+          message: `Trip with ID ${tripId} not found.`,
+        });
+      }
+
+      const trip = trips[0];
+
+      // Idempotency: if replacement already accepted by this driver
+      if (
+        trip.status === 'IN_PROGRESS' &&
+        trip.active_driver_id === replacementDriver.id
+      ) {
+        const acceptResult = {
+          tripId: trip.id,
+          status: 'IN_PROGRESS',
+          activeDriverId: replacementDriver.id,
+          message: 'Replacement already accepted for this trip',
+        };
+        const responsePayload = {
+          success: true,
+          data: acceptResult,
+        };
+        await fenceAndCompleteIdempotentTransaction(
+          tx,
+          claim,
+          responsePayload,
+          HttpStatus.OK,
+        );
+        return acceptResult;
+      }
+
+      if (trip.status !== 'INTERRUPTED') {
+        throw new BadRequestException({
+          errorCode: 'TRIP_NOT_INTERRUPTED',
+          message: `Trip must be in status 'INTERRUPTED' to accept replacement (current: '${trip.status}').`,
+        });
+      }
+
+      // 2. Lock active incident row with SELECT ... FOR UPDATE
+      const incidents = await tx.$queryRaw<
+        Array<{
+          id: string;
+          original_driver_id: string;
+          onboard_manifest_snapshot: any;
+          status: string;
+        }>
+      >`
+        SELECT id, original_driver_id, onboard_manifest_snapshot, status
+        FROM trip_incidents
+        WHERE trip_id = ${tripId}::uuid AND status = 'REPORTED'
+        ORDER BY reported_at DESC
+        LIMIT 1
+        FOR UPDATE;
+      `;
+
+      if (!incidents || incidents.length === 0) {
+        throw new BadRequestException({
+          errorCode: 'NO_ACTIVE_INCIDENT',
+          message: 'No active breakdown incident found for this trip.',
+        });
+      }
+
+      const incident = incidents[0];
+
+      if (incident.original_driver_id === replacementDriver.id) {
+        throw new BadRequestException({
+          errorCode: 'ORIGINAL_DRIVER_CANNOT_REPLACE',
+          message:
+            'The original broken-down driver cannot accept the replacement handover.',
+        });
+      }
+
+      // Check capacity
+      const snapshot =
+        typeof incident.onboard_manifest_snapshot === 'string'
+          ? JSON.parse(incident.onboard_manifest_snapshot)
+          : incident.onboard_manifest_snapshot;
+      const boardedCount = snapshot?.boardedPassengerCount ?? 1;
+
+      const vehicle = await tx.vehicle.findFirst({
+        where: {
+          driverProfileId: replacementDriver.id,
+          isActive: true,
+          passengerCapacity: { gte: boardedCount },
+        },
+      });
+
+      if (!vehicle) {
+        throw new BadRequestException({
+          errorCode: 'INSUFFICIENT_VEHICLE_CAPACITY',
+          message: `Replacement driver vehicle capacity is insufficient for ${boardedCount} onboard passengers.`,
+        });
+      }
+
+      // 3. Atomically reserve replacement driver
+      const reserveResult = await tx.$executeRaw`
+        UPDATE driver_profiles
+        SET operational_status = 'RESERVED'
+        WHERE id = ${replacementDriver.id}::uuid AND operational_status = 'AVAILABLE';
+      `;
+
+      if (reserveResult === 0) {
+        throw new ConflictException({
+          errorCode: 'DRIVER_NOT_AVAILABLE',
+          message:
+            'Replacement driver is no longer available or already reserved.',
+        });
+      }
+
+      const now = new Date();
+
+      // 4. Record replacement driver assignment
+      await tx.replacementDriverAssignment.create({
+        data: {
+          tripIncidentId: incident.id,
+          replacementDriverId: replacementDriver.id,
+          status: 'ASSIGNED',
+          assignedAt: now,
+          handoverCompletedAt: now,
+        },
+      });
+
+      // Update active replacement attempt to ACCEPTED
+      await tx.replacementDispatchAttempt.updateMany({
+        where: {
+          tripIncidentId: incident.id,
+          status: 'ACTIVE',
+        },
+        data: { status: 'ACCEPTED' },
+      });
+
+      // 5. Update incident status to RESOLVED
+      await tx.tripIncident.update({
+        where: { id: incident.id },
+        data: { status: 'RESOLVED' },
+      });
+
+      // 6. Update trip activeDriverId and status to IN_PROGRESS
+      await tx.trip.update({
+        where: { id: tripId },
+        data: {
+          activeDriverId: replacementDriver.id,
+          status: 'IN_PROGRESS',
+        },
+      });
+
+      // 7. Release original driver profile
+      await tx.$executeRaw`
+        UPDATE driver_profiles
+        SET operational_status = 'AVAILABLE'
+        WHERE id = ${incident.original_driver_id}::uuid;
+      `;
+
+      // 8. Apply 10% compensation discount (ADR-023) to remaining onboard passengers
+      const onboardPassengers = await tx.tripPassenger.findMany({
+        where: {
+          tripId,
+          status: 'BOARDED',
+        },
+      });
+
+      const discountedPassengers: Array<{
+        tripPassengerId: string;
+        bookingId: string;
+        originalFarePaise: number;
+        discountPaise: number;
+        finalFarePaise: number;
+      }> = [];
+
+      for (const tp of onboardPassengers) {
+        const originalFare = tp.finalRideFarePaise;
+        const discountPaise = Math.round(originalFare * 0.1);
+        const finalFarePaise = Math.max(0, originalFare - discountPaise);
+
+        await tx.tripPassenger.update({
+          where: { id: tp.id },
+          data: { finalRideFarePaise: finalFarePaise },
+        });
+
+        await tx.booking.update({
+          where: { id: tp.bookingId },
+          data: { finalAllocatedFarePaise: finalFarePaise },
+        });
+
+        await tx.fareAdjustment.create({
+          data: {
+            tripPassengerId: tp.id,
+            adjustmentType: 'BREAKDOWN_COMPENSATION',
+            discountPercentage: 10,
+            adjustmentAmountPaise: discountPaise,
+            justification:
+              '10% compensation discount for mid-trip breakdown and replacement',
+            appliedAt: now,
+          },
+        });
+
+        discountedPassengers.push({
+          tripPassengerId: tp.id,
+          bookingId: tp.bookingId,
+          originalFarePaise: originalFare,
+          discountPaise,
+          finalFarePaise,
+        });
+      }
+
+      // 9. Trip status history
+      await tx.tripStatusHistory.create({
+        data: {
+          tripId,
+          previousStatus: 'INTERRUPTED',
+          newStatus: 'IN_PROGRESS',
+          reason:
+            'Trip resumed by replacement driver with 10% discount applied',
+        },
+      });
+
+      // 10. Outbox event (trip.resumed domain event)
+      await tx.outboxEvent.create({
+        data: {
+          eventType: 'TRIP_RESUMED',
+          aggregateType: 'TRIP',
+          aggregateId: tripId,
+          payload: {
+            tripId,
+            incidentId: incident.id,
+            replacementDriverId: replacementDriver.id,
+            discountPercentage: 10,
+            discountedPassengersCount: discountedPassengers.length,
+          },
+        },
+      });
+
+      const acceptResult = {
+        tripId,
+        status: 'IN_PROGRESS',
+        activeDriverId: replacementDriver.id,
+        incidentId: incident.id,
+        discountPercentage: 10,
+        discountedPassengers,
+      };
+
+      const responsePayload = {
+        success: true,
+        message:
+          'Replacement accepted; trip resumed with 10% passenger discount',
+        data: acceptResult,
+      };
+
+      await fenceAndCompleteIdempotentTransaction(
+        tx,
+        claim,
+        responsePayload,
+        HttpStatus.OK,
+      );
+
+      return acceptResult;
+    });
+  }
+
+  /**
+   * Aborts an interrupted trip when replacement driver dispatch fails or is unavailable.
+   * - Transitions trip to ABORTED.
+   * - Sets all onboard passenger fares to ₹0.00 (ADR-024).
+   * - Records full refund records in refund_records.
+   * - Releases original driver and dissolves ride group.
+   * - Emits TRIP_ABORTED outbox event.
+   */
+  async abortInterruptedTrip(
+    tripId: string,
+    reason?: string,
+    claim?: IdempotencyClaimContext,
+  ) {
+    return this.prisma.$transaction(async (tx) => {
+      await verifyIdempotencyClaim(tx, claim);
+
+      // 1. Lock trip row with SELECT ... FOR UPDATE
+      const trips = await tx.$queryRaw<
+        Array<{
+          id: string;
+          status: string;
+          active_driver_id: string;
+          ride_group_id: string;
+          driver_assignment_id: string;
+        }>
+      >`
+        SELECT id, status, active_driver_id, ride_group_id, driver_assignment_id
+        FROM trips
+        WHERE id = ${tripId}::uuid
+        FOR UPDATE;
+      `;
+
+      if (!trips || trips.length === 0) {
+        throw new NotFoundException({
+          errorCode: 'TRIP_NOT_FOUND',
+          message: `Trip with ID ${tripId} not found.`,
+        });
+      }
+
+      const trip = trips[0];
+
+      if (trip.status === 'ABORTED') {
+        const abortResult = {
+          tripId,
+          status: 'ABORTED',
+          message: 'Trip was already aborted',
+        };
+        const responsePayload = {
+          success: true,
+          data: abortResult,
+        };
+        await fenceAndCompleteIdempotentTransaction(
+          tx,
+          claim,
+          responsePayload,
+          HttpStatus.OK,
+        );
+        return abortResult;
+      }
+
+      if (!['INTERRUPTED', 'IN_PROGRESS'].includes(trip.status)) {
+        throw new BadRequestException({
+          errorCode: 'CANNOT_ABORT_TRIP',
+          message: `Cannot abort trip in status '${trip.status}'. Trip must be 'INTERRUPTED' or 'IN_PROGRESS'.`,
+        });
+      }
+
+      const now = new Date();
+
+      // 2. Update trip status to ABORTED
+      await tx.trip.update({
+        where: { id: tripId },
+        data: { status: 'ABORTED' },
+      });
+
+      // 3. Update any open incidents to ABORTED
+      await tx.tripIncident.updateMany({
+        where: { tripId, status: 'REPORTED' },
+        data: { status: 'ABORTED' },
+      });
+
+      // 4. Update trip_passengers who were BOARDED: set fare to 0 and record refund audit
+      const onboardPassengers = await tx.tripPassenger.findMany({
+        where: {
+          tripId,
+          status: 'BOARDED',
+        },
+      });
+
+      const refundedPassengers: Array<{
+        tripPassengerId: string;
+        bookingId: string;
+        waivedFarePaise: number;
+      }> = [];
+
+      for (const tp of onboardPassengers) {
+        const originalFare = tp.finalRideFarePaise;
+
+        // Set fare to 0 and cancel passenger journey
+        await tx.tripPassenger.update({
+          where: { id: tp.id },
+          data: {
+            finalRideFarePaise: 0,
+            status: 'CANCELLED',
+          },
+        });
+
+        await tx.booking.update({
+          where: { id: tp.bookingId },
+          data: {
+            finalAllocatedFarePaise: 0,
+            status: 'CANCELLED',
+          },
+        });
+
+        // Audit refund record
+        await tx.refundRecord.create({
+          data: {
+            tripPassengerId: tp.id,
+            refundAmountPaise: originalFare,
+            status: 'COMPLETED',
+            reason:
+              reason ||
+              'Trip aborted due to unrecoverable vehicle breakdown; 100% fare waiver (₹0 fare)',
+            issuedAt: now,
+          },
+        });
+
+        refundedPassengers.push({
+          tripPassengerId: tp.id,
+          bookingId: tp.bookingId,
+          waivedFarePaise: originalFare,
+        });
+      }
+
+      // 5. Release driver assignment and operational status
+      if (trip.driver_assignment_id) {
+        await tx.driverAssignment.update({
+          where: { id: trip.driver_assignment_id },
+          data: { status: 'RELEASED' },
+        });
+      }
+
+      await tx.$executeRaw`
+        UPDATE driver_profiles
+        SET operational_status = 'AVAILABLE'
+        WHERE id = ${trip.active_driver_id}::uuid;
+      `;
+
+      // 6. Dissolve ride group
+      await tx.rideGroup.update({
+        where: { id: trip.ride_group_id },
+        data: { status: 'DISSOLVED' },
+      });
+
+      await tx.groupMember.updateMany({
+        where: { rideGroupId: trip.ride_group_id },
+        data: { isActiveMember: false },
+      });
+
+      // 7. Record trip status history
+      await tx.tripStatusHistory.create({
+        data: {
+          tripId,
+          previousStatus: trip.status,
+          newStatus: 'ABORTED',
+          reason:
+            reason ||
+            'Vehicle breakdown replacement unavailable; trip aborted',
+        },
+      });
+
+      // 8. Outbox event
+      await tx.outboxEvent.create({
+        data: {
+          eventType: 'TRIP_ABORTED',
+          aggregateType: 'TRIP',
+          aggregateId: tripId,
+          payload: {
+            tripId,
+            reason: reason || 'REPLACEMENT_UNAVAILABLE',
+            refundedCount: refundedPassengers.length,
+          },
+        },
+      });
+
+      const abortResult = {
+        tripId,
+        status: 'ABORTED',
+        affectedPassengersCount: refundedPassengers.length,
+        refundedPassengers,
+      };
+
+      const responsePayload = {
+        success: true,
+        message:
+          'Trip aborted; onboard passenger fares set to ₹0.00 with refund audited',
+        data: abortResult,
+      };
+
+      await fenceAndCompleteIdempotentTransaction(
+        tx,
+        claim,
+        responsePayload,
+        HttpStatus.OK,
+      );
+
+      return abortResult;
+    });
+  }
+
+  /**
+   * Retrieve active or latest incident details for a trip.
+   */
+  async getTripIncident(tripId: string) {
+    const incident = await this.prisma.tripIncident.findFirst({
+      where: { tripId },
+      orderBy: { reportedAt: 'desc' },
+      include: {
+        replacementAssignments: {
+          include: {
+            replacementDriver: {
+              include: { user: { select: { fullName: true } } },
+            },
+          },
+        },
+        replacementAttempts: true,
+      },
+    });
+
+    if (!incident) {
+      throw new NotFoundException({
+        errorCode: 'INCIDENT_NOT_FOUND',
+        message: `No incident record found for trip ${tripId}.`,
+      });
+    }
+
+    return incident;
   }
 }

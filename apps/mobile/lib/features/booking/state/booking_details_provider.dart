@@ -244,6 +244,7 @@ class BookingDetailsProvider extends ChangeNotifier {
             'Server confirmed booking is still ${updated.status}. You may safely retry cancellation.';
       } else {
         _cancellationState = CancellationAttemptState.cancellationBlocked;
+        _pendingCancellationAttempt = null;
         _cancellationError =
             'Booking transitioned to ${updated.status}. Cancellation is no longer permitted.';
       }
@@ -526,6 +527,7 @@ class BookingDetailsProvider extends ChangeNotifier {
             'Cancellation was interrupted, but booking is still ${fresh.status}. You may retry cancellation.';
       } else {
         _cancellationState = CancellationAttemptState.cancellationBlocked;
+        _pendingCancellationAttempt = null;
         _cancellationError =
             'Booking transitioned to ${fresh.status} and can no longer be cancelled.';
       }

@@ -1205,5 +1205,115 @@ void main() {
       expect(provider.cancellationState, CancellationAttemptState.confirmedCancelled);
       expect(provider.pendingCancellationAttempt, isNull);
     });
+
+    test('Manual refresh reconciliation: non-cancellable status transitions to cancellationBlocked, clears pending snapshot, blocks retry, and allows loading booking B', () async {
+      repository.bookingDetailsToReturn = BookingDetails(
+        bookingId: 'book-manual-block',
+        status: 'CONFIRMED',
+        agreedFareCeiling: '45.00',
+        maxWaitDeadline: DateTime.now(),
+      );
+      await provider.loadBookingDetails('book-manual-block');
+
+      // Ambiguous cancellation failure + failed GET leaves pending attempt in reconciliationRequired
+      repository.errorToThrowOnCancel = const ApiException(
+        statusCode: null,
+        errorCode: 'NETWORK_UNAVAILABLE',
+        message: 'Offline',
+      );
+      repository.errorToThrowOnGetDetails = const ApiException(
+        statusCode: null,
+        errorCode: 'NETWORK_UNAVAILABLE',
+        message: 'Server unreachable',
+      );
+
+      final cancelRes = await provider.cancelBooking(reason: 'Manual recon test');
+      expect(cancelRes, isFalse);
+      expect(provider.cancellationState, CancellationAttemptState.reconciliationRequired);
+      expect(provider.pendingCancellationAttempt?.bookingId, 'book-manual-block');
+      expect(provider.hasPendingCancellation, isTrue);
+
+      // Refresh booking A with authoritative non-cancellable status (e.g. BOARDED)
+      repository.errorToThrowOnGetDetails = null;
+      repository.bookingDetailsToReturn = BookingDetails(
+        bookingId: 'book-manual-block',
+        status: 'BOARDED',
+        agreedFareCeiling: '45.00',
+        maxWaitDeadline: DateTime.now(),
+      );
+
+      await provider.refreshBookingDetails();
+
+      // State is cancellationBlocked and pending snapshot is cleared
+      expect(provider.cancellationState, CancellationAttemptState.cancellationBlocked);
+      expect(provider.pendingCancellationAttempt, isNull);
+      expect(provider.hasPendingCancellation, isFalse);
+      expect(provider.canRetry, isFalse);
+      expect(provider.canCancel, isFalse);
+      expect(provider.cancellationError, contains('BOARDED'));
+
+      // Now load booking B and verify it loads successfully without restriction
+      repository.bookingDetailsToReturn = BookingDetails(
+        bookingId: 'book-B-after-manual',
+        status: 'CONFIRMED',
+        agreedFareCeiling: '45.00',
+        maxWaitDeadline: DateTime.now(),
+      );
+
+      await provider.loadBookingDetails('book-B-after-manual');
+      expect(provider.error, isNull);
+      expect(provider.bookingDetails?.bookingId, 'book-B-after-manual');
+      expect(provider.cancellationState, CancellationAttemptState.idle);
+      expect(provider.hasPendingCancellation, isFalse);
+    });
+
+    test('Automatic reconciliation: non-cancellable status transitions to cancellationBlocked, clears pending snapshot, blocks retry, and allows loading booking B', () async {
+      repository.bookingDetailsToReturn = BookingDetails(
+        bookingId: 'book-auto-block',
+        status: 'CONFIRMED',
+        agreedFareCeiling: '45.00',
+        maxWaitDeadline: DateTime.now(),
+      );
+      await provider.loadBookingDetails('book-auto-block');
+
+      // Ambiguous cancellation failure triggers automatic reconciliation GET
+      repository.errorToThrowOnCancel = const ApiException(
+        statusCode: null,
+        errorCode: 'REQUEST_TIMEOUT',
+        message: 'Request timed out',
+      );
+      // Automatic GET returns authoritative non-cancellable status (e.g. IN_PROGRESS)
+      repository.bookingDetailsToReturn = BookingDetails(
+        bookingId: 'book-auto-block',
+        status: 'IN_PROGRESS',
+        agreedFareCeiling: '45.00',
+        maxWaitDeadline: DateTime.now(),
+      );
+
+      final cancelRes = await provider.cancelBooking(reason: 'Auto recon test');
+      expect(cancelRes, isFalse);
+
+      // State is cancellationBlocked and pending snapshot is cleared
+      expect(provider.cancellationState, CancellationAttemptState.cancellationBlocked);
+      expect(provider.pendingCancellationAttempt, isNull);
+      expect(provider.hasPendingCancellation, isFalse);
+      expect(provider.canRetry, isFalse);
+      expect(provider.canCancel, isFalse);
+      expect(provider.cancellationError, contains('IN_PROGRESS'));
+
+      // Now load booking B and verify it loads successfully without restriction
+      repository.bookingDetailsToReturn = BookingDetails(
+        bookingId: 'book-B-after-auto',
+        status: 'CONFIRMED',
+        agreedFareCeiling: '45.00',
+        maxWaitDeadline: DateTime.now(),
+      );
+
+      await provider.loadBookingDetails('book-B-after-auto');
+      expect(provider.error, isNull);
+      expect(provider.bookingDetails?.bookingId, 'book-B-after-auto');
+      expect(provider.cancellationState, CancellationAttemptState.idle);
+      expect(provider.hasPendingCancellation, isFalse);
+    });
   });
 }

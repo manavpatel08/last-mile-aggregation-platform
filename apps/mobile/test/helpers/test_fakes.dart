@@ -7,6 +7,16 @@ import 'package:lastmile_mobile/features/auth/data/google_sign_in_service.dart';
 import 'package:lastmile_mobile/features/auth/models/auth_session.dart';
 import 'package:lastmile_mobile/features/auth/models/auth_user.dart';
 import 'package:lastmile_mobile/features/auth/state/auth_provider.dart';
+import 'package:lastmile_mobile/features/booking/data/booking_repository.dart';
+import 'package:lastmile_mobile/features/booking/models/booking_cancellation_response.dart';
+import 'package:lastmile_mobile/features/booking/models/booking_details.dart';
+import 'package:lastmile_mobile/features/booking/models/booking_request.dart';
+import 'package:lastmile_mobile/features/booking/models/booking_response.dart';
+import 'package:lastmile_mobile/features/booking/models/cancellation_fee.dart';
+import 'package:lastmile_mobile/features/booking/models/fare_quote.dart';
+import 'package:lastmile_mobile/features/booking/models/location_validation.dart';
+import 'package:lastmile_mobile/features/booking/models/pickup_point.dart';
+import 'package:lastmile_mobile/features/booking/models/service_region.dart';
 import 'package:lastmile_mobile/features/driver/data/driver_repository.dart';
 import 'package:lastmile_mobile/features/driver/models/driver_onboarding_request.dart';
 import 'package:lastmile_mobile/features/driver/models/driver_status_response.dart';
@@ -151,6 +161,7 @@ class FakeAuthRepository implements AuthRepository {
     this.shouldThrowOnGoogle = false,
     this.shouldThrowOnRefresh = false,
     this.shouldThrowOnUser = false,
+    this.authException,
     this.refreshException,
     this.userException,
     this.onRefreshSession,
@@ -162,6 +173,7 @@ class FakeAuthRepository implements AuthRepository {
   bool shouldThrowOnGoogle;
   bool shouldThrowOnRefresh;
   bool shouldThrowOnUser;
+  Exception? authException;
   Exception? refreshException;
   Exception? userException;
   Future<void> Function()? onRefreshSession;
@@ -174,6 +186,9 @@ class FakeAuthRepository implements AuthRepository {
     required String idToken,
     String? deviceFingerprint,
   }) async {
+    if (authException != null) {
+      throw authException!;
+    }
     if (shouldThrowOnGoogle) {
       throw Exception('Google backend auth rejected');
     }
@@ -424,4 +439,167 @@ AuthProvider createTestAuthProvider({
   );
 
   return provider;
+}
+
+/// Test double for [BookingRepository].
+class FakeBookingRepository implements BookingRepository {
+  FakeBookingRepository({
+    this.activeBooking,
+    this.bookingDetails,
+    this.cancellationResponse,
+    this.pickupZones = const [],
+    this.serviceRegions = const [],
+    this.destinationValidation =
+        const DestinationValidationResult(isInsideServiceRegion: true),
+    this.pickupValidation = const PickupValidationResult(
+      isValid: true,
+      distanceMeters: 25.0,
+      allowedRadiusMeters: 150.0,
+    ),
+    this.fareQuote,
+    this.bookingResponse,
+    this.outstandingFeesResponse,
+    this.shouldThrow = false,
+    this.exceptionToThrow,
+  });
+
+  BookingResponse? activeBooking;
+  BookingDetails? bookingDetails;
+  BookingCancellationResponse? cancellationResponse;
+  List<PickupPoint> pickupZones;
+  List<ServiceRegion> serviceRegions;
+  DestinationValidationResult destinationValidation;
+  PickupValidationResult pickupValidation;
+  FareQuote? fareQuote;
+  BookingResponse? bookingResponse;
+  OutstandingCancellationFeesResponse? outstandingFeesResponse;
+  bool shouldThrow;
+  Exception? exceptionToThrow;
+
+  int getActiveBookingCallCount = 0;
+  int createBookingCallCount = 0;
+  int cancelBookingCallCount = 0;
+
+  @override
+  Future<BookingResponse?> getActiveBooking() async {
+    getActiveBookingCallCount++;
+    if (exceptionToThrow != null) throw exceptionToThrow!;
+    if (shouldThrow) throw Exception('Booking repository error');
+    return activeBooking;
+  }
+
+  @override
+  Future<BookingResponse> createBooking({
+    required BookingRequest request,
+    required String idempotencyKey,
+  }) async {
+    createBookingCallCount++;
+    if (exceptionToThrow != null) throw exceptionToThrow!;
+    if (shouldThrow) throw Exception('Failed to create booking');
+    return bookingResponse ??
+        BookingResponse(
+          bookingId: 'book-fake-123',
+          status: 'REQUESTED',
+          agreedFareCeiling: '45.00',
+          maxWaitDeadline: DateTime.now().add(const Duration(minutes: 5)),
+        );
+  }
+
+  @override
+  Future<BookingDetails> getBookingDetails(String bookingId) async {
+    if (exceptionToThrow != null) throw exceptionToThrow!;
+    if (shouldThrow) throw Exception('Failed to get booking details');
+    return bookingDetails ??
+        BookingDetails(
+          bookingId: bookingId,
+          status: 'CONFIRMED',
+          agreedFareCeiling: '45.00',
+          maxWaitDeadline: DateTime.now().add(const Duration(minutes: 5)),
+        );
+  }
+
+  @override
+  Future<BookingCancellationResponse> cancelBooking({
+    required String bookingId,
+    String? reason,
+    required String idempotencyKey,
+  }) async {
+    cancelBookingCallCount++;
+    if (exceptionToThrow != null) throw exceptionToThrow!;
+    if (shouldThrow) throw Exception('Failed to cancel booking');
+    return cancellationResponse ??
+        BookingCancellationResponse(
+          bookingId: bookingId,
+          status: 'CANCELLED',
+          cancellationFeeAssessedPaise: 0,
+          cancellationFeeStatus: 'NONE',
+        );
+  }
+
+  @override
+  Future<List<PickupPoint>> getPickupZones() async {
+    if (exceptionToThrow != null) throw exceptionToThrow!;
+    return pickupZones;
+  }
+
+  @override
+  Future<List<ServiceRegion>> getServiceRegions() async {
+    if (exceptionToThrow != null) throw exceptionToThrow!;
+    return serviceRegions;
+  }
+
+  @override
+  Future<DestinationValidationResult> validateDestination({
+    required double latitude,
+    required double longitude,
+  }) async {
+    if (exceptionToThrow != null) throw exceptionToThrow!;
+    return destinationValidation;
+  }
+
+  @override
+  Future<PickupValidationResult> validatePickup({
+    required String pickupPointId,
+    required double latitude,
+    required double longitude,
+  }) async {
+    if (exceptionToThrow != null) throw exceptionToThrow!;
+    return pickupValidation;
+  }
+
+  @override
+  Future<FareQuote> generateFareQuote({
+    required String pickupPointId,
+    required double destinationLatitude,
+    required double destinationLongitude,
+  }) async {
+    if (exceptionToThrow != null) throw exceptionToThrow!;
+    return fareQuote ??
+        FareQuote(
+          quoteId: 'quote-fake-123',
+          pickupPointId: pickupPointId,
+          pickupPointName: 'PDEU Hub',
+          directDistanceMeters: 2500,
+          directDurationSec: 360,
+          privateEstimatedFare: '45.00',
+          sharedEstimatedRange: const SharedFareRange(
+            minFare: '30.00',
+            maxFare: '45.00',
+          ),
+          agreedFareCeiling: '45.00',
+          tariffVersion: 1,
+          expiresAt: DateTime.now().add(const Duration(minutes: 2)),
+        );
+  }
+
+  @override
+  Future<OutstandingCancellationFeesResponse>
+      getOutstandingCancellationFees() async {
+    if (exceptionToThrow != null) throw exceptionToThrow!;
+    return outstandingFeesResponse ??
+        const OutstandingCancellationFeesResponse(
+          totalOutstandingPaise: 0,
+          fees: [],
+        );
+  }
 }

@@ -305,6 +305,19 @@ Because the platform operates without credit card auto-debits, uncollected ₹30
    - Atomically updates `cancellation_fees SET status = 'COLLECTED', collected_booking_id = :bookingId, collected_at = NOW()`.
    - **Partial Unique Index Protection:** Guarantees that a cancellation fee can never be collected twice.
 
+### 9.2 Admin Cancellation Fee Waiver
+- **Privileged Exemption:** Platform administrators (`ADMIN` role) can exempt passengers from outstanding late fees upon verified justification (e.g. campus medical emergency, platform technical failure).
+- **Endpoint:** `POST /api/v1/admin/cancellation-fees/:id/waive`.
+- **Preconditions:** Only `OUTSTANDING` fees can be waived. Already `COLLECTED` fees are rejected with 400 `FEE_ALREADY_COLLECTED`.
+- **Authoritative Audit Record:** Updates existing `cancellation_fees` record:
+  - `status = 'WAIVED'`
+  - `waived_by_user_id = :adminUserId`
+  - `waiver_reason = :waiverReason` (non-empty justification)
+  - `waived_at = NOW()`
+- **Immutability & Safe Repeated Attempts:** Existing waiver audit metadata remains strictly immutable. Repeated calls on an already waived fee return 200 OK without mutating the recorded reason, timestamp, or admin ID.
+- **Outbox Emission:** Emits `CANCELLATION_FEE_WAIVED` event through transactional outbox.
+- **Immediate Quote Relief:** Once marked `WAIVED`, the fee is immediately excluded from subsequent quote surcharge aggregation (`outstandingLateFeeSurcharge = '0.00'`).
+
 ---
 
 *End of Fare Calculation and Cancellation Specification*

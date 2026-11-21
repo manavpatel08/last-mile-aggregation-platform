@@ -248,17 +248,39 @@ Idempotency-Key: <unique-uuid-or-client-nonce>
       "directDistanceMeters": 4200,
       "directDurationSec": 540,
       "privateEstimatedFare": "62.00",
+      "privateEstimatedFarePaise": 6200,
       "sharedEstimatedRange": {
         "minFare": "20.00",
         "maxFare": "62.00"
       },
+      "sharedEstimatedRangePaise": {
+        "minFarePaise": 2000,
+        "maxFarePaise": 6200
+      },
       "agreedFareCeiling": "62.00",
+      "agreedFareCeilingPaise": 6200,
       "tariffVersion": 1,
-      "expiresAt": "2026-11-17T12:02:00.000Z"
+      "expiresAt": "2026-11-17T12:02:00.000Z",
+      "outstandingLateFeeSurcharge": "30.00",
+      "outstandingLateFeeSurchargePaise": 3000,
+      "totalCashToCollect": {
+        "private": "92.00",
+        "sharedRange": {
+          "minFare": "50.00",
+          "maxFare": "92.00"
+        }
+      },
+      "totalCashToCollectPaise": {
+        "privatePaise": 9200,
+        "sharedRangePaise": {
+          "minFarePaise": 5000,
+          "maxFarePaise": 9200
+        }
+      }
     }
   }
   ```
-- **Behavior:** Calls OSRM Table/Route for direct road distance. Returns 2-minute valid quote.
+- **Behavior:** Calls OSRM Table/Route for direct road distance. Returns 2-minute valid quote. Surcharge disclosure separates uncollected late cancellation penalties without inflating the agreed ride fare ceiling.
 
 ---
 
@@ -528,17 +550,62 @@ Idempotency-Key: <unique-uuid-or-client-nonce>
 
 #### 19.1 Confirm Cash Receipt
 - **Method & Path:** `POST /api/v1/payments/confirm-cash`
-- **Auth:** Bearer Token (Assigned Driver)
+- **Auth:** Bearer Token (Assigned Driver, requires `verification_status = 'APPROVED'`)
 - **Headers:** `Idempotency-Key: <uuid>` (Mandatory)
 - **Request Body:**
   ```json
   {
     "tripId": "trip-uuid",
-    "tripPassengerId": "passenger-uuid",
+    "tripPassengerId": "trip-passenger-uuid",
     "amountCollectedPaise": 6800
   }
   ```
-- **State Transition:** Inserts `cash_collections` and `payment_allocations`. If outstanding cancellation fee was surcharged, atomically marks fee `'COLLECTED'`.
+- **Response (200 OK):**
+  ```json
+  {
+    "success": true,
+    "message": "Cash payment confirmed successfully",
+    "data": {
+      "collectionId": "collection-uuid",
+      "tripId": "trip-uuid",
+      "tripPassengerId": "trip-passenger-uuid",
+      "driverId": "driver-profile-uuid",
+      "totalCashCollectedPaise": 6800,
+      "totalCashCollected": "68.00",
+      "rideFarePaise": 3800,
+      "rideFare": "38.00",
+      "waitingChargePaise": 0,
+      "waitingCharge": "0.00",
+      "surchargeFeesPaise": 3000,
+      "surchargeFees": "30.00",
+      "collectedFeeIds": ["fee-uuid"],
+      "paymentStatus": "PAID",
+      "confirmedAt": "2026-11-22T02:00:00.000Z",
+      "paymentAllocations": [
+        {
+          "id": "alloc-1-uuid",
+          "obligationType": "RIDE_FARE",
+          "obligationEntityId": "trip-passenger-uuid",
+          "allocatedAmountPaise": 3800,
+          "allocatedAmount": "38.00"
+        },
+        {
+          "id": "alloc-2-uuid",
+          "obligationType": "CANCELLATION_FEE_SURCHARGE",
+          "obligationEntityId": "fee-uuid",
+          "allocatedAmountPaise": 3000,
+          "allocatedAmount": "30.00"
+        }
+      ]
+    }
+  }
+  ```
+- **State Transition:** Atomically creates `cash_collections` and `payment_allocations`. If outstanding cancellation fees were surcharged, atomically updates fees to `'COLLECTED'` with `collected_booking_id` and `collected_at`. Emits `CASH_PAYMENT_CONFIRMED` outbox event.
+- **Constraints & Invariants:**
+  - Cash collection permitted only when `trip_passengers.status === 'COMPLETED'`.
+  - Amount collected must match authoritative backend total exactly (`final_ride_fare_paise + waiting_charge_paise + surcharge_fees_paise`), else rejected with 400 `INVALID_COLLECTION_AMOUNT`.
+  - Enforces database Invariant 7: exactly one cash collection per journey (`idx_unique_cash_collection_trip_passenger`). Subsequent calls for same passenger journey are rejected with 409 Conflict `CASH_ALREADY_COLLECTED`.
+  - Supports duplicate request idempotency via `Idempotency-Key` header.
 
 ---
 
@@ -551,8 +618,36 @@ Idempotency-Key: <unique-uuid-or-client-nonce>
 #### 20.2 Admin: Waive Cancellation Fee
 - **Method & Path:** `POST /api/v1/admin/cancellation-fees/:id/waive`
 - **Auth:** Bearer Token (`ADMIN`)
-- **Request Body:** `{ "waiverReason": "Verified campus medical emergency" }`
-- **State Transition:** Sets fee status `'WAIVED'`, records `waived_by_user_id`, `waiver_reason`, and `waived_at` on `cancellation_fees` as authoritative audit record, and emits `CANCELLATION_FEE_WAIVED` outbox event.
+- **Request Body:**
+  ```json
+  {
+    "waiverReason": "Verified campus medical emergency"
+  }
+  ```
+- **Response (200 OK):**
+  ```json
+  {
+    "success": true,
+    "message": "Cancellation fee waived successfully",
+    "data": {
+      "feeId": "cancellation-fee-uuid",
+      "passengerId": "passenger-uuid",
+      "originalBookingId": "booking-uuid",
+      "amountPaise": 3000,
+      "amount": "30.00",
+      "status": "WAIVED",
+      "waivedByUserId": "admin-uuid",
+      "waiverReason": "Verified campus medical emergency",
+      "waivedAt": "2026-11-22T02:00:00.000Z"
+    }
+  }
+  ```
+- **State Transition:** Atomically sets fee status `'WAIVED'`, records `waived_by_user_id`, `waiver_reason`, and `waived_at` on `cancellation_fees` as authoritative audit record, and emits `CANCELLATION_FEE_WAIVED` outbox event.
+- **Constraints & Invariants:**
+  - Restricted to authenticated `ADMIN` role.
+  - Requires a non-empty `waiverReason` (400 if blank or whitespace-only).
+  - Only `OUTSTANDING` cancellation fees can be waived. Attempting to waive an already `COLLECTED` fee is rejected with 400 `FEE_ALREADY_COLLECTED`.
+  - Repeated waiver attempts on an already `WAIVED` fee return 200 OK safely without modifying the immutable original waiver audit metadata.
 
 ---
 

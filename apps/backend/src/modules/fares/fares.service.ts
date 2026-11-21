@@ -22,6 +22,48 @@ export interface AllocatedFareResult {
   allocatedFarePaise: number;
 }
 
+export interface TotalCashToCollectResponse {
+  private: string;
+  sharedRange: {
+    minFare: string;
+    maxFare: string;
+  };
+}
+
+export interface TotalCashToCollectPaiseResponse {
+  privatePaise: number;
+  sharedRangePaise: {
+    minFarePaise: number;
+    maxFarePaise: number;
+  };
+}
+
+export interface FareQuoteResponse {
+  quoteId: string;
+  pickupPointId: string;
+  pickupPointName: string;
+  directDistanceMeters: number;
+  directDurationSec: number;
+  privateEstimatedFare: string;
+  privateEstimatedFarePaise: number;
+  sharedEstimatedRange: {
+    minFare: string;
+    maxFare: string;
+  };
+  sharedEstimatedRangePaise: {
+    minFarePaise: number;
+    maxFarePaise: number;
+  };
+  agreedFareCeiling: string;
+  agreedFareCeilingPaise: number;
+  tariffVersion: number;
+  expiresAt: string;
+  outstandingLateFeeSurcharge: string;
+  outstandingLateFeeSurchargePaise: number;
+  totalCashToCollect: TotalCashToCollectResponse;
+  totalCashToCollectPaise: TotalCashToCollectPaiseResponse;
+}
+
 @Injectable()
 export class FaresService {
   private readonly logger = new Logger(FaresService.name);
@@ -169,6 +211,31 @@ export class FaresService {
       ) RETURNING id, expires_at;
     `;
 
+    // 7. Retrieve passenger's outstanding cancellation fees (Stage 8 Surcharge Disclosure)
+    const outstandingFees =
+      (await this.prisma.cancellationFee?.findMany({
+        where: {
+          passengerId: userId,
+          status: 'OUTSTANDING',
+        },
+        select: {
+          id: true,
+          amountPaise: true,
+        },
+      })) ?? [];
+
+    const outstandingLateFeeSurchargePaise = outstandingFees.reduce(
+      (sum, fee) => sum + fee.amountPaise,
+      0,
+    );
+
+    const totalPrivateCashPaise =
+      privateEstimatedFarePaise + outstandingLateFeeSurchargePaise;
+    const sharedMinTotalCashPaise =
+      sharedMinFarePaise + outstandingLateFeeSurchargePaise;
+    const sharedMaxTotalCashPaise =
+      sharedMaxFarePaise + outstandingLateFeeSurchargePaise;
+
     return {
       quoteId: quote.id,
       pickupPointId: pickupPoint.id,
@@ -189,6 +256,24 @@ export class FaresService {
       agreedFareCeilingPaise,
       tariffVersion,
       expiresAt: quote.expires_at.toISOString(),
+      outstandingLateFeeSurcharge: (
+        outstandingLateFeeSurchargePaise / 100
+      ).toFixed(2),
+      outstandingLateFeeSurchargePaise,
+      totalCashToCollect: {
+        private: (totalPrivateCashPaise / 100).toFixed(2),
+        sharedRange: {
+          minFare: (sharedMinTotalCashPaise / 100).toFixed(2),
+          maxFare: (sharedMaxTotalCashPaise / 100).toFixed(2),
+        },
+      },
+      totalCashToCollectPaise: {
+        privatePaise: totalPrivateCashPaise,
+        sharedRangePaise: {
+          minFarePaise: sharedMinTotalCashPaise,
+          maxFarePaise: sharedMaxTotalCashPaise,
+        },
+      },
     };
   }
 

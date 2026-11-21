@@ -85,6 +85,13 @@
 - Early drop-off is permitted only at an on-route safe point. Driver confirms. Passenger marked `'COMPLETED'`.
 - **The original allocated fare remains completely unchanged.** Other passengers' fares and route geometry remain untouched.
 
+### 2.7 Cash Collection & Payment Allocation Rules
+- **Physical Cash Only:** Payments are strictly settled in cash between passenger and driver upon drop-off (`COMPLETED`).
+- **Authoritative Backend Amount:** Driver-submitted collection amount must strictly match backend calculation (`final_ride_fare_paise + waiting_charge_paise + feeSurchargePaise`). Arbitrary inputs are rejected with 400 `INVALID_COLLECTION_AMOUNT`.
+- **Payment Allocations Ledger:** Exact ledger allocations are generated for `RIDE_FARE`, `WAITING_CHARGE`, and `CANCELLATION_FEE_SURCHARGE`. Sum of allocations strictly equals total cash collected.
+- **Atomic Surcharge Settlement:** When cash is confirmed, all outstanding cancellation fees for that passenger are marked `COLLECTED` atomically with `collected_booking_id` and `collected_at`.
+- **Single Cash Collection per Journey:** Cash collection is permitted only once per completed passenger journey, enforced by database constraint `idx_unique_cash_collection_trip_passenger`.
+
 ---
 
 ## 3. Database Invariants to Enforce

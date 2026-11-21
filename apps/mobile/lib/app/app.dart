@@ -40,6 +40,7 @@ class LastMileApp extends StatefulWidget {
     this.googleSignInService,
     this.driverRepository,
     this.driverOnboardingProvider,
+    this.driverHomeProvider,
     this.bookingRepository,
     this.locationService,
     this.bookingFlowProvider,
@@ -57,6 +58,7 @@ class LastMileApp extends StatefulWidget {
   final GoogleSignInService? googleSignInService;
   final DriverRepository? driverRepository;
   final DriverOnboardingProvider? driverOnboardingProvider;
+  final DriverHomeProvider? driverHomeProvider;
   final BookingRepository? bookingRepository;
   final PassengerLocationService? locationService;
   final BookingFlowProvider? bookingFlowProvider;
@@ -77,6 +79,8 @@ class _LastMileAppState extends State<LastMileApp> {
   late final DriverRepository _driverRepository;
   late final DriverOnboardingProvider _driverOnboardingProvider;
   late final bool _ownsDriverOnboardingProvider;
+  late final DriverHomeProvider _driverHomeProvider;
+  late final bool _ownsDriverHomeProvider;
   late final BookingRepository _bookingRepository;
   late final PassengerLocationService _locationService;
   late final BookingFlowProvider _bookingFlowProvider;
@@ -138,6 +142,10 @@ class _LastMileAppState extends State<LastMileApp> {
     _driverOnboardingProvider = widget.driverOnboardingProvider ??
         DriverOnboardingProvider(driverRepository: _driverRepository);
 
+    _ownsDriverHomeProvider = widget.driverHomeProvider == null;
+    _driverHomeProvider = widget.driverHomeProvider ??
+        DriverHomeProvider(driverRepository: _driverRepository);
+
     _bookingRepository = widget.bookingRepository ??
         ApiBookingRepository(apiClient: _apiClient);
     _locationService = widget.locationService ??
@@ -180,6 +188,9 @@ class _LastMileAppState extends State<LastMileApp> {
     if (_ownsDriverOnboardingProvider) {
       _driverOnboardingProvider.dispose();
     }
+    if (_ownsDriverHomeProvider) {
+      _driverHomeProvider.dispose();
+    }
     if (_ownsBookingFlowProvider) {
       _bookingFlowProvider.dispose();
     }
@@ -210,8 +221,8 @@ class _LastMileAppState extends State<LastMileApp> {
         ChangeNotifierProvider<PassengerHomeProvider>.value(
           value: _passengerHomeProvider,
         ),
-        ChangeNotifierProvider<DriverHomeProvider>(
-          create: (_) => DriverHomeProvider(),
+        ChangeNotifierProvider<DriverHomeProvider>.value(
+          value: _driverHomeProvider,
         ),
         ChangeNotifierProvider<DriverOnboardingProvider>.value(
           value: _driverOnboardingProvider,

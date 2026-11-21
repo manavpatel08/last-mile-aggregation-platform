@@ -24,6 +24,7 @@ import 'package:lastmile_mobile/features/booking/models/service_region.dart';
 import 'package:lastmile_mobile/features/booking/services/passenger_location_service.dart';
 import 'package:lastmile_mobile/features/booking/state/booking_details_provider.dart';
 import 'package:lastmile_mobile/features/booking/state/booking_flow_provider.dart';
+import 'package:lastmile_mobile/features/driver/data/driver_repository.dart';
 import 'package:lastmile_mobile/features/driver/state/driver_home_provider.dart';
 import 'package:lastmile_mobile/features/driver/state/driver_onboarding_provider.dart';
 import 'package:lastmile_mobile/features/passenger/state/passenger_home_provider.dart';
@@ -113,13 +114,14 @@ Widget _buildTestApp({
   return MultiProvider(
     providers: [
       Provider<AppConfig>.value(value: AppConfig.fromEnvironment()),
+      Provider<DriverRepository>.value(value: FakeDriverRepository()),
       ChangeNotifierProvider<AuthProvider>.value(value: authProvider),
       ChangeNotifierProvider<AppModeProvider>.value(value: appModeProvider),
       ChangeNotifierProvider<PassengerHomeProvider>(
         create: (_) => PassengerHomeProvider(),
       ),
       ChangeNotifierProvider<DriverHomeProvider>(
-        create: (_) => DriverHomeProvider(),
+        create: (_) => DriverHomeProvider(driverRepository: FakeDriverRepository()),
       ),
       ChangeNotifierProvider<DriverOnboardingProvider>(
         create: (_) => DriverOnboardingProvider(

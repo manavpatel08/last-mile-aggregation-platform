@@ -105,6 +105,7 @@ stateDiagram-v2
     DRIVER_EN_ROUTE --> AT_PICKUP: Driver Arrives at PDEU Hub (5m Free Timer)
     AT_PICKUP --> IN_PROGRESS: All Passengers Verified via OTP & Depart
     AT_PICKUP --> CANCELLED: Driver Cancels / Vehicle Fails at Gate
+    AT_PICKUP --> CANCELLED: All Passengers No-Show / Cancelled (Zero Boarded)
 
     IN_PROGRESS --> INTERRUPTED: Driver Reports Mechanical Breakdown
     INTERRUPTED --> IN_PROGRESS: Replacement Driver Handover (trip.resumed event)
@@ -187,11 +188,23 @@ stateDiagram-v2
 | `[None]` | Offer Accepted | `CREATED` | Dispatch Worker | Winning driver accepted offer. | Materializes `trips` and `trip_passengers`. |
 | `CREATED` | Navigating | `DRIVER_EN_ROUTE` | Driver | Driver opens navigation to PDEU pickup. | Streams GPS updates to passenger room. |
 | `DRIVER_EN_ROUTE` | Arrival Click | `AT_PICKUP` | Driver | Driver device within pickup geofence. | Sets `driver_arrived_at = NOW()`. Emits `driver.arrived`. |
-| `AT_PICKUP` | Trip Start | `IN_PROGRESS` | Driver | All passenger OTPs verified or marked no-show. | Emits `trip.started`. Navigation begins. |
+| `AT_PICKUP` | Trip Start | `IN_PROGRESS` | Driver | All passenger OTPs verified or marked no-show; $\ge 1$ boarded. | Emits `trip.started`. Navigation begins. |
+| `AT_PICKUP` | All Passengers No-Show / Cancelled | `CANCELLED` | Driver / Worker | Zero passengers boarded; all manifest members NO_SHOW or CANCELLED. | Marks trip `CANCELLED`, dissolves group, releases driver assignment and profile to `AVAILABLE`. Emits `TRIP_CANCELLED`. |
 | `IN_PROGRESS` | Breakdown | `INTERRUPTED` | Driver / Admin | Mechanical failure, tire blowout, accident. | Captures immutable manifest snapshot. Searches replacement. |
 | `INTERRUPTED` | Replacement Accepts | `IN_PROGRESS` | Replacement Driver | Replacement driver within capacity accepts handover. | Emits `trip.resumed` event. Applies 10% discount to onboard members. |
 | `INTERRUPTED` | Replacement Fails | `ABORTED` | Worker Scheduler | No eligible replacement within timeout. | Sets trip `ABORTED`. Onboard passengers pay ₹0. Full refund. |
 | `IN_PROGRESS` | Final Drop-Off | `COMPLETED` | Driver | All passenger journeys finalized. | Sets trip `COMPLETED`. Driver status $\rightarrow$ `AVAILABLE`. |
+
+---
+
+### 3.3 Cancellation Fee Ledger Transitions
+
+| Current State | Trigger / Event | Target State | Actor / Initiator | Preconditions | Side Effects & Actions |
+|---|---|---|---|---|---|
+| `[None]` | Late Cancellation | `OUTSTANDING` | Passenger / Worker | Cancelled after driver assigned (`DRIVER_ASSIGNED` or `DRIVER_ARRIVED`). | Inserts `cancellation_fees` record (₹30.00). Invariant 7 enforced. |
+| `[None]` | Passenger No-Show | `OUTSTANDING` | Driver | 10 minutes elapsed at hub without OTP verification. | Inserts `cancellation_fees` record (flat ₹30.00 penalty, ₹0 waiting fee). |
+| `OUTSTANDING` | Driver Cash Confirmation | `COLLECTED` | Driver | Passenger drop-off completed on subsequent ride; cash collected. | Atomically updates fee `COLLECTED`, sets `collected_booking_id` and `collected_at`. Inserts `payment_allocations`. |
+| `OUTSTANDING` | Admin Waiver | `WAIVED` | Administrator | Authenticated `ADMIN`; valid non-empty waiver reason supplied. | Atomically updates fee `WAIVED`, sets `waived_by_user_id`, `waiver_reason`, and `waived_at`. Emits `CANCELLATION_FEE_WAIVED`. |
 
 ---
 

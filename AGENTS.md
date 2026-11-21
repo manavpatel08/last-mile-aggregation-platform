@@ -85,6 +85,13 @@
 - Early drop-off is permitted only at an on-route safe point. Driver confirms. Passenger marked `'COMPLETED'`.
 - **The original allocated fare remains completely unchanged.** Other passengers' fares and route geometry remain untouched.
 
+### 2.7 Cash Collection & Payment Allocation Rules
+- **Physical Cash Only:** Payments are strictly settled in cash between passenger and driver upon drop-off (`COMPLETED`).
+- **Authoritative Backend Amount:** Driver-submitted collection amount must strictly match backend calculation (`final_ride_fare_paise + waiting_charge_paise + feeSurchargePaise`). Arbitrary inputs are rejected with 400 `INVALID_COLLECTION_AMOUNT`.
+- **Payment Allocations Ledger:** Exact ledger allocations are generated for `RIDE_FARE`, `WAITING_CHARGE`, and `CANCELLATION_FEE_SURCHARGE`. Sum of allocations strictly equals total cash collected.
+- **Atomic Surcharge Settlement:** When cash is confirmed, all outstanding cancellation fees for that passenger are marked `COLLECTED` atomically with `collected_booking_id` and `collected_at`.
+- **Single Cash Collection per Journey:** Cash collection is permitted only once per completed passenger journey, enforced by database constraint `idx_unique_cash_collection_trip_passenger`.
+
 ---
 
 ## 3. Database Invariants to Enforce
@@ -103,8 +110,9 @@ When generating Prisma migrations or executing raw SQL queries, you must guarant
    `CREATE UNIQUE INDEX idx_unique_single_pending_offer_per_group ON driver_dispatch_offers (ride_group_id) WHERE status = 'PENDING';`
 6. **Scoped Driver Offer Exclusion:**
    `CREATE UNIQUE INDEX idx_unique_driver_offer_per_group_version ON driver_dispatch_offers (ride_group_id, group_version, dispatch_attempt_id, driver_id);`
-7. **No Duplicate Fee Collection:**
-   `CREATE UNIQUE INDEX idx_unique_collected_booking_fee ON cancellation_fees (collected_booking_id) WHERE status = 'COLLECTED';`
+7. **Single Cancellation Fee per Booking and Single Cash Collection per Journey:**
+   `CREATE UNIQUE INDEX idx_unique_cancellation_fee_per_booking ON cancellation_fees (original_booking_id);`
+   `CREATE UNIQUE INDEX idx_unique_cash_collection_trip_passenger ON cash_collections (trip_passenger_id);`
 8. **Group Capacity Limits:** A shared group must maintain between 2 and 4 passengers while active for dispatch.
 9. **Ownership Protection:** A passenger can never cancel or query another passenger's booking.
 10. **Driver Eligibility:** Only administrator-approved (`verification_status = 'APPROVED'`), online (`is_online = true`), unsuspended drivers can receive or accept offers.

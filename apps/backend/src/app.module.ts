@@ -18,6 +18,7 @@ import { RoutingModule } from './modules/routing/routing.module.js';
 import { FaresModule } from './modules/fares/fares.module.js';
 import { BookingsModule } from './modules/bookings/bookings.module.js';
 import { TripsModule } from './modules/trips/trips.module.js';
+import { PaymentsModule } from './modules/payments/payments.module.js';
 import { MatchingModule } from './modules/matching/matching.module.js';
 import { DispatchModule } from './modules/dispatch/dispatch.module.js';
 import { OutboxModule } from './infrastructure/outbox/outbox.module.js';
@@ -53,6 +54,7 @@ import { IdempotencyInterceptor } from './common/interceptors/idempotency.interc
     FaresModule,
     BookingsModule,
     TripsModule,
+    PaymentsModule,
     MatchingModule,
     DispatchModule,
     OutboxModule,

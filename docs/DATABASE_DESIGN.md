@@ -795,11 +795,11 @@ erDiagram
 - **Columns:**
   - `id` (`UUID`, PK): Primary key.
   - `passenger_id` (`UUID`, NOT NULL, FK $\rightarrow$ `users.id` ON DELETE RESTRICT): Liable passenger.
-  - `original_booking_id` (`UUID`, NOT NULL, FK $\rightarrow$ `bookings.id` ON DELETE RESTRICT): Originating booking.
+  - `original_booking_id` (`UUID`, NOT NULL, UNIQUE, FK $\rightarrow$ `bookings.id` ON DELETE RESTRICT): Originating booking (enforced unique by `idx_unique_cancellation_fee_per_booking`).
   - `amount_paise` (`INTEGER`, NOT NULL, DEFAULT `3000`, CHECK (`amount_paise > 0`)): Fixed penalty (₹30.00 = 3000 paise).
   - `status` (`VARCHAR(50)`, NOT NULL, DEFAULT `'OUTSTANDING'`): `'OUTSTANDING'`, `'COLLECTED'`, `'WAIVED'`.
   - `collected_booking_id` (`UUID`, NULL, FK $\rightarrow$ `bookings.id`): Subsequent booking where fee was collected.
-  - `waived_by_user_id` (`UUID`, NULL, FK $\rightarrow$ `users.id`): Administrator who granted waiver.
+  - `waived_by_user_id` (`UUID`, NULL, FK $\rightarrow$ `users.id`): Administrator who granted waiver (authoritative waiver audit record).
   - `waiver_reason` (`TEXT`, NULL): Documented justification for waiver.
   - `created_at` (`TIMESTAMPTZ`, NOT NULL, DEFAULT `NOW()`): Creation timestamp.
   - `collected_at` (`TIMESTAMPTZ`, NULL): Collection timestamp.
@@ -811,7 +811,7 @@ erDiagram
   - `id` (`UUID`, PK): Primary key.
   - `trip_id` (`UUID`, NOT NULL, FK $\rightarrow$ `trips.id` ON DELETE RESTRICT): Associated trip.
   - `driver_id` (`UUID`, NOT NULL, FK $\rightarrow$ `driver_profiles.id` ON DELETE RESTRICT): Collecting driver.
-  - `trip_passenger_id` (`UUID`, NOT NULL, FK $\rightarrow$ `trip_passengers.id` ON DELETE RESTRICT): Passenger.
+  - `trip_passenger_id` (`UUID`, NOT NULL, UNIQUE, FK $\rightarrow$ `trip_passengers.id` ON DELETE RESTRICT): Passenger journey (enforced unique by `idx_unique_cash_collection_trip_passenger`).
   - `total_cash_collected_paise` (`INTEGER`, NOT NULL, CHECK (`total_cash_collected_paise >= 0`)): Total cash received.
   - `payment_status` (`VARCHAR(50)`, NOT NULL, DEFAULT `'PAID'`): `'PAID'`, `'DISPUTED'`.
   - `confirmed_at` (`TIMESTAMPTZ`, NOT NULL, DEFAULT `NOW()`): Confirmation timestamp.
@@ -910,49 +910,58 @@ To guarantee zero illegal states, the following 11 database invariants are stric
 
 ### 4.1 Invariant 1: Exactly One Active Booking per Passenger
 ```sql
-CREATE UNIQUE INDEX idx_unique_active_passenger_booking 
-ON bookings (passenger_id) 
+CREATE UNIQUE INDEX idx_unique_active_passenger_booking
+ON bookings (passenger_id)
 WHERE status IN ('REQUESTED', 'MATCHING', 'DISPATCHING', 'CONFIRMED', 'IN_PROGRESS');
 ```
 
 ### 4.2 Invariant 2: A Booking Belongs to At Most One Active Group
 ```sql
-CREATE UNIQUE INDEX idx_unique_active_booking_in_group 
-ON group_members (booking_id) 
+CREATE UNIQUE INDEX idx_unique_active_booking_in_group
+ON group_members (booking_id)
 WHERE is_active_member = true;
 ```
 
 ### 4.3 Invariant 3: Exactly One Active Assignment per Driver
 ```sql
-CREATE UNIQUE INDEX idx_unique_active_driver_assignment 
-ON driver_assignments (driver_id) 
+CREATE UNIQUE INDEX idx_unique_active_driver_assignment
+ON driver_assignments (driver_id)
 WHERE status IN ('RESERVED', 'ACTIVE');
 ```
 
 ### 4.4 Invariant 4: Exactly One Active Assignment per Ride Group
 ```sql
-CREATE UNIQUE INDEX idx_unique_active_group_assignment 
-ON driver_assignments (ride_group_id) 
+CREATE UNIQUE INDEX idx_unique_active_group_assignment
+ON driver_assignments (ride_group_id)
 WHERE status IN ('RESERVED', 'ACTIVE');
 ```
 
 ### 4.5 Invariant 5: A Group Has At Most ONE Pending Driver Offer at a Time
 ```sql
-CREATE UNIQUE INDEX idx_unique_single_pending_offer_per_group 
-ON driver_dispatch_offers (ride_group_id) 
+CREATE UNIQUE INDEX idx_unique_single_pending_offer_per_group
+ON driver_dispatch_offers (ride_group_id)
 WHERE status = 'PENDING';
 ```
 
 ### 4.6 Invariant 6: Scoped Driver Offer Exclusion per Group Version
 ```sql
-CREATE UNIQUE INDEX idx_unique_driver_offer_per_group_version 
+CREATE UNIQUE INDEX idx_unique_driver_offer_per_group_version
 ON driver_dispatch_offers (ride_group_id, group_version, dispatch_attempt_id, driver_id);
 ```
 
-### 4.7 Invariant 7: A Cancellation Fee Cannot Be Collected Twice
+### 4.7 Invariant 7: Single Cancellation Fee per Booking and Single Cash Collection per Journey
 ```sql
-CREATE UNIQUE INDEX idx_unique_collected_booking_fee 
-ON cancellation_fees (collected_booking_id) 
+-- Replaces previous partial unique index; guarantees an original booking can incur at most one cancellation fee
+CREATE UNIQUE INDEX idx_unique_cancellation_fee_per_booking
+ON cancellation_fees (original_booking_id);
+
+-- Enforces exactly one cash collection record per passenger journey (no duplicate or partial collections)
+CREATE UNIQUE INDEX idx_unique_cash_collection_trip_passenger
+ON cash_collections (trip_passenger_id);
+
+-- Supports multi-fee collection queries on a subsequent booking
+CREATE INDEX idx_cancellation_fees_collected_booking
+ON cancellation_fees (collected_booking_id)
 WHERE status = 'COLLECTED';
 ```
 
@@ -968,21 +977,21 @@ CREATE INDEX idx_trip_incidents_loc_gist ON trip_incidents USING GIST (incident_
 
 ### 4.9 Invariant 9: Active Outbox Queue Claiming Index
 ```sql
-CREATE INDEX idx_outbox_events_pending 
-ON outbox_events (created_at) 
+CREATE INDEX idx_outbox_events_pending
+ON outbox_events (created_at)
 WHERE status = 'PENDING';
 ```
 
 ### 4.10 Invariant 10: Single Verified Boarding per Passenger Journey
 ```sql
-CREATE UNIQUE INDEX idx_unique_verified_passenger_boarding 
-ON boarding_verifications (trip_passenger_id) 
+CREATE UNIQUE INDEX idx_unique_verified_passenger_boarding
+ON boarding_verifications (trip_passenger_id)
 WHERE is_verified = true;
 ```
 
 ### 4.11 Invariant 11: Idempotency Key Expiration Index
 ```sql
-CREATE INDEX idx_idempotency_created_at 
+CREATE INDEX idx_idempotency_created_at
 ON idempotency_records (created_at);
 ```
 

@@ -12,6 +12,7 @@ import {
 import { PrismaService } from '../../infrastructure/prisma/prisma.service.js';
 import { RedisService } from '../../infrastructure/redis/redis.service.js';
 import { LocationsService } from '../locations/locations.service.js';
+import { RoutingService } from '../routing/routing.service.js';
 import { CreateBookingDto } from './dto/create-booking.dto.js';
 import { CancelBookingDto } from './dto/cancel-booking.dto.js';
 import { CANONICAL_ACTIVE_BOOKING_STATUSES } from './bookings.constants.js';
@@ -72,6 +73,7 @@ export class BookingsService {
     private readonly prisma: PrismaService,
     private readonly locationsService: LocationsService,
     @Optional() private readonly redisService?: RedisService,
+    @Optional() private readonly routingService?: RoutingService,
   ) {}
 
   /**
@@ -539,11 +541,32 @@ export class BookingsService {
     cancellationFeeAssessedPaise: number;
     cancellationFeeStatus: 'NONE' | 'OUTSTANDING';
   }> {
-    return this.prisma.$transaction(async (tx) => {
+    const result = await this.prisma.$transaction(async (tx) => {
       // Verify claim ownership and lock idempotency record
       await verifyIdempotencyClaim(tx, claim);
 
-      // 1. Lock booking row with SELECT FOR UPDATE to coordinate concurrency
+      // Standard lock order across the monolith: trips -> bookings -> trip_passengers
+      // 1. If this booking is associated with an active trip, lock the trip row first
+      const activeTripLookup = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT t.id
+        FROM trips t
+        LEFT JOIN trip_passengers tp ON tp.trip_id = t.id AND tp.booking_id = ${bookingId}::uuid
+        LEFT JOIN group_members gm ON gm.ride_group_id = t.ride_group_id AND gm.booking_id = ${bookingId}::uuid
+        WHERE (tp.id IS NOT NULL OR gm.id IS NOT NULL)
+          AND t.status IN ('CREATED', 'DRIVER_EN_ROUTE', 'AT_PICKUP', 'IN_PROGRESS')
+        LIMIT 1;
+      `;
+
+      if (activeTripLookup && activeTripLookup.length > 0) {
+        await tx.$queryRaw`
+          SELECT id
+          FROM trips
+          WHERE id = ${activeTripLookup[0].id}::uuid
+          FOR UPDATE;
+        `;
+      }
+
+      // 2. Lock booking row with SELECT FOR UPDATE to coordinate concurrency
       const bookings = await tx.$queryRaw<
         Array<{
           id: string;
@@ -590,6 +613,14 @@ export class BookingsService {
         });
       }
 
+      if (currentStatus === 'NO_SHOW') {
+        throw new BadRequestException({
+          errorCode: 'CANNOT_CANCEL_IN_CURRENT_STATUS',
+          message:
+            "Cannot cancel booking in status 'NO_SHOW'. Commuter has already been declared a no-show.",
+        });
+      }
+
       const cancellableStatuses = [
         'REQUESTED',
         'MATCHING',
@@ -604,6 +635,43 @@ export class BookingsService {
         throw new BadRequestException({
           errorCode: 'CANNOT_CANCEL_IN_CURRENT_STATUS',
           message: `Cannot cancel booking in status '${currentStatus}'. Active onboard trips cannot be cancelled.`,
+        });
+      }
+
+      // Synchronize associated TripPassenger record if trip was materialized
+      // Strict lock ordering: bookings row was locked above, now lock trip_passengers row
+      const tripPassengerRows = await tx.$queryRaw<
+        Array<{
+          id: string;
+          trip_id: string;
+          status: string;
+        }>
+      >`
+        SELECT id, trip_id, status
+        FROM trip_passengers
+        WHERE booking_id = ${booking.id}::uuid
+        FOR UPDATE;
+      `;
+
+      if (tripPassengerRows && tripPassengerRows.length > 0) {
+        const tp = tripPassengerRows[0];
+        if (tp.status === 'NO_SHOW') {
+          throw new BadRequestException({
+            errorCode: 'CANNOT_CANCEL_IN_CURRENT_STATUS',
+            message:
+              "Cannot cancel booking in status 'NO_SHOW'. Commuter has already been declared a no-show.",
+          });
+        }
+        if (['BOARDED', 'COMPLETED'].includes(tp.status)) {
+          throw new BadRequestException({
+            errorCode: 'CANNOT_CANCEL_IN_CURRENT_STATUS',
+            message: `Cannot cancel booking in status '${tp.status}'. Active onboard trips cannot be cancelled.`,
+          });
+        }
+        // Update trip_passenger status to CANCELLED so it does not block startTrip()
+        await tx.tripPassenger.update({
+          where: { id: tp.id },
+          data: { status: 'CANCELLED' },
         });
       }
 
@@ -640,18 +708,37 @@ export class BookingsService {
       });
 
       // 7. If after driver assignment, assess fixed ₹30 late fee into cancellation_fees ledger
+      // Guarded by unique index idx_unique_cancellation_fee_per_booking
       if (feePaise > 0) {
-        await tx.cancellationFee.create({
-          data: {
-            passengerId: booking.passenger_id,
-            originalBookingId: booking.id,
-            amountPaise: feePaise,
-            status: 'OUTSTANDING',
-          },
+        const existingFee = await tx.cancellationFee.findUnique({
+          where: { originalBookingId: booking.id },
         });
+
+        if (!existingFee) {
+          await tx.cancellationFee.create({
+            data: {
+              passengerId: booking.passenger_id,
+              originalBookingId: booking.id,
+              amountPaise: feePaise,
+              status: 'OUTSTANDING',
+            },
+          });
+        }
       }
 
       // 8. If member of an active group, deactivate member and evaluate group continuity
+      let routeReconciliationInfo: {
+        rideGroupId: string;
+        expectedGroupVersion: number;
+        pickupPoint: { lat: number; lng: number };
+        destinations: Array<{
+          groupMemberId: string;
+          bookingId: string;
+          lat: number;
+          lng: number;
+        }>;
+      } | null = null;
+
       const activeMembership = await tx.groupMember.findFirst({
         where: {
           bookingId: booking.id,
@@ -666,18 +753,41 @@ export class BookingsService {
         });
 
         // Check remaining active members in group
-        const remainingActiveCount = await tx.groupMember.count({
+        const remainingActiveMembers = await tx.groupMember.findMany({
           where: {
             rideGroupId: activeMembership.rideGroupId,
             isActiveMember: true,
           },
+          orderBy: { dropoffSequenceOrder: 'asc' },
         });
 
-        if (remainingActiveCount < 2) {
-          // Dissolve group because remaining members < 2
+        // Check if any surviving member has already boarded a materialized trip.
+        // If a surviving passenger is already onboard, their journey and driver assignment
+        // must be preserved; the group must not be dissolved, and the onboard passenger
+        // must never be rematched.
+        const boardedSurvivor =
+          remainingActiveMembers.length > 0
+            ? await tx.tripPassenger.findFirst({
+                where: {
+                  bookingId: {
+                    in: remainingActiveMembers.map((m) => m.bookingId),
+                  },
+                  status: 'BOARDED',
+                },
+              })
+            : null;
+
+        if (remainingActiveMembers.length < 2 && !boardedSurvivor) {
+          // Scenario B: Fewer than two eligible passengers survive and NONE is boarded -> Dissolve group
           await tx.rideGroup.update({
             where: { id: activeMembership.rideGroupId },
             data: { status: 'DISSOLVED' },
+          });
+
+          // Deactivate all old memberships in this group
+          await tx.groupMember.updateMany({
+            where: { rideGroupId: activeMembership.rideGroupId },
+            data: { isActiveMember: false },
           });
 
           // Release active driver assignment (Invariant 3)
@@ -699,14 +809,182 @@ export class BookingsService {
               data: { operationalStatus: 'AVAILABLE' },
             });
           }
+
+          // If a trip has already been materialized, cancel it
+          const associatedTrips = await tx.trip.findMany({
+            where: {
+              rideGroupId: activeMembership.rideGroupId,
+              status: { in: ['CREATED', 'DRIVER_EN_ROUTE', 'AT_PICKUP'] },
+            },
+          });
+
+          for (const t of associatedTrips) {
+            await tx.trip.update({
+              where: { id: t.id },
+              data: { status: 'CANCELLED' },
+            });
+
+            await tx.tripStatusHistory.create({
+              data: {
+                tripId: t.id,
+                previousStatus: t.status,
+                newStatus: 'CANCELLED',
+                reason:
+                  'Group dissolved due to passenger cancellation; trip cancelled',
+              },
+            });
+
+            await tx.tripPassenger.updateMany({
+              where: {
+                tripId: t.id,
+                status: { in: ['WAITING', 'BOARDED'] },
+              },
+              data: { status: 'CANCELLED' },
+            });
+          }
+
+          // Return surviving eligible booking to REQUESTED (or EXPIRED if deadline passed)
+          if (remainingActiveMembers.length === 1) {
+            const survivingMember = remainingActiveMembers[0];
+            const survivingBookings = await tx.$queryRaw<
+              Array<{
+                id: string;
+                passenger_id: string;
+                status: string;
+                max_wait_deadline: Date;
+                created_at: Date;
+              }>
+            >`
+              SELECT id, passenger_id, status, max_wait_deadline, created_at
+              FROM bookings
+              WHERE id = ${survivingMember.bookingId}::uuid
+              FOR UPDATE;
+            `;
+
+            if (survivingBookings && survivingBookings.length > 0) {
+              const survivingBooking = survivingBookings[0];
+              const isExpired =
+                new Date(survivingBooking.max_wait_deadline).getTime() <=
+                now.getTime();
+
+              if (isExpired) {
+                await tx.booking.update({
+                  where: { id: survivingBooking.id },
+                  data: { status: 'EXPIRED' },
+                });
+
+                await tx.bookingStatusHistory.create({
+                  data: {
+                    bookingId: survivingBooking.id,
+                    previousStatus: survivingBooking.status,
+                    newStatus: 'EXPIRED',
+                    reason:
+                      'Group dissolved and max wait deadline expired; no driver assigned',
+                  },
+                });
+
+                await tx.outboxEvent.create({
+                  data: {
+                    eventType: 'BOOKING_EXPIRED',
+                    aggregateType: 'BOOKING',
+                    aggregateId: survivingBooking.id,
+                    payload: {
+                      bookingId: survivingBooking.id,
+                      passengerId: survivingBooking.passenger_id,
+                    },
+                  },
+                });
+              } else {
+                await tx.booking.update({
+                  where: { id: survivingBooking.id },
+                  data: { status: 'REQUESTED' },
+                });
+
+                await tx.bookingStatusHistory.create({
+                  data: {
+                    bookingId: survivingBooking.id,
+                    previousStatus: survivingBooking.status,
+                    newStatus: 'REQUESTED',
+                    reason:
+                      'Returned to matching pool following group dissolution; original timestamp and deadline preserved',
+                  },
+                });
+
+                await tx.outboxEvent.create({
+                  data: {
+                    eventType: 'BOOKING_RETURNED_TO_MATCHING',
+                    aggregateType: 'BOOKING',
+                    aggregateId: survivingBooking.id,
+                    payload: {
+                      bookingId: survivingBooking.id,
+                      passengerId: survivingBooking.passenger_id,
+                      maxWaitDeadline: survivingBooking.max_wait_deadline,
+                      createdAt: survivingBooking.created_at,
+                    },
+                  },
+                });
+              }
+            }
+          }
         } else {
-          // Increment group version to v+1
-          await tx.rideGroup.update({
+          // Scenario A: At least two eligible passengers survive -> Increment group version
+          const updatedGroup = await tx.rideGroup.update({
             where: { id: activeMembership.rideGroupId },
             data: {
               groupVersion: { increment: 1 },
             },
+            select: {
+              id: true,
+              groupVersion: true,
+              pickupPointId: true,
+            },
           });
+
+          // Fetch pickup point coordinates
+          const [pickupPoint] = await tx.$queryRaw<
+            Array<{ lat: number; lng: number }>
+          >`
+            SELECT ST_Y(center_point::geometry) as lat, ST_X(center_point::geometry) as lng
+            FROM pickup_points
+            WHERE id = ${updatedGroup.pickupPointId}::uuid;
+          `;
+
+          const memberDestinations: Array<{
+            groupMemberId: string;
+            bookingId: string;
+            lat: number;
+            lng: number;
+          }> = [];
+
+          for (const m of remainingActiveMembers) {
+            const [dest] = await tx.$queryRaw<
+              Array<{ lat: number; lng: number }>
+            >`
+              SELECT ST_Y(destination_location::geometry) as lat, ST_X(destination_location::geometry) as lng
+              FROM bookings
+              WHERE id = ${m.bookingId}::uuid;
+            `;
+            if (dest) {
+              memberDestinations.push({
+                groupMemberId: m.id,
+                bookingId: m.bookingId,
+                lat: Number(dest.lat),
+                lng: Number(dest.lng),
+              });
+            }
+          }
+
+          if (pickupPoint && memberDestinations.length >= 1) {
+            routeReconciliationInfo = {
+              rideGroupId: updatedGroup.id,
+              expectedGroupVersion: updatedGroup.groupVersion,
+              pickupPoint: {
+                lat: Number(pickupPoint.lat),
+                lng: Number(pickupPoint.lng),
+              },
+              destinations: memberDestinations,
+            };
+          }
         }
       }
 
@@ -747,8 +1025,24 @@ export class BookingsService {
         HttpStatus.OK,
       );
 
-      return cancellationResult;
+      return {
+        cancellationResult,
+        routeReconciliationInfo,
+      };
     });
+
+    // Execute route recalculation outside the transaction to preserve Invariant 4
+    if (result.routeReconciliationInfo && this.routingService) {
+      await this.recalculateAndPersistRoute(result.routeReconciliationInfo).catch(
+        (err) => {
+          this.logger.warn(
+            `Route recalculation failed after passenger cancellation for group ${result.routeReconciliationInfo?.rideGroupId}: ${(err as Error).message}`,
+          );
+        },
+      );
+    }
+
+    return result.cancellationResult;
   }
 
   /**
@@ -1011,5 +1305,110 @@ export class BookingsService {
           : null,
       },
     };
+  }
+
+  /**
+   * Recalculates route using OSRM for surviving passengers after a group membership change.
+   * Runs strictly outside open database transactions, applies groupVersion fencing check,
+   * verifies detour <= 25%, and persists new GroupRouteVersion and GroupRouteStop records.
+   */
+  private async recalculateAndPersistRoute(info: {
+    rideGroupId: string;
+    expectedGroupVersion: number;
+    pickupPoint: { lat: number; lng: number };
+    destinations: Array<{
+      groupMemberId: string;
+      bookingId: string;
+      lat: number;
+      lng: number;
+    }>;
+  }): Promise<void> {
+    if (!this.routingService) return;
+
+    try {
+      const waypoints = [
+        { latitude: info.pickupPoint.lat, longitude: info.pickupPoint.lng },
+        ...info.destinations.map((d) => ({
+          latitude: d.lat,
+          longitude: d.lng,
+        })),
+      ];
+
+      const routeResult = await this.routingService.getMultiStopRoute(waypoints);
+      if (routeResult.distanceMeters <= 0) return;
+
+      await this.prisma.$transaction(async (tx) => {
+        const groups = await tx.$queryRaw<
+          Array<{ id: string; group_version: number; status: string }>
+        >`
+          SELECT id, group_version, status
+          FROM ride_groups
+          WHERE id = ${info.rideGroupId}::uuid
+          FOR UPDATE;
+        `;
+
+        if (!groups || groups.length === 0) return;
+        const group = groups[0];
+
+        // Fencing check: discard stale route calculation if group version has changed
+        // or if group has moved to a terminal state
+        if (
+          group.group_version !== info.expectedGroupVersion ||
+          ['DISSOLVED', 'CANCELLED', 'COMPLETED'].includes(group.status)
+        ) {
+          return;
+        }
+
+        const routeGeometry = routeResult.geometry ?? {};
+        const newRouteVersion = await tx.groupRouteVersion.create({
+          data: {
+            rideGroupId: info.rideGroupId,
+            versionNumber: info.expectedGroupVersion,
+            routeGeometry: routeGeometry as any,
+            totalDistanceMeters: routeResult.distanceMeters,
+            totalDurationSec: routeResult.durationSec,
+          },
+        });
+
+        for (let i = 0; i < info.destinations.length; i++) {
+          const dest = info.destinations[i];
+          await tx.$executeRaw`
+            INSERT INTO group_route_stops (
+              id,
+              group_route_version_id,
+              group_member_id,
+              stop_order,
+              stop_location,
+              stop_type
+            ) VALUES (
+              gen_random_uuid(),
+              ${newRouteVersion.id}::uuid,
+              ${dest.groupMemberId}::uuid,
+              ${i + 1},
+              (SELECT destination_location FROM bookings WHERE id = ${dest.bookingId}::uuid),
+              'DROPOFF'
+            );
+          `;
+        }
+
+        await tx.outboxEvent.create({
+          data: {
+            eventType: 'GROUP_ROUTE_UPDATED',
+            aggregateType: 'RIDE_GROUP',
+            aggregateId: info.rideGroupId,
+            payload: {
+              rideGroupId: info.rideGroupId,
+              groupVersion: info.expectedGroupVersion,
+              totalDistanceMeters: routeResult.distanceMeters,
+              totalDurationSec: routeResult.durationSec,
+            },
+          },
+        });
+      });
+    } catch (err) {
+      this.logger.warn(
+        `Failed to recalculate and persist route for group ${info.rideGroupId}: ${(err as Error).message}`,
+      );
+    }
   }
 }

@@ -936,7 +936,7 @@ export class TripsService {
    * Complete individual passenger drop-off.
    * Validates sequential drop-off according to approved stop_order from group_route_stops.
    * Advances trips.current_stop_order atomically.
-   * Atomically claims and settles outstanding cancellation fees with CAS lock.
+   * Finalizes passenger fare and waiting charges drop-off settlement.
    * Idempotent on duplicate completion requests.
    */
   async completePassenger(

@@ -9,6 +9,7 @@ import {
   IsString,
   Max,
   Min,
+  MinLength,
   validateSync,
 } from 'class-validator';
 
@@ -64,6 +65,10 @@ export class EnvironmentVariables {
   @IsInt()
   @IsOptional()
   REFRESH_TOKEN_MAX_DAYS: number = 30;
+
+  @IsString()
+  @MinLength(32)
+  BOARDING_OTP_SECRET!: string;
 
   @IsString()
   @IsOptional()

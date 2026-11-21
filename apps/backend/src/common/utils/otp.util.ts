@@ -17,12 +17,18 @@ export function deriveBoardingOtp(
   salt: string,
   secret?: string,
 ): string {
-  const hmacSecret =
-    secret ||
-    process.env.BOARDING_OTP_SECRET ||
-    process.env.JWT_SECRET ||
-    'lastmile-pdeu-boarding-otp-secret-key';
-  const hmac = crypto.createHmac('sha256', hmacSecret);
+  const hmacSecret = secret || process.env.BOARDING_OTP_SECRET;
+  if (!hmacSecret || hmacSecret.trim().length === 0) {
+    throw new Error(
+      'BOARDING_OTP_SECRET is not configured. Boarding OTP generation failed closed.',
+    );
+  }
+  if (hmacSecret.trim().length < 32) {
+    throw new Error(
+      'BOARDING_OTP_SECRET must be at least 32 characters long. Boarding OTP generation failed closed.',
+    );
+  }
+  const hmac = crypto.createHmac('sha256', hmacSecret.trim());
   hmac.update(`${bookingId}:${salt}`);
   const digest = hmac.digest();
   const code = (digest.readUInt32BE(0) % 9000) + 1000;

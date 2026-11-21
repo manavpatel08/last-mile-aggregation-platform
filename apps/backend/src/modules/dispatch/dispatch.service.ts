@@ -4,7 +4,10 @@ import {
   NotFoundException,
   ForbiddenException,
   ConflictException,
+  ServiceUnavailableException,
   Optional,
+  Inject,
+  forwardRef,
 } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import type { Queue } from 'bullmq';
@@ -12,6 +15,7 @@ import * as crypto from 'node:crypto';
 import { PrismaService } from '../../infrastructure/prisma/prisma.service.js';
 import { DriversService } from '../drivers/drivers.service.js';
 import { RoutingService } from '../routing/routing.service.js';
+import { OutboxService } from '../../infrastructure/outbox/outbox.service.js';
 import { QUEUES } from '../../common/constants/index.js';
 import { fenceAndCompleteIdempotentTransaction } from '../../common/interceptors/idempotency.interceptor.js';
 import type { IdempotencyClaimContext } from '../../common/interceptors/idempotency.interceptor.js';
@@ -80,6 +84,9 @@ export class DispatchService {
     @Optional()
     @InjectQueue(QUEUES.DISPATCH)
     private readonly dispatchQueue?: Queue<DispatchTimeoutJobPayload>,
+    @Optional()
+    @Inject(forwardRef(() => OutboxService))
+    private readonly outboxService?: OutboxService,
   ) {}
 
   /**
@@ -268,7 +275,10 @@ export class DispatchService {
       this.logger.error(
         `OSRM travel time matrix call failed: ${error?.message}`,
       );
-      return [];
+      throw new ServiceUnavailableException({
+        errorCode: 'ROUTING_UNAVAILABLE',
+        message: `OSRM travel time matrix call failed: ${error?.message}`,
+      });
     }
 
     // Strictly enforce road network routing: reject fallback or non-OSRM source
@@ -280,7 +290,10 @@ export class DispatchService {
       this.logger.warn(
         `OSRM matrix returned fallback/non-OSRM (source=${matrixResult?.source}, isFallback=${matrixResult?.isFallback}); aborting driver ranking for dispatch`,
       );
-      return [];
+      throw new ServiceUnavailableException({
+        errorCode: 'ROUTING_UNAVAILABLE',
+        message: `OSRM matrix returned degraded or fallback response (source=${matrixResult?.source})`,
+      });
     }
 
     const pickupIndex = candidatesWithGps.length;
@@ -319,6 +332,17 @@ export class DispatchService {
       });
     }
 
+    if (rankedCandidates.length === 0 && candidatesWithGps.length > 0) {
+      this.logger.warn(
+        `OSRM matrix returned invalid durations for all ${candidatesWithGps.length} candidate drivers`,
+      );
+      throw new ServiceUnavailableException({
+        errorCode: 'ROUTING_UNAVAILABLE',
+        message:
+          'OSRM travel time matrix contained invalid durations for candidate drivers',
+      });
+    }
+
     // 6. Deterministic tie-breaking: ETA ascending, driverId ascending
     rankedCandidates.sort((a, b) => {
       if (a.etaSec !== b.etaSec) {
@@ -331,38 +355,93 @@ export class DispatchService {
   }
 
   /**
-   * Schedules a delayed 20-second timeout BullMQ job for an offer.
-   * Guarantees deterministic job identity (dispatch-timeout-<offerId>) for deduplication.
+   * Durably schedules a BullMQ timeout job for a driver dispatch offer.
+   * Invoked reliably by the outbox consumer for DISPATCH_OFFER_CREATED events.
+   *
+   * Invariants:
+   * 1. Reads offer from PostgreSQL by offerId.
+   * 2. If offer is no longer PENDING (e.g. ACCEPTED, REJECTED, EXPIRED, WITHDRAWN),
+   *    skips queueing and returns false (no timeout needed).
+   * 3. If PENDING, derives remaining delay from persisted expiresAt.
+   * 4. Enqueues with deterministic jobId `dispatch-timeout-${offerId}` to prevent duplicate active jobs.
+   * 5. If queue is down or queue.add throws, propagates the error so the outbox event remains retryable.
+   */
+  async scheduleOfferTimeout(offerId: string): Promise<{
+    scheduled: boolean;
+    jobId?: string;
+    remainingMs?: number;
+    reason?: string;
+  }> {
+    const offer = await this.prisma.driverDispatchOffer.findUnique({
+      where: { id: offerId },
+    });
+
+    if (!offer) {
+      throw new NotFoundException({
+        errorCode: 'OFFER_NOT_FOUND',
+        message: `Driver dispatch offer ${offerId} not found`,
+      });
+    }
+
+    if (offer.status !== 'PENDING') {
+      this.logger.debug(
+        `Offer ${offerId} status is '${offer.status}', skipping timeout job scheduling`,
+      );
+      return {
+        scheduled: false,
+        reason: `OFFER_STATUS_${offer.status}`,
+      };
+    }
+
+    if (!this.dispatchQueue) {
+      this.logger.debug(
+        `Dispatch queue not configured; skipping delayed BullMQ job for offer ${offerId}`,
+      );
+      return {
+        scheduled: false,
+        reason: 'QUEUE_NOT_CONFIGURED',
+      };
+    }
+
+    const now = Date.now();
+    const remainingMs = Math.max(0, offer.expiresAt.getTime() - now);
+
+    const job = await this.dispatchQueue.add(
+      DISPATCH_TIMEOUT_JOB_NAME,
+      {
+        offerId: offer.id,
+        rideGroupId: offer.rideGroupId,
+        driverId: offer.driverId,
+        groupVersion: offer.groupVersion,
+        dispatchAttemptId: offer.dispatchAttemptId,
+      },
+      {
+        delay: remainingMs,
+        jobId: `dispatch-timeout-${offer.id}`,
+        removeOnComplete: 100,
+        removeOnFail: 50,
+      },
+    );
+
+    this.logger.log(
+      `Scheduled durable timeout job ${job.id} for offer ${offer.id} with delay ${remainingMs}ms`,
+    );
+
+    return {
+      scheduled: true,
+      jobId: job.id,
+      remainingMs,
+    };
+  }
+
+  /**
+   * Schedules a delayed timeout BullMQ job for an offer.
+   * Delegates to durable scheduleOfferTimeout() implementation.
    */
   async scheduleOfferTimeoutJob(
     payload: DispatchTimeoutJobPayload,
   ): Promise<void> {
-    if (!this.dispatchQueue) {
-      this.logger.debug(
-        `Dispatch queue not configured; skipping delayed BullMQ job for offer ${payload.offerId}`,
-      );
-      return;
-    }
-
-    try {
-      await this.dispatchQueue.add(
-        DISPATCH_TIMEOUT_JOB_NAME,
-        payload,
-        {
-          delay: DRIVER_OFFER_TIMEOUT_MS,
-          jobId: `dispatch-timeout-${payload.offerId}`,
-          removeOnComplete: 100,
-          removeOnFail: 50,
-        },
-      );
-      this.logger.log(
-        `Scheduled 20s delayed timeout job on dispatch-queue for offer ${payload.offerId}`,
-      );
-    } catch (err: any) {
-      this.logger.error(
-        `Failed to enqueue BullMQ timeout job for offer ${payload.offerId}: ${err?.message}`,
-      );
-    }
+    await this.scheduleOfferTimeout(payload.offerId);
   }
 
   /**
@@ -400,7 +479,29 @@ export class DispatchService {
       });
     }
 
-    // 2. Validate group status
+    // 2. Fast-path check: if driver already assigned to this group, return success
+    const existingAssignment = await this.prisma.driverAssignment.findFirst({
+      where: {
+        rideGroupId,
+        status: { in: ['RESERVED', 'ACTIVE', 'COMPLETED'] },
+      },
+    });
+
+    if (existingAssignment) {
+      this.logger.log(
+        `Ride group ${rideGroupId} already has assigned driver (assignment ${existingAssignment.id})`,
+      );
+      return {
+        success: true,
+        attemptId: existingAssignment.dispatchAttemptId,
+        driverId: existingAssignment.driverId,
+        isExistingAssignment: true,
+        isExistingOffer: true,
+        message: 'Driver already assigned to group',
+      };
+    }
+
+    // 3. Validate group status
     if (
       rideGroup.status !== 'READY_FOR_DISPATCH' &&
       rideGroup.status !== 'DISPATCHING'
@@ -415,7 +516,7 @@ export class DispatchService {
       };
     }
 
-    // 3. Fast-path idempotency: return existing pending offer if already active
+    // 4. Fast-path idempotency: return existing pending offer if already active
     const existingOffer = await this.prisma.driverDispatchOffer.findFirst({
       where: {
         rideGroupId,
@@ -448,32 +549,97 @@ export class DispatchService {
 
     // 5. Query candidate drivers and rank by OSRM ETA (OUTSIDE DB transaction)
     const groupSize = Math.max(1, rideGroup.members.length);
-    const rankedCandidates = await this.findEligibleCandidateDrivers(
-      rideGroupId,
-      rideGroup.pickupPointId,
-      groupSize,
-      activeAttempt?.id,
-    );
+    let rankedCandidates: CandidateDriver[];
+    try {
+      rankedCandidates = await this.findEligibleCandidateDrivers(
+        rideGroupId,
+        rideGroup.pickupPointId,
+        groupSize,
+        activeAttempt?.id,
+      );
+    } catch (err: any) {
+      if (
+        err instanceof ServiceUnavailableException ||
+        err?.response?.errorCode === 'ROUTING_UNAVAILABLE' ||
+        err?.message?.includes('OSRM')
+      ) {
+        this.logger.warn(
+          `Routing unavailable during candidate driver ranking for group ${rideGroupId}: ${err?.message}`,
+        );
+        return {
+          success: false,
+          reason: 'ROUTING_UNAVAILABLE',
+          retryable: true,
+          message:
+            err?.message ||
+            'OSRM routing engine unavailable for driver candidate ranking',
+        };
+      }
+      throw err;
+    }
 
     if (rankedCandidates.length === 0) {
       this.logger.warn(
         `No eligible ranked candidate drivers found for ride group ${rideGroupId}`,
       );
 
-      // Fleet exhaustion: Mark active attempt EXHAUSTED if one exists
-      if (activeAttempt) {
-        await this.prisma.dispatchAttempt.update({
-          where: { id: activeAttempt.id },
-          data: { status: 'EXHAUSTED' },
+      let attemptId: string | undefined;
+
+      // Find active attempt or latest existing attempt for this group version
+      const latestAttempt =
+        activeAttempt ??
+        (await this.prisma.dispatchAttempt.findFirst({
+          where: {
+            rideGroupId,
+            groupVersion: rideGroup.groupVersion,
+          },
+          orderBy: { attemptNumber: 'desc' },
+        }));
+
+      if (latestAttempt) {
+        attemptId = latestAttempt.id;
+        if (latestAttempt.status === 'ACTIVE') {
+          // Transition active attempt to EXHAUSTED
+          await this.prisma.dispatchAttempt.update({
+            where: { id: latestAttempt.id },
+            data: { status: 'EXHAUSTED' },
+          });
+
+          await this.prisma.outboxEvent.create({
+            data: {
+              eventType: 'DISPATCH_ATTEMPT_EXHAUSTED',
+              aggregateType: 'DISPATCH_ATTEMPT',
+              aggregateId: latestAttempt.id,
+              payload: {
+                dispatchAttemptId: latestAttempt.id,
+                rideGroupId,
+                groupVersion: rideGroup.groupVersion,
+                exhaustedAt: new Date().toISOString(),
+              },
+            },
+          });
+        }
+        // If latestAttempt.status is already 'EXHAUSTED', do not create duplicate attempts or events
+      } else {
+        // Initial dispatch with 0 candidates: durably record attempt 1 as EXHAUSTED
+        // so it cannot leave an untracked, silently abandoned group
+        const attempt = await this.prisma.dispatchAttempt.create({
+          data: {
+            rideGroupId,
+            groupVersion: rideGroup.groupVersion,
+            attemptNumber: 1,
+            status: 'EXHAUSTED',
+          },
         });
+        attemptId = attempt.id;
 
         await this.prisma.outboxEvent.create({
           data: {
             eventType: 'DISPATCH_ATTEMPT_EXHAUSTED',
             aggregateType: 'DISPATCH_ATTEMPT',
-            aggregateId: activeAttempt.id,
+            aggregateId: attempt.id,
             payload: {
-              dispatchAttemptId: activeAttempt.id,
+              dispatchAttemptId: attempt.id,
               rideGroupId,
               groupVersion: rideGroup.groupVersion,
               exhaustedAt: new Date().toISOString(),
@@ -485,6 +651,8 @@ export class DispatchService {
       return {
         success: false,
         reason: 'FLEET_EXHAUSTED',
+        retryable: true,
+        attemptId,
         message: 'All eligible candidate drivers have been exhausted',
       };
     }
@@ -654,21 +822,27 @@ export class DispatchService {
       throw error;
     }
 
-    // 7. Schedule BullMQ delayed timeout job for new offer
+    // 7. Trigger durable timeout scheduling through the transactional outbox
     if (
       dispatchResult.success &&
       !dispatchResult.isExistingOffer &&
-      dispatchResult.offerId &&
-      dispatchResult.attemptId &&
-      dispatchResult.driverId
+      dispatchResult.offerId
     ) {
-      await this.scheduleOfferTimeoutJob({
-        offerId: dispatchResult.offerId,
-        rideGroupId,
-        driverId: dispatchResult.driverId,
-        groupVersion: rideGroup.groupVersion,
-        dispatchAttemptId: dispatchResult.attemptId,
-      });
+      if (this.outboxService) {
+        this.outboxService
+          .triggerImmediateProcessing({
+            aggregateId: dispatchResult.offerId,
+            eventType: 'DISPATCH_OFFER_CREATED',
+          })
+          .catch((err) => {
+            this.logger.warn(
+              `Immediate outbox timeout trigger for offer ${dispatchResult.offerId} deferred to scheduled poll: ${err?.message}`,
+            );
+          });
+      } else {
+        // Fallback for isolated unit tests without OutboxService injected
+        await this.scheduleOfferTimeout(dispatchResult.offerId);
+      }
     }
 
     return dispatchResult;
@@ -762,6 +936,31 @@ export class DispatchService {
         return { shouldCascade: false, reason: 'ATTEMPT_NOT_ACTIVE' };
       }
 
+      // Stale attempt check: Does offer belong to the triggering dispatch attempt?
+      if (lockedOffer.dispatch_attempt_id !== dispatchAttemptId) {
+        this.logger.debug(
+          `Offer ${offerId} attempt mismatch (${lockedOffer.dispatch_attempt_id} vs ${dispatchAttemptId}), skipping timeout expiry`,
+        );
+        return { shouldCascade: false, reason: 'STALE_DISPATCH_ATTEMPT' };
+      }
+
+      // Early timeout safety check: verify persisted expiresAt against current time
+      const now = new Date();
+      const expiresAt = new Date(lockedOffer.expires_at);
+
+      if (now.getTime() < expiresAt.getTime()) {
+        const remainingMs = expiresAt.getTime() - now.getTime();
+        this.logger.warn(
+          `Offer ${offerId} timeout job triggered prematurely (${remainingMs}ms remaining); rescheduling without expiring`,
+        );
+        return {
+          shouldCascade: false,
+          rescheduled: true,
+          remainingMs,
+          reason: 'OFFER_NOT_YET_EXPIRED',
+        };
+      }
+
       // Atomically mark offer EXPIRED
       await tx.driverDispatchOffer.update({
         where: { id: offerId },
@@ -790,6 +989,24 @@ export class DispatchService {
 
       return { shouldCascade: true, driverId: lockedOffer.driver_id };
     });
+
+    if (expireResult.rescheduled && expireResult.remainingMs && this.dispatchQueue) {
+      await this.dispatchQueue.add(
+        DISPATCH_TIMEOUT_JOB_NAME,
+        payload,
+        {
+          delay: expireResult.remainingMs,
+          jobId: `dispatch-timeout-${payload.offerId}-${Date.now()}`,
+          removeOnComplete: 100,
+          removeOnFail: 50,
+        },
+      );
+      return {
+        expired: false,
+        cascaded: false,
+        reason: 'RESCHEDULED_EARLY_TIMEOUT',
+      };
+    }
 
     if (!expireResult.shouldCascade) {
       return { expired: false, cascaded: false, reason: expireResult.reason };

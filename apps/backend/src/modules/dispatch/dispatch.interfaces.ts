@@ -18,8 +18,10 @@ export interface DispatchResult {
   etaSec?: number;
   expiresAt?: Date;
   isExistingOffer?: boolean;
+  isExistingAssignment?: boolean;
   reason?: string;
   message?: string;
+  retryable?: boolean;
 }
 
 export interface DispatchTimeoutJobPayload {

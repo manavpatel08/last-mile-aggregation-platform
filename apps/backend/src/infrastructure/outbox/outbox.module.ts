@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Module, forwardRef } from '@nestjs/common';
 import { BullModule } from '@nestjs/bullmq';
 import { PrismaModule } from '../prisma/prisma.module.js';
 import { DispatchModule } from '../../modules/dispatch/dispatch.module.js';
@@ -9,7 +9,7 @@ import { OutboxProcessor } from './outbox.processor.js';
 @Module({
   imports: [
     PrismaModule,
-    DispatchModule,
+    forwardRef(() => DispatchModule),
     BullModule.registerQueue({
       name: QUEUES.OUTBOX,
     }),

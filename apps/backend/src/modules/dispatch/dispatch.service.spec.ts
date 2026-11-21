@@ -6,6 +6,7 @@ import {
   ConflictException,
   ForbiddenException,
   NotFoundException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { DispatchService } from './dispatch.service.js';
 import {
@@ -514,7 +515,7 @@ describe('DispatchService - Unit Tests', () => {
       expect(ranked[2].driverId).toBe('driver-z-id');
     });
 
-    it('should reject fallback and non-OSRM source, returning empty array', async () => {
+    it('should reject fallback and non-OSRM source by throwing ServiceUnavailableException', async () => {
       prismaMock.driverProfile.findMany.mockResolvedValue([
         {
           id: 'driver-1',
@@ -536,16 +537,16 @@ describe('DispatchService - Unit Tests', () => {
         isFallback: true,
       });
 
-      const ranked = await service.findEligibleCandidateDrivers(
-        mockGroupId,
-        mockPickupPointId,
-        2,
-      );
-
-      expect(ranked).toHaveLength(0);
+      await expect(
+        service.findEligibleCandidateDrivers(
+          mockGroupId,
+          mockPickupPointId,
+          2,
+        ),
+      ).rejects.toThrow(ServiceUnavailableException);
     });
 
-    it('should handle OSRM matrix exception gracefully and return empty array', async () => {
+    it('should handle OSRM matrix exception by throwing ServiceUnavailableException', async () => {
       prismaMock.driverProfile.findMany.mockResolvedValue([
         {
           id: 'driver-1',
@@ -565,13 +566,13 @@ describe('DispatchService - Unit Tests', () => {
         new Error('Network connection refused'),
       );
 
-      const ranked = await service.findEligibleCandidateDrivers(
-        mockGroupId,
-        mockPickupPointId,
-        2,
-      );
-
-      expect(ranked).toHaveLength(0);
+      await expect(
+        service.findEligibleCandidateDrivers(
+          mockGroupId,
+          mockPickupPointId,
+          2,
+        ),
+      ).rejects.toThrow(ServiceUnavailableException);
     });
   });
 
@@ -655,6 +656,256 @@ describe('DispatchService - Unit Tests', () => {
       );
     });
 
+    it('should create attempt with status EXHAUSTED and outbox event when initial dispatch has no candidate drivers', async () => {
+      prismaMock.rideGroup.findUnique.mockResolvedValue({
+        id: mockGroupId,
+        status: 'READY_FOR_DISPATCH',
+        groupVersion: 1,
+        pickupPointId: mockPickupPointId,
+        members: [{ isActiveMember: true }, { isActiveMember: true }],
+      });
+
+      // No active attempt initially
+      prismaMock.dispatchAttempt.findFirst.mockResolvedValue(null);
+      prismaMock.dispatchAttempt.create.mockResolvedValue({
+        id: 'initial-exhausted-attempt',
+        rideGroupId: mockGroupId,
+        groupVersion: 1,
+        attemptNumber: 1,
+        status: 'EXHAUSTED',
+      });
+
+      prismaMock.driverDispatchOffer.findFirst.mockResolvedValue(null);
+      prismaMock.driverProfile.findMany.mockResolvedValue([]);
+
+      const result = await service.initiateDispatchForGroup(mockGroupId);
+
+      expect(result.success).toBe(false);
+      expect(result.reason).toBe('FLEET_EXHAUSTED');
+      expect(result.retryable).toBe(true);
+      expect(prismaMock.dispatchAttempt.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          rideGroupId: mockGroupId,
+          groupVersion: 1,
+          attemptNumber: 1,
+          status: 'EXHAUSTED',
+        }),
+      });
+      expect(prismaMock.outboxEvent.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            eventType: 'DISPATCH_ATTEMPT_EXHAUSTED',
+          }),
+        }),
+      );
+    });
+
+    it('Scenario 1: repeated retries with zero drivers should reuse exhausted attempt and not recreate attempt 1 or duplicate attempts', async () => {
+      prismaMock.rideGroup.findUnique.mockResolvedValue({
+        id: mockGroupId,
+        status: 'READY_FOR_DISPATCH',
+        groupVersion: 1,
+        pickupPointId: mockPickupPointId,
+        members: [{ isActiveMember: true }, { isActiveMember: true }],
+      });
+
+      prismaMock.driverDispatchOffer.findFirst.mockResolvedValue(null);
+      prismaMock.driverAssignment.findFirst.mockResolvedValue(null);
+      prismaMock.driverProfile.findMany.mockResolvedValue([]);
+
+      // Attempt 1 already exists and is EXHAUSTED
+      const existingExhaustedAttempt = {
+        id: 'attempt-exhausted-1',
+        rideGroupId: mockGroupId,
+        groupVersion: 1,
+        attemptNumber: 1,
+        status: 'EXHAUSTED',
+      };
+
+      // activeAttempt query returns null (since status is EXHAUSTED), latestAttempt returns attempt 1
+      prismaMock.dispatchAttempt.findFirst.mockResolvedValue(existingExhaustedAttempt);
+
+      const result = await service.initiateDispatchForGroup(mockGroupId);
+
+      expect(result.success).toBe(false);
+      expect(result.reason).toBe('FLEET_EXHAUSTED');
+      expect(result.retryable).toBe(true);
+      expect(result.attemptId).toBe(existingExhaustedAttempt.id);
+
+      // Must NOT create a new attempt or duplicate attemptNumber: 1
+      expect(prismaMock.dispatchAttempt.create).not.toHaveBeenCalled();
+      // Must NOT update or emit duplicate event for already EXHAUSTED attempt
+      expect(prismaMock.dispatchAttempt.update).not.toHaveBeenCalled();
+    });
+
+    it('Scenario 1: zero drivers -> exhausted attempt 1 -> retry -> driver becomes available -> successful offer creation on attempt 2', async () => {
+      prismaMock.rideGroup.findUnique.mockResolvedValue({
+        id: mockGroupId,
+        status: 'READY_FOR_DISPATCH',
+        groupVersion: 1,
+        pickupPointId: mockPickupPointId,
+        members: [{ isActiveMember: true }, { isActiveMember: true }],
+      });
+
+      prismaMock.driverDispatchOffer.findFirst.mockResolvedValue(null);
+      prismaMock.driverAssignment.findFirst.mockResolvedValue(null);
+
+      // In initial dispatch: activeAttempt is null
+      prismaMock.dispatchAttempt.findFirst.mockResolvedValue(null);
+
+      // Driver becomes eligible on retry
+      prismaMock.driverProfile.findMany.mockResolvedValue([
+        {
+          id: 'driver-rank1',
+          userId: 'user-r1',
+          licenseNumber: 'GJ01-R1',
+          operationalStatus: 'AVAILABLE',
+          vehicles: [{ passengerCapacity: 4 }],
+        },
+      ]);
+
+      driversServiceMock.getDriverGpsFix.mockResolvedValue({
+        latitude: 23.153,
+        longitude: 72.665,
+      });
+
+      routingServiceMock.getTravelTimeMatrix.mockResolvedValue({
+        durations: [
+          [0, 60],
+          [60, 0],
+        ],
+        distances: [
+          [0, 500],
+          [500, 0],
+        ],
+        source: 'OSRM',
+        isFallback: false,
+      });
+
+      const attempt2Mock = {
+        id: 'attempt-uuid-2',
+        rideGroupId: mockGroupId,
+        groupVersion: 1,
+        attemptNumber: 2,
+        status: 'ACTIVE',
+      };
+
+      const offerMock = {
+        id: 'offer-uuid-2',
+        dispatchAttemptId: attempt2Mock.id,
+        rideGroupId: mockGroupId,
+        groupVersion: 1,
+        driverId: 'driver-rank1',
+        status: 'PENDING',
+        expiresAt: new Date(Date.now() + 20000),
+      };
+
+      prismaMock.$transaction.mockImplementation(async (cb: any) => {
+        const txMock = {
+          $queryRaw: vi.fn().mockResolvedValue([
+            {
+              id: mockGroupId,
+              status: 'READY_FOR_DISPATCH',
+              group_version: 1,
+              pickup_point_id: mockPickupPointId,
+            },
+          ]),
+          driverDispatchOffer: {
+            findFirst: vi.fn().mockResolvedValue(null),
+            create: vi.fn().mockResolvedValue(offerMock),
+          },
+          dispatchAttempt: {
+            findFirst: vi.fn().mockResolvedValue(null), // no active attempt in tx
+            count: vi.fn().mockResolvedValue(1), // 1 previous exhausted attempt exists!
+            create: vi.fn().mockResolvedValue(attempt2Mock),
+          },
+          rideGroup: {
+            update: vi.fn().mockResolvedValue({}),
+          },
+          outboxEvent: {
+            create: vi.fn().mockResolvedValue({}),
+          },
+        };
+        return cb(txMock);
+      });
+
+      const result = await service.initiateDispatchForGroup(mockGroupId);
+
+      expect(result.success).toBe(true);
+      expect(result.attemptId).toBe(attempt2Mock.id);
+      expect(result.offerId).toBe(offerMock.id);
+      expect(result.driverId).toBe('driver-rank1');
+    });
+
+    it('Scenario 2: fast-path idempotency should immediately return success when driver is already assigned to the group', async () => {
+      prismaMock.rideGroup.findUnique.mockResolvedValue({
+        id: mockGroupId,
+        status: 'DRIVER_ASSIGNED',
+        groupVersion: 1,
+        pickupPointId: mockPickupPointId,
+        members: [{ isActiveMember: true }, { isActiveMember: true }],
+      });
+
+      prismaMock.driverAssignment.findFirst.mockResolvedValue({
+        id: 'assignment-uuid-1',
+        rideGroupId: mockGroupId,
+        driverId: 'driver-assigned-1',
+        dispatchAttemptId: 'attempt-uuid-1',
+        status: 'RESERVED',
+      });
+
+      const result = await service.initiateDispatchForGroup(mockGroupId);
+
+      expect(result.success).toBe(true);
+      expect(result.isExistingAssignment).toBe(true);
+      expect(result.attemptId).toBe('attempt-uuid-1');
+      expect(result.driverId).toBe('driver-assigned-1');
+      // Candidate search and transaction must NOT be triggered
+      expect(prismaMock.driverProfile.findMany).not.toHaveBeenCalled();
+      expect(prismaMock.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('should return retryable ROUTING_UNAVAILABLE when OSRM routing fails during candidate ranking', async () => {
+      prismaMock.rideGroup.findUnique.mockResolvedValue({
+        id: mockGroupId,
+        status: 'READY_FOR_DISPATCH',
+        groupVersion: 1,
+        pickupPointId: mockPickupPointId,
+        members: [{ isActiveMember: true }, { isActiveMember: true }],
+      });
+
+      prismaMock.dispatchAttempt.findFirst.mockResolvedValue(null);
+      prismaMock.driverDispatchOffer.findFirst.mockResolvedValue(null);
+
+      prismaMock.driverProfile.findMany.mockResolvedValue([
+        {
+          id: 'driver-r1',
+          userId: 'user-r1',
+          licenseNumber: 'GJ01-R1',
+          operationalStatus: 'AVAILABLE',
+          vehicles: [{ passengerCapacity: 4 }],
+        },
+      ]);
+
+      driversServiceMock.getDriverGpsFix.mockResolvedValue({
+        latitude: 23.153,
+        longitude: 72.665,
+      });
+
+      routingServiceMock.getTravelTimeMatrix.mockRejectedValue(
+        new Error('OSRM connection refused'),
+      );
+
+      const result = await service.initiateDispatchForGroup(mockGroupId);
+
+      expect(result.success).toBe(false);
+      expect(result.reason).toBe('ROUTING_UNAVAILABLE');
+      expect(result.retryable).toBe(true);
+      // Attempt should NOT be marked EXHAUSTED on OSRM error
+      expect(prismaMock.dispatchAttempt.update).not.toHaveBeenCalled();
+      expect(prismaMock.driverDispatchOffer.create).not.toHaveBeenCalled();
+    });
+
     it('should atomically create attempt, offer, outbox event and schedule 20s delayed timeout job', async () => {
       prismaMock.rideGroup.findUnique.mockResolvedValue({
         id: mockGroupId,
@@ -699,10 +950,12 @@ describe('DispatchService - Unit Tests', () => {
       });
 
       prismaMock.driverDispatchOffer.create.mockImplementation(({ data }: any) => {
-        return Promise.resolve({
+        const created = {
           id: 'offer-created-1',
           ...data,
-        });
+        };
+        prismaMock.driverDispatchOffer.findUnique.mockResolvedValueOnce(created);
+        return Promise.resolve(created);
       });
 
       const result = await service.initiateDispatchForGroup(mockGroupId);
@@ -812,6 +1065,7 @@ describe('DispatchService - Unit Tests', () => {
               group_version: 1,
               dispatch_attempt_id: 'attempt-1',
               driver_id: mockDriverId,
+              expires_at: new Date(Date.now() - 5000),
             },
           ]);
         }
@@ -856,6 +1110,170 @@ describe('DispatchService - Unit Tests', () => {
       );
 
       initiateSpy.mockRestore();
+    });
+
+    it('should NOT expire offer when timeout job runs prematurely before expiresAt (rescheduling with remaining time)', async () => {
+      const prematureExpiresAt = new Date(Date.now() + 15000); // 15 seconds in future
+
+      prismaMock.$queryRaw.mockImplementation((query: any) => {
+        const text = Array.isArray(query) ? query.join(' ') : String(query);
+        if (text.includes('FROM ride_groups')) {
+          return Promise.resolve([{ id: mockGroupId, status: 'DISPATCHING', group_version: 1 }]);
+        }
+        if (text.includes('FROM driver_dispatch_offers')) {
+          return Promise.resolve([
+            {
+              id: mockOfferId,
+              status: 'PENDING',
+              group_version: 1,
+              dispatch_attempt_id: 'attempt-1',
+              driver_id: mockDriverId,
+              expires_at: prematureExpiresAt,
+            },
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+
+      prismaMock.dispatchAttempt.findUnique.mockResolvedValue({
+        id: 'attempt-1',
+        status: 'ACTIVE',
+      });
+
+      const result = await service.handleOfferTimeout({
+        offerId: mockOfferId,
+        rideGroupId: mockGroupId,
+        driverId: mockDriverId,
+        groupVersion: 1,
+        dispatchAttemptId: 'attempt-1',
+      });
+
+      // Must NOT expire and must NOT cascade
+      expect(result.expired).toBe(false);
+      expect(result.cascaded).toBe(false);
+      expect(result.reason).toBe('RESCHEDULED_EARLY_TIMEOUT');
+      expect(prismaMock.driverDispatchOffer.update).not.toHaveBeenCalled();
+
+      // Must reschedule with remaining delay
+      expect(dispatchQueueMock.add).toHaveBeenCalledWith(
+        DISPATCH_TIMEOUT_JOB_NAME,
+        expect.objectContaining({ offerId: mockOfferId }),
+        expect.objectContaining({
+          delay: expect.any(Number),
+        }),
+      );
+    });
+
+    it('should skip timeout if dispatch attempt id does not match (stale attempt no-op)', async () => {
+      prismaMock.$queryRaw.mockImplementation((query: any) => {
+        const text = Array.isArray(query) ? query.join(' ') : String(query);
+        if (text.includes('FROM ride_groups')) {
+          return Promise.resolve([{ id: mockGroupId, status: 'DISPATCHING', group_version: 1 }]);
+        }
+        if (text.includes('FROM driver_dispatch_offers')) {
+          return Promise.resolve([
+            {
+              id: mockOfferId,
+              status: 'PENDING',
+              group_version: 1,
+              dispatch_attempt_id: 'attempt-2', // Offer belongs to attempt-2
+              driver_id: mockDriverId,
+              expires_at: new Date(Date.now() - 1000),
+            },
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+
+      prismaMock.dispatchAttempt.findUnique.mockResolvedValue({
+        id: 'attempt-1', // Job was for attempt-1
+        status: 'ACTIVE',
+      });
+
+      const result = await service.handleOfferTimeout({
+        offerId: mockOfferId,
+        rideGroupId: mockGroupId,
+        driverId: mockDriverId,
+        groupVersion: 1,
+        dispatchAttemptId: 'attempt-1',
+      });
+
+      expect(result.expired).toBe(false);
+      expect(result.cascaded).toBe(false);
+      expect(result.reason).toBe('STALE_DISPATCH_ATTEMPT');
+      expect(prismaMock.driverDispatchOffer.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('scheduleOfferTimeout', () => {
+    it('should throw NotFoundException if offer does not exist in database', async () => {
+      prismaMock.driverDispatchOffer.findUnique.mockResolvedValue(null);
+
+      await expect(
+        service.scheduleOfferTimeout('non-existent-offer'),
+      ).rejects.toThrow(NotFoundException);
+    });
+
+    it('should skip queueing if offer is already terminal (ACCEPTED)', async () => {
+      prismaMock.driverDispatchOffer.findUnique.mockResolvedValue({
+        id: mockOfferId,
+        status: 'ACCEPTED',
+      });
+
+      const result = await service.scheduleOfferTimeout(mockOfferId);
+
+      expect(result.scheduled).toBe(false);
+      expect(result.reason).toBe('OFFER_STATUS_ACCEPTED');
+      expect(dispatchQueueMock.add).not.toHaveBeenCalled();
+    });
+
+    it('should successfully enqueue BullMQ job with deterministic ID and remaining delay when offer is PENDING', async () => {
+      const expiresAt = new Date(Date.now() + 18000);
+      prismaMock.driverDispatchOffer.findUnique.mockResolvedValue({
+        id: mockOfferId,
+        rideGroupId: mockGroupId,
+        driverId: mockDriverId,
+        groupVersion: 1,
+        dispatchAttemptId: 'attempt-1',
+        status: 'PENDING',
+        expiresAt,
+      });
+
+      const result = await service.scheduleOfferTimeout(mockOfferId);
+
+      expect(result.scheduled).toBe(true);
+      expect(dispatchQueueMock.add).toHaveBeenCalledWith(
+        DISPATCH_TIMEOUT_JOB_NAME,
+        {
+          offerId: mockOfferId,
+          rideGroupId: mockGroupId,
+          driverId: mockDriverId,
+          groupVersion: 1,
+          dispatchAttemptId: 'attempt-1',
+        },
+        expect.objectContaining({
+          delay: expect.any(Number),
+          jobId: `dispatch-timeout-${mockOfferId}`,
+        }),
+      );
+    });
+
+    it('should propagate error when dispatchQueue.add throws (leaves outbox event retryable)', async () => {
+      prismaMock.driverDispatchOffer.findUnique.mockResolvedValue({
+        id: mockOfferId,
+        rideGroupId: mockGroupId,
+        driverId: mockDriverId,
+        groupVersion: 1,
+        dispatchAttemptId: 'attempt-1',
+        status: 'PENDING',
+        expiresAt: new Date(Date.now() + 20000),
+      });
+
+      dispatchQueueMock.add.mockRejectedValueOnce(new Error('Redis connection severed'));
+
+      await expect(
+        service.scheduleOfferTimeout(mockOfferId),
+      ).rejects.toThrow('Redis connection severed');
     });
   });
 
@@ -987,6 +1405,170 @@ describe('DispatchService - Unit Tests', () => {
 
       expect(initiateSpy).toHaveBeenCalledWith(mockGroupId);
       initiateSpy.mockRestore();
+    });
+
+    it('should NOT expire offer when timeout job runs prematurely before expiresAt (rescheduling with remaining time)', async () => {
+      const prematureExpiresAt = new Date(Date.now() + 15000); // 15 seconds in future
+
+      prismaMock.$queryRaw.mockImplementation((query: any) => {
+        const text = Array.isArray(query) ? query.join(' ') : String(query);
+        if (text.includes('FROM ride_groups')) {
+          return Promise.resolve([{ id: mockGroupId, status: 'DISPATCHING', group_version: 1 }]);
+        }
+        if (text.includes('FROM driver_dispatch_offers')) {
+          return Promise.resolve([
+            {
+              id: mockOfferId,
+              status: 'PENDING',
+              group_version: 1,
+              dispatch_attempt_id: 'attempt-1',
+              driver_id: mockDriverId,
+              expires_at: prematureExpiresAt,
+            },
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+
+      prismaMock.dispatchAttempt.findUnique.mockResolvedValue({
+        id: 'attempt-1',
+        status: 'ACTIVE',
+      });
+
+      const result = await service.handleOfferTimeout({
+        offerId: mockOfferId,
+        rideGroupId: mockGroupId,
+        driverId: mockDriverId,
+        groupVersion: 1,
+        dispatchAttemptId: 'attempt-1',
+      });
+
+      // Must NOT expire and must NOT cascade
+      expect(result.expired).toBe(false);
+      expect(result.cascaded).toBe(false);
+      expect(result.reason).toBe('RESCHEDULED_EARLY_TIMEOUT');
+      expect(prismaMock.driverDispatchOffer.update).not.toHaveBeenCalled();
+
+      // Must reschedule with remaining delay
+      expect(dispatchQueueMock.add).toHaveBeenCalledWith(
+        DISPATCH_TIMEOUT_JOB_NAME,
+        expect.objectContaining({ offerId: mockOfferId }),
+        expect.objectContaining({
+          delay: expect.any(Number),
+        }),
+      );
+    });
+
+    it('should skip timeout if dispatch attempt id does not match (stale attempt no-op)', async () => {
+      prismaMock.$queryRaw.mockImplementation((query: any) => {
+        const text = Array.isArray(query) ? query.join(' ') : String(query);
+        if (text.includes('FROM ride_groups')) {
+          return Promise.resolve([{ id: mockGroupId, status: 'DISPATCHING', group_version: 1 }]);
+        }
+        if (text.includes('FROM driver_dispatch_offers')) {
+          return Promise.resolve([
+            {
+              id: mockOfferId,
+              status: 'PENDING',
+              group_version: 1,
+              dispatch_attempt_id: 'attempt-2', // Offer belongs to attempt-2
+              driver_id: mockDriverId,
+              expires_at: new Date(Date.now() - 1000),
+            },
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+
+      prismaMock.dispatchAttempt.findUnique.mockResolvedValue({
+        id: 'attempt-1', // Job was for attempt-1
+        status: 'ACTIVE',
+      });
+
+      const result = await service.handleOfferTimeout({
+        offerId: mockOfferId,
+        rideGroupId: mockGroupId,
+        driverId: mockDriverId,
+        groupVersion: 1,
+        dispatchAttemptId: 'attempt-1',
+      });
+
+      expect(result.expired).toBe(false);
+      expect(result.cascaded).toBe(false);
+      expect(result.reason).toBe('STALE_DISPATCH_ATTEMPT');
+      expect(prismaMock.driverDispatchOffer.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('scheduleOfferTimeout', () => {
+    it('should throw NotFoundException if offer does not exist in database', async () => {
+      prismaMock.driverDispatchOffer.findUnique.mockResolvedValue(null);
+
+      await expect(
+        service.scheduleOfferTimeout('non-existent-offer'),
+      ).rejects.toThrow(NotFoundException);
+    });
+
+    it('should skip queueing if offer is already terminal (ACCEPTED)', async () => {
+      prismaMock.driverDispatchOffer.findUnique.mockResolvedValue({
+        id: mockOfferId,
+        status: 'ACCEPTED',
+      });
+
+      const result = await service.scheduleOfferTimeout(mockOfferId);
+
+      expect(result.scheduled).toBe(false);
+      expect(result.reason).toBe('OFFER_STATUS_ACCEPTED');
+      expect(dispatchQueueMock.add).not.toHaveBeenCalled();
+    });
+
+    it('should successfully enqueue BullMQ job with deterministic ID and remaining delay when offer is PENDING', async () => {
+      const expiresAt = new Date(Date.now() + 18000);
+      prismaMock.driverDispatchOffer.findUnique.mockResolvedValue({
+        id: mockOfferId,
+        rideGroupId: mockGroupId,
+        driverId: mockDriverId,
+        groupVersion: 1,
+        dispatchAttemptId: 'attempt-1',
+        status: 'PENDING',
+        expiresAt,
+      });
+
+      const result = await service.scheduleOfferTimeout(mockOfferId);
+
+      expect(result.scheduled).toBe(true);
+      expect(dispatchQueueMock.add).toHaveBeenCalledWith(
+        DISPATCH_TIMEOUT_JOB_NAME,
+        {
+          offerId: mockOfferId,
+          rideGroupId: mockGroupId,
+          driverId: mockDriverId,
+          groupVersion: 1,
+          dispatchAttemptId: 'attempt-1',
+        },
+        expect.objectContaining({
+          delay: expect.any(Number),
+          jobId: `dispatch-timeout-${mockOfferId}`,
+        }),
+      );
+    });
+
+    it('should propagate error when dispatchQueue.add throws (leaves outbox event retryable)', async () => {
+      prismaMock.driverDispatchOffer.findUnique.mockResolvedValue({
+        id: mockOfferId,
+        rideGroupId: mockGroupId,
+        driverId: mockDriverId,
+        groupVersion: 1,
+        dispatchAttemptId: 'attempt-1',
+        status: 'PENDING',
+        expiresAt: new Date(Date.now() + 20000),
+      });
+
+      dispatchQueueMock.add.mockRejectedValueOnce(new Error('Redis connection severed'));
+
+      await expect(
+        service.scheduleOfferTimeout(mockOfferId),
+      ).rejects.toThrow('Redis connection severed');
     });
   });
 

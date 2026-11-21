@@ -606,5 +606,103 @@ void main() {
       expect(provider.hasLoaded, isTrue);
       expect(provider.isLoading, isFalse);
     });
+
+    test('superseded refresh: new loadDashboard for same user properly resets obsolete refresh state and allows future refreshes', () async {
+      final repo = ControllableDriverRepository();
+      final provider = DriverHomeProvider(driverRepository: repo);
+
+      const initialVehicle = DriverVehicle(
+        id: 'veh-initial',
+        driverProfileId: 'dp-user-1',
+        registrationNumber: 'GJ-01-INIT',
+        vehicleType: 'E_RICKSHAW',
+        passengerCapacity: 4,
+        makeModel: 'Initial Model',
+        isActive: true,
+      );
+
+      // Initialize dashboard for user-1
+      final initialRepo = FakeDriverRepository(vehiclesResponse: [initialVehicle]);
+      await provider.loadDashboard(
+        verificationStatus: 'PENDING',
+        userId: 'user-1',
+        repository: initialRepo,
+      );
+      expect(provider.vehicles, equals([initialVehicle]));
+      expect(provider.hasLoaded, isTrue);
+
+      // 1. Start a refresh for user-1 with a pending Completer
+      final refreshCompleter = Completer<List<DriverVehicle>>();
+      repo.vehiclesCompleter = refreshCompleter;
+
+      final refreshFuture = provider.refreshDashboard(
+        verificationStatus: 'PENDING',
+        userId: 'user-1',
+        repository: repo,
+      );
+      expect(provider.isRefreshing, isTrue);
+
+      // 2. Start a new dashboard load for the SAME user before refresh completes
+      const loadedVehicle = DriverVehicle(
+        id: 'veh-loaded',
+        driverProfileId: 'dp-user-1',
+        registrationNumber: 'GJ-01-LOADED',
+        vehicleType: 'E_RICKSHAW',
+        passengerCapacity: 4,
+        makeModel: 'Loaded Model',
+        isActive: true,
+      );
+      final loadRepo = FakeDriverRepository(vehiclesResponse: [loadedVehicle]);
+
+      // 3. Complete the new load
+      await provider.loadDashboard(
+        verificationStatus: 'PENDING',
+        userId: 'user-1',
+        repository: loadRepo,
+      );
+
+      expect(provider.isLoading, isFalse);
+      expect(provider.isRefreshing, isFalse);
+      expect(provider.vehicles, equals([loadedVehicle]));
+
+      // 4. Complete the old refresh with stale data
+      refreshCompleter.complete([
+        const DriverVehicle(
+          id: 'veh-stale',
+          driverProfileId: 'dp-user-1',
+          registrationNumber: 'GJ-01-STALE',
+          vehicleType: 'E_RICKSHAW',
+          passengerCapacity: 4,
+          makeModel: 'Stale Model',
+          isActive: true,
+        ),
+      ]);
+      await refreshFuture;
+
+      // 5. Verify isRefreshing remains false and state is preserved
+      expect(provider.isRefreshing, isFalse);
+      expect(provider.vehicles, equals([loadedVehicle]));
+
+      // 6. Verify a subsequent refreshDashboard() call succeeds normally
+      const subsequentVehicle = DriverVehicle(
+        id: 'veh-subsequent',
+        driverProfileId: 'dp-user-1',
+        registrationNumber: 'GJ-01-SUBS',
+        vehicleType: 'E_RICKSHAW',
+        passengerCapacity: 4,
+        makeModel: 'Subsequent Model',
+        isActive: true,
+      );
+      final subsequentRepo = FakeDriverRepository(vehiclesResponse: [subsequentVehicle]);
+
+      await provider.refreshDashboard(
+        verificationStatus: 'PENDING',
+        userId: 'user-1',
+        repository: subsequentRepo,
+      );
+
+      expect(provider.isRefreshing, isFalse);
+      expect(provider.vehicles, equals([subsequentVehicle]));
+    });
   });
 }

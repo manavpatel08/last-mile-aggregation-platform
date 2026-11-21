@@ -156,6 +156,7 @@ class DriverHomeProvider extends ChangeNotifier {
     final requestUser = _currentUserId;
 
     _isLoading = true;
+    _isRefreshing = false;
     _error = null;
     notifyListeners();
 

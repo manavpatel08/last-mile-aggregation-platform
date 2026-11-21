@@ -1,6 +1,8 @@
 export const SUPPORTED_OUTBOX_EVENT_TYPES = [
   'GROUP_FORMED',
   'DISPATCH_OFFER_CREATED',
+  'DISPATCH_OFFER_REJECTED',
+  'DISPATCH_OFFER_EXPIRED',
 ] as const;
 
 export type SupportedOutboxEventType =
@@ -26,6 +28,25 @@ export interface DispatchOfferCreatedPayload {
   expiresAt?: string;
 }
 
+export interface DispatchOfferRejectedPayload {
+  offerId: string;
+  rideGroupId: string;
+  driverId: string;
+  groupVersion: number;
+  dispatchAttemptId: string;
+  reason?: string | null;
+  rejectedAt?: string;
+}
+
+export interface DispatchOfferExpiredPayload {
+  offerId: string;
+  rideGroupId: string;
+  driverId: string;
+  groupVersion: number;
+  dispatchAttemptId: string;
+  expiredAt?: string;
+}
+
 export interface OutboxProcessingSummary {
   processedCount: number;
   publishedCount: number;
@@ -33,6 +54,8 @@ export interface OutboxProcessingSummary {
   retriedCount: number;
   groupFormedHandledCount: number;
   dispatchOfferCreatedHandledCount?: number;
+  dispatchOfferRejectedHandledCount?: number;
+  dispatchOfferExpiredHandledCount?: number;
 }
 
 export interface OutboxClaimedRow {

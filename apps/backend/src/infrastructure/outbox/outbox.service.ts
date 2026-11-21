@@ -11,6 +11,8 @@ import { DispatchService } from '../../modules/dispatch/dispatch.service.js';
 import {
   GroupFormedPayload,
   DispatchOfferCreatedPayload,
+  DispatchOfferRejectedPayload,
+  DispatchOfferExpiredPayload,
   OutboxClaimedRow,
   OutboxProcessingSummary,
   SUPPORTED_OUTBOX_EVENT_TYPES,
@@ -146,6 +148,153 @@ export class OutboxService {
         dispatchAttemptId:
           typeof p.dispatchAttemptId === 'string' ? p.dispatchAttemptId : undefined,
         expiresAt: typeof p.expiresAt === 'string' ? p.expiresAt : undefined,
+      },
+    };
+  }
+
+  /**
+   * Validates the payload of a DISPATCH_OFFER_REJECTED domain event.
+   */
+  validateDispatchOfferRejectedPayload(
+    payload: unknown,
+    aggregateId: string,
+  ): { valid: boolean; error?: string; data?: DispatchOfferRejectedPayload } {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      return {
+        valid: false,
+        error: 'DISPATCH_OFFER_REJECTED payload must be a non-null object',
+      };
+    }
+
+    const p = payload as Record<string, unknown>;
+
+    if (typeof p.offerId !== 'string' || !UUID_REGEX.test(p.offerId)) {
+      return {
+        valid: false,
+        error: 'DISPATCH_OFFER_REJECTED payload missing valid offerId UUID',
+      };
+    }
+
+    if (p.offerId !== aggregateId) {
+      return {
+        valid: false,
+        error: `DISPATCH_OFFER_REJECTED payload offerId (${p.offerId}) does not match aggregateId (${aggregateId})`,
+      };
+    }
+
+    if (typeof p.rideGroupId !== 'string' || !UUID_REGEX.test(p.rideGroupId)) {
+      return {
+        valid: false,
+        error: 'DISPATCH_OFFER_REJECTED payload missing valid rideGroupId UUID',
+      };
+    }
+
+    if (
+      typeof p.dispatchAttemptId !== 'string' ||
+      !UUID_REGEX.test(p.dispatchAttemptId)
+    ) {
+      return {
+        valid: false,
+        error:
+          'DISPATCH_OFFER_REJECTED payload missing valid dispatchAttemptId UUID',
+      };
+    }
+
+    if (
+      typeof p.groupVersion !== 'number' ||
+      !Number.isInteger(p.groupVersion) ||
+      p.groupVersion < 1
+    ) {
+      return {
+        valid: false,
+        error:
+          'DISPATCH_OFFER_REJECTED payload missing valid positive groupVersion',
+      };
+    }
+
+    return {
+      valid: true,
+      data: {
+        offerId: p.offerId,
+        rideGroupId: p.rideGroupId,
+        driverId: typeof p.driverId === 'string' ? p.driverId : '',
+        groupVersion: p.groupVersion,
+        dispatchAttemptId: p.dispatchAttemptId,
+        reason: typeof p.reason === 'string' ? p.reason : null,
+        rejectedAt: typeof p.rejectedAt === 'string' ? p.rejectedAt : undefined,
+      },
+    };
+  }
+
+  /**
+   * Validates the payload of a DISPATCH_OFFER_EXPIRED domain event.
+   */
+  validateDispatchOfferExpiredPayload(
+    payload: unknown,
+    aggregateId: string,
+  ): { valid: boolean; error?: string; data?: DispatchOfferExpiredPayload } {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      return {
+        valid: false,
+        error: 'DISPATCH_OFFER_EXPIRED payload must be a non-null object',
+      };
+    }
+
+    const p = payload as Record<string, unknown>;
+
+    if (typeof p.offerId !== 'string' || !UUID_REGEX.test(p.offerId)) {
+      return {
+        valid: false,
+        error: 'DISPATCH_OFFER_EXPIRED payload missing valid offerId UUID',
+      };
+    }
+
+    if (p.offerId !== aggregateId) {
+      return {
+        valid: false,
+        error: `DISPATCH_OFFER_EXPIRED payload offerId (${p.offerId}) does not match aggregateId (${aggregateId})`,
+      };
+    }
+
+    if (typeof p.rideGroupId !== 'string' || !UUID_REGEX.test(p.rideGroupId)) {
+      return {
+        valid: false,
+        error: 'DISPATCH_OFFER_EXPIRED payload missing valid rideGroupId UUID',
+      };
+    }
+
+    if (
+      typeof p.dispatchAttemptId !== 'string' ||
+      !UUID_REGEX.test(p.dispatchAttemptId)
+    ) {
+      return {
+        valid: false,
+        error:
+          'DISPATCH_OFFER_EXPIRED payload missing valid dispatchAttemptId UUID',
+      };
+    }
+
+    if (
+      typeof p.groupVersion !== 'number' ||
+      !Number.isInteger(p.groupVersion) ||
+      p.groupVersion < 1
+    ) {
+      return {
+        valid: false,
+        error:
+          'DISPATCH_OFFER_EXPIRED payload missing valid positive groupVersion',
+      };
+    }
+
+    return {
+      valid: true,
+      data: {
+        offerId: p.offerId,
+        rideGroupId: p.rideGroupId,
+        driverId: typeof p.driverId === 'string' ? p.driverId : '',
+        groupVersion: p.groupVersion,
+        dispatchAttemptId: p.dispatchAttemptId,
+        expiredAt: typeof p.expiredAt === 'string' ? p.expiredAt : undefined,
       },
     };
   }
@@ -411,10 +560,68 @@ export class OutboxService {
             continue;
           }
 
-          const scheduleResult =
-            await this.dispatchService.scheduleOfferTimeout(
-              validation.data!.offerId,
+          let scheduleResult;
+          try {
+            scheduleResult =
+              await this.dispatchService.scheduleOfferTimeout(
+                validation.data!.offerId,
+              );
+          } catch (err: any) {
+            this.logger.warn(
+              `Timeout scheduling failed for offer ${validation.data!.offerId}: ${err?.message}; leaving outbox event retryable`,
             );
+            const nextRetry = row.retry_count + 1;
+            const isTerminal = nextRetry >= MAX_OUTBOX_RETRIES;
+
+            await this.prisma.outboxEvent.update({
+              where: { id: row.id },
+              data: {
+                status: isTerminal ? 'FAILED' : 'PENDING',
+                retryCount: nextRetry,
+                lastError: err?.message || 'QUEUE_NOT_AVAILABLE',
+                publishedAt: new Date(),
+              },
+            });
+
+            if (isTerminal) {
+              summary.failedCount++;
+            } else {
+              summary.retriedCount++;
+            }
+            continue;
+          }
+
+          if (!scheduleResult.scheduled) {
+            if (scheduleResult.reason?.startsWith('OFFER_STATUS_')) {
+              this.logger.log(
+                `Timeout scheduling skipped for terminal offer ${validation.data!.offerId} (${scheduleResult.reason}); marking outbox event PUBLISHED`,
+              );
+            } else {
+              // Unscheduled pending offer: keep event retryable, never mark PUBLISHED
+              this.logger.warn(
+                `Offer ${validation.data!.offerId} timeout was not scheduled (${scheduleResult.reason}); leaving outbox event retryable`,
+              );
+              const nextRetry = row.retry_count + 1;
+              const isTerminal = nextRetry >= MAX_OUTBOX_RETRIES;
+
+              await this.prisma.outboxEvent.update({
+                where: { id: row.id },
+                data: {
+                  status: isTerminal ? 'FAILED' : 'PENDING',
+                  retryCount: nextRetry,
+                  lastError: scheduleResult.reason || 'TIMEOUT_NOT_SCHEDULED',
+                  publishedAt: new Date(),
+                },
+              });
+
+              if (isTerminal) {
+                summary.failedCount++;
+              } else {
+                summary.retriedCount++;
+              }
+              continue;
+            }
+          }
 
           this.logger.log(
             `Durable timeout scheduling for offer ${validation.data!.offerId} via outbox event ${row.id}: scheduled=${scheduleResult.scheduled}, reason=${scheduleResult.reason ?? 'ENQUEUED'}`,
@@ -433,6 +640,284 @@ export class OutboxService {
           summary.publishedCount++;
           summary.dispatchOfferCreatedHandledCount =
             (summary.dispatchOfferCreatedHandledCount ?? 0) + 1;
+        } else if (
+          (row.event_type === 'DISPATCH_OFFER_REJECTED' ||
+            row.event_type === 'DISPATCH_OFFER_EXPIRED') &&
+          row.aggregate_type === 'DRIVER_DISPATCH_OFFER'
+        ) {
+          const isRejection = row.event_type === 'DISPATCH_OFFER_REJECTED';
+          const validation = isRejection
+            ? this.validateDispatchOfferRejectedPayload(
+                row.payload,
+                row.aggregate_id,
+              )
+            : this.validateDispatchOfferExpiredPayload(
+                row.payload,
+                row.aggregate_id,
+              );
+
+          if (!validation.valid) {
+            this.logger.error(
+              `Outbox event ${row.id} rejected: ${validation.error}`,
+            );
+            await this.prisma.outboxEvent.update({
+              where: { id: row.id },
+              data: {
+                status: 'FAILED',
+                lastError: validation.error,
+                publishedAt: new Date(),
+              },
+            });
+            summary.failedCount++;
+            continue;
+          }
+
+          const { offerId, rideGroupId, groupVersion, dispatchAttemptId } =
+            validation.data!;
+
+          // 1. Verify offer exists in PostgreSQL and is in expected terminal state
+          const offer = await this.prisma.driverDispatchOffer.findUnique({
+            where: { id: offerId },
+          });
+
+          if (!offer) {
+            this.logger.error(
+              `Offer ${offerId} referenced by outbox event ${row.id} not found in database`,
+            );
+            await this.prisma.outboxEvent.update({
+              where: { id: row.id },
+              data: {
+                status: 'FAILED',
+                lastError: `Offer ${offerId} not found in database`,
+                publishedAt: new Date(),
+              },
+            });
+            summary.failedCount++;
+            continue;
+          }
+
+          const expectedStatus = isRejection ? 'REJECTED' : 'EXPIRED';
+          if (offer.status !== expectedStatus) {
+            this.logger.warn(
+              `Offer ${offerId} status is '${offer.status}', expected '${expectedStatus}' for outbox event ${row.id}; skipping cascade`,
+            );
+            await this.prisma.outboxEvent.update({
+              where: { id: row.id },
+              data: {
+                status: 'PUBLISHED',
+                publishedAt: new Date(),
+                lastError: null,
+              },
+            });
+            summary.publishedCount++;
+            continue;
+          }
+
+          // 2. Verify ride group is still relevant for this group version
+          const group = await this.prisma.rideGroup.findUnique({
+            where: { id: rideGroupId },
+          });
+
+          if (!group) {
+            this.logger.error(
+              `Ride group ${rideGroupId} referenced by outbox event ${row.id} not found`,
+            );
+            await this.prisma.outboxEvent.update({
+              where: { id: row.id },
+              data: {
+                status: 'FAILED',
+                lastError: `Ride group ${rideGroupId} not found`,
+                publishedAt: new Date(),
+              },
+            });
+            summary.failedCount++;
+            continue;
+          }
+
+          if (group.groupVersion !== groupVersion) {
+            this.logger.log(
+              `Group ${rideGroupId} version changed (${group.groupVersion} vs ${groupVersion}); acknowledging stale cascade event ${row.id}`,
+            );
+            await this.prisma.outboxEvent.update({
+              where: { id: row.id },
+              data: {
+                status: 'PUBLISHED',
+                publishedAt: new Date(),
+                lastError: null,
+              },
+            });
+            summary.publishedCount++;
+            continue;
+          }
+
+          if (
+            ['CANCELLED', 'DISSOLVED', 'COMPLETED'].includes(group.status)
+          ) {
+            this.logger.log(
+              `Group ${rideGroupId} is in terminal status '${group.status}'; acknowledging cascade event ${row.id}`,
+            );
+            await this.prisma.outboxEvent.update({
+              where: { id: row.id },
+              data: {
+                status: 'PUBLISHED',
+                publishedAt: new Date(),
+                lastError: null,
+              },
+            });
+            summary.publishedCount++;
+            continue;
+          }
+
+          // 3. Check whether a subsequent dispatch outcome already exists
+          const activeAssignment =
+            await this.prisma.driverAssignment.findFirst({
+              where: {
+                rideGroupId,
+                status: { in: ['RESERVED', 'ACTIVE', 'COMPLETED'] },
+              },
+            });
+
+          const pendingOffer =
+            await this.prisma.driverDispatchOffer.findFirst({
+              where: {
+                rideGroupId,
+                status: 'PENDING',
+              },
+            });
+
+          const subsequentOfferInAttempt =
+            await this.prisma.driverDispatchOffer.findFirst({
+              where: {
+                dispatchAttemptId,
+                id: { not: offerId },
+                offeredAt: { gt: offer.offeredAt },
+              },
+            });
+
+          const attempt = await this.prisma.dispatchAttempt.findUnique({
+            where: { id: dispatchAttemptId },
+          });
+
+          if (
+            activeAssignment ||
+            pendingOffer ||
+            subsequentOfferInAttempt ||
+            attempt?.status === 'EXHAUSTED'
+          ) {
+            this.logger.log(
+              `Subsequent dispatch outcome already exists for group ${rideGroupId} (v${groupVersion}): assignment=${activeAssignment?.id ?? 'none'}, pendingOffer=${pendingOffer?.id ?? 'none'}, subsequentOffer=${subsequentOfferInAttempt?.id ?? 'none'}, attemptStatus=${attempt?.status ?? 'none'}; acknowledging cascade event ${row.id}`,
+            );
+            await this.prisma.outboxEvent.update({
+              where: { id: row.id },
+              data: {
+                status: 'PUBLISHED',
+                publishedAt: new Date(),
+                lastError: null,
+              },
+            });
+            summary.publishedCount++;
+            if (isRejection) {
+              summary.dispatchOfferRejectedHandledCount =
+                (summary.dispatchOfferRejectedHandledCount ?? 0) + 1;
+            } else {
+              summary.dispatchOfferExpiredHandledCount =
+                (summary.dispatchOfferExpiredHandledCount ?? 0) + 1;
+            }
+            continue;
+          }
+
+          // 4. Trigger sequential cascade dispatch
+          this.logger.log(
+            `Triggering durable next-driver cascade dispatch for group ${rideGroupId} via outbox event ${row.id} (${row.event_type})`,
+          );
+
+          let dispatchResult;
+          try {
+            dispatchResult =
+              await this.dispatchService.initiateDispatchForGroup(rideGroupId);
+          } catch (err: any) {
+            this.logger.warn(
+              `Cascade dispatch exception for group ${rideGroupId} via outbox event ${row.id}: ${err?.message}; leaving retryable`,
+            );
+            const nextRetry = row.retry_count + 1;
+            const isTerminal = nextRetry >= MAX_OUTBOX_RETRIES;
+
+            await this.prisma.outboxEvent.update({
+              where: { id: row.id },
+              data: {
+                status: isTerminal ? 'FAILED' : 'PENDING',
+                retryCount: nextRetry,
+                lastError: err?.message || 'CASCADE_DISPATCH_FAILED',
+                publishedAt: new Date(),
+              },
+            });
+
+            if (isTerminal) {
+              summary.failedCount++;
+            } else {
+              summary.retriedCount++;
+            }
+            continue;
+          }
+
+          if (!dispatchResult.success) {
+            if (dispatchResult.reason === 'INVALID_GROUP_STATUS') {
+              await this.prisma.outboxEvent.update({
+                where: { id: row.id },
+                data: {
+                  status: 'PUBLISHED',
+                  publishedAt: new Date(),
+                  lastError: null,
+                },
+              });
+              summary.publishedCount++;
+              continue;
+            }
+
+            // Retryable dispatch condition (e.g. ROUTING_UNAVAILABLE, FLEET_EXHAUSTED)
+            this.logger.warn(
+              `Cascade dispatch for group ${rideGroupId} could not complete (${dispatchResult.reason}): ${dispatchResult.message}; leaving outbox event retryable`,
+            );
+
+            const nextRetry = row.retry_count + 1;
+            const isTerminal = nextRetry >= MAX_OUTBOX_RETRIES;
+
+            await this.prisma.outboxEvent.update({
+              where: { id: row.id },
+              data: {
+                status: isTerminal ? 'FAILED' : 'PENDING',
+                retryCount: nextRetry,
+                lastError: dispatchResult.message || dispatchResult.reason,
+                publishedAt: new Date(),
+              },
+            });
+
+            if (isTerminal) {
+              summary.failedCount++;
+            } else {
+              summary.retriedCount++;
+            }
+            continue;
+          }
+
+          // Cascade succeeded: mark outbox event PUBLISHED
+          await this.prisma.outboxEvent.update({
+            where: { id: row.id },
+            data: {
+              status: 'PUBLISHED',
+              publishedAt: new Date(),
+              lastError: null,
+            },
+          });
+
+          summary.publishedCount++;
+          if (isRejection) {
+            summary.dispatchOfferRejectedHandledCount =
+              (summary.dispatchOfferRejectedHandledCount ?? 0) + 1;
+          } else {
+            summary.dispatchOfferExpiredHandledCount =
+              (summary.dispatchOfferExpiredHandledCount ?? 0) + 1;
+          }
         } else {
           // Unsupported or unhandled event type: DO NOT mark PUBLISHED!
           this.logger.debug(

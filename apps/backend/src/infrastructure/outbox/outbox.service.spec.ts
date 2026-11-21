@@ -1,4 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
+import { ServiceUnavailableException } from '@nestjs/common';
 import { OutboxService } from './outbox.service.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { DispatchService } from '../../modules/dispatch/dispatch.service.js';
@@ -11,6 +12,7 @@ describe('OutboxService', () => {
   const validGroupId = '11111111-1111-4111-a111-111111111111';
   const validPickupPointId = '22222222-2222-4222-a222-222222222222';
   const validOfferId = '33333333-3333-4333-a333-333333333333';
+  const validAttemptId = '55555555-5555-4555-a555-555555555555';
 
   beforeEach(() => {
     prismaMock = {
@@ -35,6 +37,13 @@ describe('OutboxService', () => {
         findUnique: vi.fn().mockResolvedValue({
           id: validGroupId,
           status: 'READY_FOR_DISPATCH',
+          groupVersion: 1,
+        }),
+      },
+      dispatchAttempt: {
+        findUnique: vi.fn().mockResolvedValue({
+          id: validAttemptId,
+          status: 'ACTIVE',
         }),
       },
     };
@@ -159,6 +168,86 @@ describe('OutboxService', () => {
       );
       expect(result.valid).toBe(false);
       expect(result.error).toContain('does not match aggregateId');
+    });
+  });
+
+  describe('validateDispatchOfferRejectedPayload', () => {
+    it('should validate a correct DISPATCH_OFFER_REJECTED payload', () => {
+      const payload = {
+        offerId: validOfferId,
+        rideGroupId: validGroupId,
+        driverId: 'driver-1',
+        groupVersion: 1,
+        dispatchAttemptId: validAttemptId,
+        reason: 'DRIVER_DECLINED',
+        rejectedAt: new Date().toISOString(),
+      };
+
+      const result = service.validateDispatchOfferRejectedPayload(payload, validOfferId);
+      expect(result.valid).toBe(true);
+      expect(result.data?.offerId).toBe(validOfferId);
+      expect(result.data?.dispatchAttemptId).toBe(validAttemptId);
+    });
+
+    it('should reject non-object or null payload', () => {
+      expect(service.validateDispatchOfferRejectedPayload(null, validOfferId).valid).toBe(false);
+      expect(service.validateDispatchOfferRejectedPayload('string', validOfferId).valid).toBe(false);
+    });
+
+    it('should reject payload when offerId is missing or does not match aggregateId', () => {
+      expect(
+        service.validateDispatchOfferRejectedPayload(
+          { offerId: 'invalid-uuid', rideGroupId: validGroupId, dispatchAttemptId: validAttemptId, groupVersion: 1 },
+          validOfferId,
+        ).valid,
+      ).toBe(false);
+
+      expect(
+        service.validateDispatchOfferRejectedPayload(
+          { offerId: validOfferId, rideGroupId: validGroupId, dispatchAttemptId: validAttemptId, groupVersion: 1 },
+          '99999999-9999-4999-a999-999999999999',
+        ).valid,
+      ).toBe(false);
+    });
+
+    it('should reject payload when dispatchAttemptId is missing or not a UUID', () => {
+      const result = service.validateDispatchOfferRejectedPayload(
+        { offerId: validOfferId, rideGroupId: validGroupId, dispatchAttemptId: 'not-a-uuid', groupVersion: 1 },
+        validOfferId,
+      );
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain('missing valid dispatchAttemptId UUID');
+    });
+  });
+
+  describe('validateDispatchOfferExpiredPayload', () => {
+    it('should validate a correct DISPATCH_OFFER_EXPIRED payload', () => {
+      const payload = {
+        offerId: validOfferId,
+        rideGroupId: validGroupId,
+        driverId: 'driver-1',
+        groupVersion: 1,
+        dispatchAttemptId: validAttemptId,
+        expiredAt: new Date().toISOString(),
+      };
+
+      const result = service.validateDispatchOfferExpiredPayload(payload, validOfferId);
+      expect(result.valid).toBe(true);
+      expect(result.data?.offerId).toBe(validOfferId);
+      expect(result.data?.dispatchAttemptId).toBe(validAttemptId);
+    });
+
+    it('should reject non-object or null payload', () => {
+      expect(service.validateDispatchOfferExpiredPayload(null, validOfferId).valid).toBe(false);
+    });
+
+    it('should reject payload when dispatchAttemptId is missing or not a UUID', () => {
+      const result = service.validateDispatchOfferExpiredPayload(
+        { offerId: validOfferId, rideGroupId: validGroupId, dispatchAttemptId: 'not-a-uuid', groupVersion: 1 },
+        validOfferId,
+      );
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain('missing valid dispatchAttemptId UUID');
     });
   });
 
@@ -671,6 +760,343 @@ describe('OutboxService', () => {
         where: { id: mockEvent.id },
         data: expect.objectContaining({
           status: 'PUBLISHED',
+        }),
+      });
+    });
+
+    it('Fix 2: should NOT mark DISPATCH_OFFER_CREATED as PUBLISHED if queue is not configured (leaves event retryable)', async () => {
+      const mockEvent = {
+        id: 'event-uuid-offer-no-queue',
+        event_type: 'DISPATCH_OFFER_CREATED',
+        aggregate_type: 'DRIVER_DISPATCH_OFFER',
+        aggregate_id: validOfferId,
+        payload: {
+          offerId: validOfferId,
+          rideGroupId: validGroupId,
+          driverId: 'driver-1',
+          groupVersion: 1,
+        },
+        retry_count: 0,
+      };
+
+      prismaMock.$transaction.mockImplementation(async (cb: any) => {
+        const txMock = {
+          $queryRaw: vi.fn().mockResolvedValue([mockEvent]),
+          $executeRaw: vi.fn().mockResolvedValue(1),
+        };
+        return cb(txMock);
+      });
+
+      dispatchServiceMock.scheduleOfferTimeout.mockRejectedValueOnce(
+        new ServiceUnavailableException({
+          errorCode: 'QUEUE_NOT_AVAILABLE',
+          message: 'Dispatch queue not configured; cannot schedule timeout for pending offer',
+        }),
+      );
+
+      const summary = await service.processPendingEvents();
+
+      expect(summary.publishedCount).toBe(0);
+      expect(summary.retriedCount).toBe(1);
+      expect(prismaMock.outboxEvent.update).toHaveBeenCalledWith({
+        where: { id: mockEvent.id },
+        data: expect.objectContaining({
+          status: 'PENDING',
+          retryCount: 1,
+          lastError: expect.stringContaining('Dispatch queue not configured'),
+        }),
+      });
+    });
+
+    it('Fix 1: Rejection -> cascade fails due to OSRM outage -> OSRM recovers -> next offer created', async () => {
+      const mockEvent = {
+        id: 'event-uuid-reject-cascade',
+        event_type: 'DISPATCH_OFFER_REJECTED',
+        aggregate_type: 'DRIVER_DISPATCH_OFFER',
+        aggregate_id: validOfferId,
+        payload: {
+          offerId: validOfferId,
+          rideGroupId: validGroupId,
+          driverId: 'driver-1',
+          groupVersion: 1,
+          dispatchAttemptId: validAttemptId,
+        },
+        retry_count: 0,
+      };
+
+      prismaMock.$transaction.mockImplementation(async (cb: any) => {
+        const txMock = {
+          $queryRaw: vi.fn().mockResolvedValue([mockEvent]),
+          $executeRaw: vi.fn().mockResolvedValue(1),
+        };
+        return cb(txMock);
+      });
+
+      prismaMock.driverDispatchOffer.findUnique.mockResolvedValue({
+        id: validOfferId,
+        status: 'REJECTED',
+        offeredAt: new Date(Date.now() - 5000),
+      });
+
+      // No existing subsequent offer or assignment
+      prismaMock.driverAssignment.findFirst.mockResolvedValue(null);
+      prismaMock.driverDispatchOffer.findFirst.mockResolvedValue(null);
+
+      // 1. Initial attempt: OSRM is down
+      dispatchServiceMock.initiateDispatchForGroup.mockResolvedValueOnce({
+        success: false,
+        reason: 'ROUTING_UNAVAILABLE',
+        retryable: true,
+        message: 'OSRM routing engine unavailable',
+      });
+
+      const summary1 = await service.processPendingEvents();
+
+      expect(summary1.publishedCount).toBe(0);
+      expect(summary1.retriedCount).toBe(1);
+      expect(prismaMock.outboxEvent.update).toHaveBeenCalledWith({
+        where: { id: mockEvent.id },
+        data: expect.objectContaining({
+          status: 'PENDING',
+          retryCount: 1,
+          lastError: expect.stringContaining('OSRM routing engine unavailable'),
+        }),
+      });
+
+      // 2. Retry attempt: OSRM recovers, cascade succeeds
+      dispatchServiceMock.initiateDispatchForGroup.mockResolvedValueOnce({
+        success: true,
+        offerId: 'next-offer-uuid-2',
+        driverId: 'driver-rank2',
+      });
+
+      const summary2 = await service.processPendingEvents();
+
+      expect(summary2.publishedCount).toBe(1);
+      expect(summary2.dispatchOfferRejectedHandledCount).toBe(1);
+      expect(prismaMock.outboxEvent.update).toHaveBeenCalledWith({
+        where: { id: mockEvent.id },
+        data: expect.objectContaining({
+          status: 'PUBLISHED',
+          lastError: null,
+        }),
+      });
+    });
+
+    it('Fix 1: Expiry -> cascade fails temporarily -> subsequent retry succeeds', async () => {
+      const mockEvent = {
+        id: 'event-uuid-expire-cascade',
+        event_type: 'DISPATCH_OFFER_EXPIRED',
+        aggregate_type: 'DRIVER_DISPATCH_OFFER',
+        aggregate_id: validOfferId,
+        payload: {
+          offerId: validOfferId,
+          rideGroupId: validGroupId,
+          driverId: 'driver-1',
+          groupVersion: 1,
+          dispatchAttemptId: validAttemptId,
+        },
+        retry_count: 0,
+      };
+
+      prismaMock.$transaction.mockImplementation(async (cb: any) => {
+        const txMock = {
+          $queryRaw: vi.fn().mockResolvedValue([mockEvent]),
+          $executeRaw: vi.fn().mockResolvedValue(1),
+        };
+        return cb(txMock);
+      });
+
+      prismaMock.driverDispatchOffer.findUnique.mockResolvedValue({
+        id: validOfferId,
+        status: 'EXPIRED',
+        offeredAt: new Date(Date.now() - 25000),
+      });
+
+      prismaMock.driverAssignment.findFirst.mockResolvedValue(null);
+      prismaMock.driverDispatchOffer.findFirst.mockResolvedValue(null);
+
+      // 1. Initial attempt: dispatch fails temporarily
+      dispatchServiceMock.initiateDispatchForGroup.mockRejectedValueOnce(
+        new ServiceUnavailableException('ROUTING_UNAVAILABLE'),
+      );
+
+      const summary1 = await service.processPendingEvents();
+
+      expect(summary1.publishedCount).toBe(0);
+      expect(summary1.retriedCount).toBe(1);
+
+      // 2. Retry succeeds
+      dispatchServiceMock.initiateDispatchForGroup.mockResolvedValueOnce({
+        success: true,
+        offerId: 'next-offer-uuid-3',
+        driverId: 'driver-rank3',
+      });
+
+      const summary2 = await service.processPendingEvents();
+
+      expect(summary2.publishedCount).toBe(1);
+      expect(summary2.dispatchOfferExpiredHandledCount).toBe(1);
+      expect(prismaMock.outboxEvent.update).toHaveBeenCalledWith({
+        where: { id: mockEvent.id },
+        data: expect.objectContaining({
+          status: 'PUBLISHED',
+          lastError: null,
+        }),
+      });
+    });
+
+    it('Fix 1: Duplicate rejection-event delivery does not create duplicate offers or attempts', async () => {
+      const mockEvent = {
+        id: 'event-uuid-reject-dup',
+        event_type: 'DISPATCH_OFFER_REJECTED',
+        aggregate_type: 'DRIVER_DISPATCH_OFFER',
+        aggregate_id: validOfferId,
+        payload: {
+          offerId: validOfferId,
+          rideGroupId: validGroupId,
+          driverId: 'driver-1',
+          groupVersion: 1,
+          dispatchAttemptId: validAttemptId,
+        },
+        retry_count: 0,
+      };
+
+      prismaMock.$transaction.mockImplementation(async (cb: any) => {
+        const txMock = {
+          $queryRaw: vi.fn().mockResolvedValue([mockEvent]),
+          $executeRaw: vi.fn().mockResolvedValue(1),
+        };
+        return cb(txMock);
+      });
+
+      prismaMock.driverDispatchOffer.findUnique.mockResolvedValue({
+        id: validOfferId,
+        status: 'REJECTED',
+        offeredAt: new Date(Date.now() - 5000),
+      });
+
+      // A pending offer was ALREADY created for this group (e.g. by direct cascade or earlier delivery)
+      prismaMock.driverDispatchOffer.findFirst.mockResolvedValue({
+        id: 'next-offer-uuid-already-active',
+        rideGroupId: validGroupId,
+        status: 'PENDING',
+      });
+
+      const summary = await service.processPendingEvents();
+
+      // Must acknowledge event WITHOUT calling dispatch again
+      expect(dispatchServiceMock.initiateDispatchForGroup).not.toHaveBeenCalled();
+      expect(summary.publishedCount).toBe(1);
+      expect(prismaMock.outboxEvent.update).toHaveBeenCalledWith({
+        where: { id: mockEvent.id },
+        data: expect.objectContaining({
+          status: 'PUBLISHED',
+          lastError: null,
+        }),
+      });
+    });
+
+    it('Fix 1: Duplicate expiry-event delivery does not create duplicate offers or attempts', async () => {
+      const mockEvent = {
+        id: 'event-uuid-expire-dup',
+        event_type: 'DISPATCH_OFFER_EXPIRED',
+        aggregate_type: 'DRIVER_DISPATCH_OFFER',
+        aggregate_id: validOfferId,
+        payload: {
+          offerId: validOfferId,
+          rideGroupId: validGroupId,
+          driverId: 'driver-1',
+          groupVersion: 1,
+          dispatchAttemptId: validAttemptId,
+        },
+        retry_count: 0,
+      };
+
+      prismaMock.$transaction.mockImplementation(async (cb: any) => {
+        const txMock = {
+          $queryRaw: vi.fn().mockResolvedValue([mockEvent]),
+          $executeRaw: vi.fn().mockResolvedValue(1),
+        };
+        return cb(txMock);
+      });
+
+      prismaMock.driverDispatchOffer.findUnique.mockResolvedValue({
+        id: validOfferId,
+        status: 'EXPIRED',
+        offeredAt: new Date(Date.now() - 25000),
+      });
+
+      // Driver was already assigned to the group
+      prismaMock.driverAssignment.findFirst.mockResolvedValue({
+        id: 'assignment-uuid-1',
+        rideGroupId: validGroupId,
+        status: 'RESERVED',
+      });
+
+      const summary = await service.processPendingEvents();
+
+      // Must acknowledge event WITHOUT calling dispatch again
+      expect(dispatchServiceMock.initiateDispatchForGroup).not.toHaveBeenCalled();
+      expect(summary.publishedCount).toBe(1);
+      expect(prismaMock.outboxEvent.update).toHaveBeenCalledWith({
+        where: { id: mockEvent.id },
+        data: expect.objectContaining({
+          status: 'PUBLISHED',
+          lastError: null,
+        }),
+      });
+    });
+
+    it('Fix 1: Worker crash after next offer creation but before event acknowledgement is recovered safely', async () => {
+      const mockEvent = {
+        id: 'event-uuid-crash-recovery',
+        event_type: 'DISPATCH_OFFER_REJECTED',
+        aggregate_type: 'DRIVER_DISPATCH_OFFER',
+        aggregate_id: validOfferId,
+        payload: {
+          offerId: validOfferId,
+          rideGroupId: validGroupId,
+          driverId: 'driver-1',
+          groupVersion: 1,
+          dispatchAttemptId: validAttemptId,
+        },
+        retry_count: 0,
+      };
+
+      prismaMock.$transaction.mockImplementation(async (cb: any) => {
+        const txMock = {
+          $queryRaw: vi.fn().mockResolvedValue([mockEvent]),
+          $executeRaw: vi.fn().mockResolvedValue(1),
+        };
+        return cb(txMock);
+      });
+
+      const originalOfferDate = new Date(Date.now() - 10000);
+      prismaMock.driverDispatchOffer.findUnique.mockResolvedValue({
+        id: validOfferId,
+        status: 'REJECTED',
+        offeredAt: originalOfferDate,
+      });
+
+      // Next offer was committed in DB before the crash occurred
+      prismaMock.driverAssignment.findFirst.mockResolvedValue(null);
+      prismaMock.driverDispatchOffer.findFirst.mockResolvedValue({
+        id: 'subsequent-offer-uuid',
+        dispatchAttemptId: validAttemptId,
+        offeredAt: new Date(Date.now() - 5000),
+      });
+
+      const summary = await service.processPendingEvents();
+
+      // Recognizes subsequent offer in attempt, publishes event without creating duplicates
+      expect(dispatchServiceMock.initiateDispatchForGroup).not.toHaveBeenCalled();
+      expect(summary.publishedCount).toBe(1);
+      expect(prismaMock.outboxEvent.update).toHaveBeenCalledWith({
+        where: { id: mockEvent.id },
+        data: expect.objectContaining({
+          status: 'PUBLISHED',
+          lastError: null,
         }),
       });
     });

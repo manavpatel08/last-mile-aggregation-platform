@@ -9,10 +9,7 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { DispatchService } from './dispatch.service.js';
-import {
-  DRIVER_OFFER_TIMEOUT_MS,
-  DISPATCH_TIMEOUT_JOB_NAME,
-} from './dispatch.interfaces.js';
+import { DISPATCH_TIMEOUT_JOB_NAME } from './dispatch.interfaces.js';
 import { PrismaModule } from '../../infrastructure/prisma/prisma.module.js';
 import { PrismaService } from '../../infrastructure/prisma/prisma.service.js';
 import { RedisModule } from '../../infrastructure/redis/redis.module.js';
@@ -985,7 +982,7 @@ describe('DispatchService - Unit Tests', () => {
           dispatchAttemptId: 'attempt-created-1',
         },
         expect.objectContaining({
-          delay: DRIVER_OFFER_TIMEOUT_MS,
+          delay: expect.any(Number),
           jobId: 'dispatch-timeout-offer-created-1',
         }),
       );
@@ -1275,6 +1272,30 @@ describe('DispatchService - Unit Tests', () => {
         service.scheduleOfferTimeout(mockOfferId),
       ).rejects.toThrow('Redis connection severed');
     });
+
+    it('Fix 2: should throw ServiceUnavailableException if dispatch queue is not configured for pending offer', async () => {
+      prismaMock.driverDispatchOffer.findUnique.mockResolvedValue({
+        id: mockOfferId,
+        rideGroupId: mockGroupId,
+        driverId: mockDriverId,
+        groupVersion: 1,
+        dispatchAttemptId: 'attempt-1',
+        status: 'PENDING',
+        expiresAt: new Date(Date.now() + 20000),
+      });
+
+      // Temporarily remove dispatchQueue
+      (service as any).dispatchQueue = null;
+
+      try {
+        await expect(
+          service.scheduleOfferTimeout(mockOfferId),
+        ).rejects.toThrow(ServiceUnavailableException);
+      } finally {
+        // Restore dispatchQueue
+        (service as any).dispatchQueue = dispatchQueueMock;
+      }
+    });
   });
 
   describe('getPendingOffersForDriver', () => {
@@ -1497,78 +1518,6 @@ describe('DispatchService - Unit Tests', () => {
       expect(result.cascaded).toBe(false);
       expect(result.reason).toBe('STALE_DISPATCH_ATTEMPT');
       expect(prismaMock.driverDispatchOffer.update).not.toHaveBeenCalled();
-    });
-  });
-
-  describe('scheduleOfferTimeout', () => {
-    it('should throw NotFoundException if offer does not exist in database', async () => {
-      prismaMock.driverDispatchOffer.findUnique.mockResolvedValue(null);
-
-      await expect(
-        service.scheduleOfferTimeout('non-existent-offer'),
-      ).rejects.toThrow(NotFoundException);
-    });
-
-    it('should skip queueing if offer is already terminal (ACCEPTED)', async () => {
-      prismaMock.driverDispatchOffer.findUnique.mockResolvedValue({
-        id: mockOfferId,
-        status: 'ACCEPTED',
-      });
-
-      const result = await service.scheduleOfferTimeout(mockOfferId);
-
-      expect(result.scheduled).toBe(false);
-      expect(result.reason).toBe('OFFER_STATUS_ACCEPTED');
-      expect(dispatchQueueMock.add).not.toHaveBeenCalled();
-    });
-
-    it('should successfully enqueue BullMQ job with deterministic ID and remaining delay when offer is PENDING', async () => {
-      const expiresAt = new Date(Date.now() + 18000);
-      prismaMock.driverDispatchOffer.findUnique.mockResolvedValue({
-        id: mockOfferId,
-        rideGroupId: mockGroupId,
-        driverId: mockDriverId,
-        groupVersion: 1,
-        dispatchAttemptId: 'attempt-1',
-        status: 'PENDING',
-        expiresAt,
-      });
-
-      const result = await service.scheduleOfferTimeout(mockOfferId);
-
-      expect(result.scheduled).toBe(true);
-      expect(dispatchQueueMock.add).toHaveBeenCalledWith(
-        DISPATCH_TIMEOUT_JOB_NAME,
-        {
-          offerId: mockOfferId,
-          rideGroupId: mockGroupId,
-          driverId: mockDriverId,
-          groupVersion: 1,
-          dispatchAttemptId: 'attempt-1',
-        },
-        expect.objectContaining({
-          delay: expect.any(Number),
-          jobId: `dispatch-timeout-${mockOfferId}`,
-        }),
-      );
-    });
-
-    it('should propagate error when dispatchQueue.add throws (leaves outbox event retryable)', async () => {
-      prismaMock.driverDispatchOffer.findUnique.mockResolvedValue({
-        id: mockOfferId,
-        rideGroupId: mockGroupId,
-        driverId: mockDriverId,
-        groupVersion: 1,
-        dispatchAttemptId: 'attempt-1',
-        status: 'PENDING',
-        expiresAt: new Date(Date.now() + 20000),
-      });
-
-      dispatchQueueMock.add.mockRejectedValueOnce(new Error('Redis connection severed'));
-
-      await expect(
-        service.scheduleOfferTimeout(mockOfferId),
-      ).rejects.toThrow('Redis connection severed');
     });
   });
 

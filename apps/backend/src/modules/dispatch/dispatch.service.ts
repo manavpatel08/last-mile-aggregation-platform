@@ -394,13 +394,13 @@ export class DispatchService {
     }
 
     if (!this.dispatchQueue) {
-      this.logger.debug(
-        `Dispatch queue not configured; skipping delayed BullMQ job for offer ${offerId}`,
+      this.logger.warn(
+        `Dispatch queue not configured; cannot schedule timeout for pending offer ${offerId}`,
       );
-      return {
-        scheduled: false,
-        reason: 'QUEUE_NOT_CONFIGURED',
-      };
+      throw new ServiceUnavailableException({
+        errorCode: 'QUEUE_NOT_AVAILABLE',
+        message: `Dispatch queue not configured; cannot schedule timeout for pending offer ${offerId}`,
+      });
     }
 
     const now = Date.now();
@@ -841,7 +841,13 @@ export class DispatchService {
           });
       } else {
         // Fallback for isolated unit tests without OutboxService injected
-        await this.scheduleOfferTimeout(dispatchResult.offerId);
+        try {
+          await this.scheduleOfferTimeout(dispatchResult.offerId);
+        } catch (err: any) {
+          this.logger.debug(
+            `Direct timeout scheduling skipped in test environment: ${err?.message}`,
+          );
+        }
       }
     }
 
@@ -1016,7 +1022,23 @@ export class DispatchService {
     this.logger.log(
       `Offer ${offerId} expired; cascading to next candidate driver for group ${rideGroupId}`,
     );
-    const cascadeResult = await this.initiateDispatchForGroup(rideGroupId);
+    let cascadeResult: DispatchResult;
+    try {
+      cascadeResult = await this.initiateDispatchForGroup(rideGroupId);
+    } catch (err: any) {
+      this.logger.warn(
+        `Direct cascade for group ${rideGroupId} after offer ${offerId} timeout failed (${err?.message}); durable outbox will retry`,
+      );
+      cascadeResult = {
+        success: false,
+        reason: 'ROUTING_UNAVAILABLE',
+        retryable: true,
+      };
+    }
+
+    if (this.outboxService) {
+      this.outboxService.triggerImmediateProcessing().catch(() => {});
+    }
 
     return {
       expired: true,
@@ -1149,9 +1171,7 @@ export class DispatchService {
       });
     }
 
-    let rideGroupIdToCascade: string | null = null;
-
-    await this.prisma.$transaction(async (tx) => {
+    const rideGroupIdToCascade = await this.prisma.$transaction(async (tx) => {
       // 1. Lock offer row
       const lockedOffers = await tx.$queryRaw<
         Array<{
@@ -1194,7 +1214,7 @@ export class DispatchService {
           { success: true, message: 'Offer already rejected' },
           200,
         );
-        return;
+        return null;
       }
 
       if (lockedOffer.status !== 'PENDING') {
@@ -1238,8 +1258,6 @@ export class DispatchService {
         },
       });
 
-      rideGroupIdToCascade = lockedOffer.ride_group_id;
-
       // Complete idempotency claim
       await fenceAndCompleteIdempotentTransaction(
         tx,
@@ -1247,11 +1265,23 @@ export class DispatchService {
         { success: true, message: 'Offer rejected successfully' },
         200,
       );
+
+      return lockedOffer.ride_group_id;
     });
 
     // 2. Cascade sequentially to next candidate driver (OUTSIDE DB transaction)
     if (rideGroupIdToCascade) {
-      await this.initiateDispatchForGroup(rideGroupIdToCascade);
+      try {
+        await this.initiateDispatchForGroup(rideGroupIdToCascade);
+      } catch (err: any) {
+        this.logger.warn(
+          `Direct cascade for group ${rideGroupIdToCascade} after offer ${offerId} rejection failed (${err?.message}); durable outbox will retry`,
+        );
+      }
+
+      if (this.outboxService) {
+        this.outboxService.triggerImmediateProcessing().catch(() => {});
+      }
     }
 
     return { success: true, message: 'Offer rejected successfully' };

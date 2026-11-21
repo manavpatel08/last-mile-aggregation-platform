@@ -203,11 +203,12 @@ class DriverDispatchOffer {
       id: offerId,
       groupId: rideGroupId,
       pickupLocationName: pickupPoint.name,
-      dropoffLocationName: 'Gandhinagar Drop-off Corridor ($passengerCount riders)',
+      dropoffLocationName: null,
       passengerCount: passengerCount,
       estimatedEarnings: fareFormatted,
       estimatedDistance: distanceKm,
       status: effectiveStatus,
+      remainingSeconds: remainingSeconds,
     );
   }
 

@@ -146,5 +146,46 @@ void main() {
       expect(() => AcceptOfferResponse.fromJson({...validJson, 'passengerCount': 'nan'}), throwsFormatException);
       expect(() => AcceptOfferResponse.fromJson({...validJson, 'navigationRoute': 'not-map'}), throwsFormatException);
     });
+
+    test('throws FormatException on missing or malformed navigationRoute geometry and stops', () {
+      // Missing geometry
+      expect(
+        () => AcceptOfferResponse.fromJson({
+          ...validJson,
+          'navigationRoute': {'stops': []},
+        }),
+        throwsFormatException,
+      );
+
+      // Missing stops
+      expect(
+        () => AcceptOfferResponse.fromJson({
+          ...validJson,
+          'navigationRoute': {'geometry': {}},
+        }),
+        throwsFormatException,
+      );
+
+      // Non-list stops
+      expect(
+        () => AcceptOfferResponse.fromJson({
+          ...validJson,
+          'navigationRoute': {'geometry': {}, 'stops': 'not-a-list'},
+        }),
+        throwsFormatException,
+      );
+
+      // Non-map stop item
+      expect(
+        () => AcceptOfferResponse.fromJson({
+          ...validJson,
+          'navigationRoute': {
+            'geometry': {},
+            'stops': ['not-a-map'],
+          },
+        }),
+        throwsFormatException,
+      );
+    });
   });
 }

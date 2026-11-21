@@ -630,6 +630,46 @@ void main() {
       );
     });
 
+    test('acceptOffer throws ApiException INVALID_RESPONSE on missing navigationRoute geometry', () async {
+      final adapter = _FakeAdapter((options) async {
+        return _jsonResponse({
+          'success': true,
+          'data': {
+            'assignmentId': 'asgn-456',
+            'tripId': 'trip-789',
+            'rideGroupId': 'grp-123',
+            'passengerCount': 3,
+            'totalEstimatedFare': '48.00',
+            'navigationRoute': {
+              // Missing geometry!
+              'stops': [],
+            },
+          },
+        });
+      });
+
+      final apiClient = ApiClient(
+        config: testConfig,
+        tokenProvider: () async => 'driver-access-token',
+        httpClientAdapter: adapter,
+        enableDebugLogging: false,
+      );
+
+      final repository = ApiDriverRepository(apiClient: apiClient);
+
+      await expectLater(
+        repository.acceptOffer(
+          offerId: 'off-123',
+          idempotencyKey: 'idemp-uuid-1234',
+        ),
+        throwsA(
+          isA<ApiException>()
+              .having((e) => e.errorCode, 'errorCode', 'INVALID_RESPONSE')
+              .having((e) => e.message, 'message', contains('Malformed accept offer response')),
+        ),
+      );
+    });
+
     test('rejectOffer sends POST request with Idempotency-Key and optional reason', () async {
       final adapter = _FakeAdapter((options) async {
         expect(options.method, 'POST');

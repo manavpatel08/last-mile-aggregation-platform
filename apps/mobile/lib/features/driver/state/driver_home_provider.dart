@@ -1,8 +1,10 @@
+import 'dart:async';
 import 'package:flutter/widgets.dart';
 import 'package:uuid/uuid.dart';
 
 import '../../../core/network/api_exception.dart';
 import '../data/driver_repository.dart';
+import '../models/driver_dispatch_offer.dart';
 import '../models/driver_status_response.dart';
 import '../models/driver_vehicle.dart';
 import '../presentation/models/dispatch_offer_item.dart';
@@ -27,10 +29,12 @@ class DriverHomeProvider extends ChangeNotifier {
   DriverHomeProvider({
     this.driverRepository,
     DriverLocationTracker? locationTracker,
+    this.enableCountdownTimer = true,
   }) : _locationTracker = locationTracker ?? const NoOpDriverLocationTracker();
 
   final DriverRepository? driverRepository;
   final DriverLocationTracker _locationTracker;
+  final bool enableCountdownTimer;
 
   final List<DriverPlaceholderItem> _sections = const [
     DriverPlaceholderItem(
@@ -55,6 +59,16 @@ class DriverHomeProvider extends ChangeNotifier {
 
   List<DriverPlaceholderItem> get sections => _sections;
 
+  // Session Tracking (increments on clear/logout/account switch)
+  int _sessionGeneration = 0;
+  String? _currentUserId;
+
+  // Independent Request Tracking Generations (decoupled concurrency)
+  int _dashboardRequestGeneration = 0;
+  int _offersRequestGeneration = 0;
+  int _statusMutationGeneration = 0;
+  int _actionRequestGeneration = 0;
+
   // Readiness Dashboard State
   bool _isLoading = false;
   bool _isRefreshing = false;
@@ -62,17 +76,21 @@ class DriverHomeProvider extends ChangeNotifier {
   DriverStatusResponse? _status;
   List<DriverVehicle> _vehicles = const [];
   bool _hasLoaded = false;
-  String? _currentUserId;
-  int _requestGeneration = 0;
 
-  // Availability & Dispatch Offers State (TASK-009 Phase 2)
+  // Availability State
   bool _isUpdatingStatus = false;
   String? _statusUpdateError;
+
+  // Dispatch Offers State (TASK-009 Phase 2)
   DispatchInboxState _inboxState = DispatchInboxState.disconnected;
   List<DispatchOfferItem> _offers = const [];
   String? _offersError;
+  String? _actionSuccessMessage;
   bool _isProcessingAction = false;
   final Map<String, String> _offerIdempotencyKeys = {};
+
+  // Presentation Countdown Timer
+  Timer? _countdownTimer;
 
   bool get isLoading => _isLoading;
   bool get isRefreshing => _isRefreshing;
@@ -92,16 +110,29 @@ class DriverHomeProvider extends ChangeNotifier {
   DispatchInboxState get inboxState => _inboxState;
   List<DispatchOfferItem> get offers => _offers;
   String? get offersError => _offersError;
+  String? get actionSuccessMessage => _actionSuccessMessage;
   bool get isProcessingAction => _isProcessingAction;
 
   @visibleForTesting
   DriverLocationTracker get locationTracker => _locationTracker;
 
   @visibleForTesting
-  int get requestGeneration => _requestGeneration;
+  int get sessionGeneration => _sessionGeneration;
 
-  bool _isCurrentRequest(int generation, String? userId) {
-    return generation == _requestGeneration && userId == _currentUserId;
+  @visibleForTesting
+  int get requestGeneration => _sessionGeneration;
+
+  @visibleForTesting
+  int get dashboardRequestGeneration => _dashboardRequestGeneration;
+
+  @visibleForTesting
+  int get offersRequestGeneration => _offersRequestGeneration;
+
+  @visibleForTesting
+  int get actionRequestGeneration => _actionRequestGeneration;
+
+  bool _isCurrentSession(int sessionGen, String? userId) {
+    return sessionGen == _sessionGeneration && userId == _currentUserId;
   }
 
   String get statusSummary {
@@ -114,10 +145,14 @@ class DriverHomeProvider extends ChangeNotifier {
 
   /// Clears all user-session, dashboard, availability, and dispatch offer state across logout or account switch.
   ///
-  /// Increments [_requestGeneration] so all in-flight asynchronous operations
-  /// from the previous account session are immediately invalidated.
+  /// Increments [_sessionGeneration] and all operation generations so in-flight
+  /// asynchronous operations from the previous account session are completely dropped.
   void clear() {
-    _requestGeneration++;
+    _sessionGeneration++;
+    _dashboardRequestGeneration++;
+    _offersRequestGeneration++;
+    _statusMutationGeneration++;
+    _actionRequestGeneration++;
     _currentUserId = null;
     _isLoading = false;
     _isRefreshing = false;
@@ -130,18 +165,21 @@ class DriverHomeProvider extends ChangeNotifier {
     _inboxState = DispatchInboxState.disconnected;
     _offers = const [];
     _offersError = null;
+    _actionSuccessMessage = null;
     _isProcessingAction = false;
     _offerIdempotencyKeys.clear();
+    _cancelCountdownTimer();
     _locationTracker.stopTracking();
     notifyListeners();
   }
 
   /// Resets dashboard state specifically for a new user ID.
-  ///
-  /// Increments [_requestGeneration] so all in-flight asynchronous operations
-  /// from the previous account session are immediately invalidated.
   void clearForUser(String? userId) {
-    _requestGeneration++;
+    _sessionGeneration++;
+    _dashboardRequestGeneration++;
+    _offersRequestGeneration++;
+    _statusMutationGeneration++;
+    _actionRequestGeneration++;
     _currentUserId = userId;
     _isLoading = false;
     _isRefreshing = false;
@@ -154,8 +192,10 @@ class DriverHomeProvider extends ChangeNotifier {
     _inboxState = DispatchInboxState.disconnected;
     _offers = const [];
     _offersError = null;
+    _actionSuccessMessage = null;
     _isProcessingAction = false;
     _offerIdempotencyKeys.clear();
+    _cancelCountdownTimer();
     _locationTracker.stopTracking();
     notifyListeners();
   }
@@ -184,30 +224,16 @@ class DriverHomeProvider extends ChangeNotifier {
     }
 
     if (userId != null && userId != _currentUserId) {
-      _requestGeneration++;
-      _currentUserId = userId;
-      _status = null;
-      _vehicles = const [];
-      _error = null;
-      _hasLoaded = false;
-      _isLoading = false;
-      _isRefreshing = false;
-      _isUpdatingStatus = false;
-      _statusUpdateError = null;
-      _inboxState = DispatchInboxState.disconnected;
-      _offers = const [];
-      _offersError = null;
-      _isProcessingAction = false;
-      _offerIdempotencyKeys.clear();
-      _locationTracker.stopTracking();
+      clearForUser(userId);
     } else if (userId != null) {
       _currentUserId = userId;
     }
 
     if (_isLoading) return;
 
-    final requestGen = ++_requestGeneration;
-    final requestUser = _currentUserId;
+    final sessionGen = _sessionGeneration;
+    final sessionUser = _currentUserId;
+    final requestGen = ++_dashboardRequestGeneration;
 
     _isLoading = true;
     _isRefreshing = false;
@@ -222,16 +248,24 @@ class DriverHomeProvider extends ChangeNotifier {
           repo.getDriverStatus(),
           repo.getVehicles(),
         ]);
-        if (!_isCurrentRequest(requestGen, requestUser)) return;
+        if (!_isCurrentSession(sessionGen, sessionUser) ||
+            requestGen != _dashboardRequestGeneration) {
+          return;
+        }
         _status = results[0] as DriverStatusResponse;
         _vehicles = results[1] as List<DriverVehicle>;
 
         // Coordinate online foreground location reporting and offers
         if (_status!.isOnline) {
           _locationTracker.startTracking(repository: repo);
-          await _fetchOffersInternal(repo: repo, requestGen: requestGen, requestUser: requestUser);
+          await _fetchOffersInternal(
+            repo: repo,
+            sessionGen: sessionGen,
+            sessionUser: sessionUser,
+          );
         } else {
           _locationTracker.stopTracking();
+          _cancelCountdownTimer();
           _inboxState = DispatchInboxState.disconnected;
           _offers = const [];
         }
@@ -239,22 +273,30 @@ class DriverHomeProvider extends ChangeNotifier {
         // For non-approved drivers:
         // Never call the approval-protected operational-status endpoint!
         final fetchedVehicles = await repo.getVehicles();
-        if (!_isCurrentRequest(requestGen, requestUser)) return;
+        if (!_isCurrentSession(sessionGen, sessionUser) ||
+            requestGen != _dashboardRequestGeneration) {
+          return;
+        }
         _status = null;
         _vehicles = fetchedVehicles;
         _locationTracker.stopTracking();
+        _cancelCountdownTimer();
         _inboxState = DispatchInboxState.disconnected;
         _offers = const [];
       }
       _error = null;
       _hasLoaded = true;
     } catch (e) {
-      if (!_isCurrentRequest(requestGen, requestUser)) return;
+      if (!_isCurrentSession(sessionGen, sessionUser) ||
+          requestGen != _dashboardRequestGeneration) {
+        return;
+      }
       _error = e is ApiException
           ? e.message
           : 'Failed to load driver dashboard: ${e.toString()}';
     } finally {
-      if (_isCurrentRequest(requestGen, requestUser)) {
+      if (_isCurrentSession(sessionGen, sessionUser) &&
+          requestGen == _dashboardRequestGeneration) {
         _isLoading = false;
         notifyListeners();
       }
@@ -270,30 +312,16 @@ class DriverHomeProvider extends ChangeNotifier {
     final repo = repository ?? driverRepository;
 
     if (userId != null && userId != _currentUserId) {
-      _requestGeneration++;
-      _currentUserId = userId;
-      _status = null;
-      _vehicles = const [];
-      _error = null;
-      _hasLoaded = false;
-      _isLoading = false;
-      _isRefreshing = false;
-      _isUpdatingStatus = false;
-      _statusUpdateError = null;
-      _inboxState = DispatchInboxState.disconnected;
-      _offers = const [];
-      _offersError = null;
-      _isProcessingAction = false;
-      _offerIdempotencyKeys.clear();
-      _locationTracker.stopTracking();
+      clearForUser(userId);
     } else if (userId != null) {
       _currentUserId = userId;
     }
 
     if (repo == null || _isRefreshing || _isLoading) return;
 
-    final requestGen = ++_requestGeneration;
-    final requestUser = _currentUserId;
+    final sessionGen = _sessionGeneration;
+    final sessionUser = _currentUserId;
+    final requestGen = ++_dashboardRequestGeneration;
 
     _isRefreshing = true;
     notifyListeners();
@@ -306,36 +334,52 @@ class DriverHomeProvider extends ChangeNotifier {
           repo.getDriverStatus(),
           repo.getVehicles(),
         ]);
-        if (!_isCurrentRequest(requestGen, requestUser)) return;
+        if (!_isCurrentSession(sessionGen, sessionUser) ||
+            requestGen != _dashboardRequestGeneration) {
+          return;
+        }
         _status = results[0] as DriverStatusResponse;
         _vehicles = results[1] as List<DriverVehicle>;
 
         if (_status!.isOnline) {
           _locationTracker.startTracking(repository: repo);
-          await _fetchOffersInternal(repo: repo, requestGen: requestGen, requestUser: requestUser);
+          await _fetchOffersInternal(
+            repo: repo,
+            sessionGen: sessionGen,
+            sessionUser: sessionUser,
+          );
         } else {
           _locationTracker.stopTracking();
+          _cancelCountdownTimer();
           _inboxState = DispatchInboxState.disconnected;
           _offers = const [];
         }
       } else {
         final updatedVehicles = await repo.getVehicles();
-        if (!_isCurrentRequest(requestGen, requestUser)) return;
+        if (!_isCurrentSession(sessionGen, sessionUser) ||
+            requestGen != _dashboardRequestGeneration) {
+          return;
+        }
         _status = null;
         _vehicles = updatedVehicles;
         _locationTracker.stopTracking();
+        _cancelCountdownTimer();
         _inboxState = DispatchInboxState.disconnected;
         _offers = const [];
       }
       _error = null;
       _hasLoaded = true;
     } catch (e) {
-      if (!_isCurrentRequest(requestGen, requestUser)) return;
+      if (!_isCurrentSession(sessionGen, sessionUser) ||
+          requestGen != _dashboardRequestGeneration) {
+        return;
+      }
       _error = e is ApiException
           ? e.message
           : 'Failed to refresh driver dashboard: ${e.toString()}';
     } finally {
-      if (_isCurrentRequest(requestGen, requestUser)) {
+      if (_isCurrentSession(sessionGen, sessionUser) &&
+          requestGen == _dashboardRequestGeneration) {
         _isRefreshing = false;
         notifyListeners();
       }
@@ -359,8 +403,9 @@ class DriverHomeProvider extends ChangeNotifier {
       return false;
     }
 
-    final requestGen = ++_requestGeneration;
-    final requestUser = _currentUserId;
+    final sessionGen = _sessionGeneration;
+    final sessionUser = _currentUserId;
+    final requestGen = ++_statusMutationGeneration;
 
     _isUpdatingStatus = true;
     _statusUpdateError = null;
@@ -368,26 +413,38 @@ class DriverHomeProvider extends ChangeNotifier {
 
     try {
       final updatedStatus = await repo.updateStatus(isOnline: online);
-      if (!_isCurrentRequest(requestGen, requestUser)) return false;
+      if (!_isCurrentSession(sessionGen, sessionUser) ||
+          requestGen != _statusMutationGeneration) {
+        return false;
+      }
 
       _status = updatedStatus;
       _statusUpdateError = null;
 
       if (updatedStatus.isOnline) {
         _locationTracker.startTracking(repository: repo);
-        await _fetchOffersInternal(repo: repo, requestGen: requestGen, requestUser: requestUser);
+        await _fetchOffersInternal(
+          repo: repo,
+          sessionGen: sessionGen,
+          sessionUser: sessionUser,
+        );
       } else {
         _locationTracker.stopTracking();
+        _cancelCountdownTimer();
         _inboxState = DispatchInboxState.disconnected;
         _offers = const [];
       }
       return true;
     } catch (e) {
-      if (!_isCurrentRequest(requestGen, requestUser)) return false;
+      if (!_isCurrentSession(sessionGen, sessionUser) ||
+          requestGen != _statusMutationGeneration) {
+        return false;
+      }
       _statusUpdateError = e is ApiException ? e.message : e.toString();
       return false;
     } finally {
-      if (_isCurrentRequest(requestGen, requestUser)) {
+      if (_isCurrentSession(sessionGen, sessionUser) &&
+          requestGen == _statusMutationGeneration) {
         _isUpdatingStatus = false;
         notifyListeners();
       }
@@ -402,52 +459,158 @@ class DriverHomeProvider extends ChangeNotifier {
     if (_status == null || !_status!.isApproved || !_status!.isOnline) {
       _inboxState = DispatchInboxState.disconnected;
       _offers = const [];
+      _cancelCountdownTimer();
       notifyListeners();
       return;
     }
 
-    final requestGen = ++_requestGeneration;
-    final requestUser = _currentUserId;
+    final sessionGen = _sessionGeneration;
+    final sessionUser = _currentUserId;
 
     _inboxState = DispatchInboxState.loading;
     _offersError = null;
     notifyListeners();
 
-    await _fetchOffersInternal(repo: repo, requestGen: requestGen, requestUser: requestUser);
-    if (_isCurrentRequest(requestGen, requestUser)) {
+    await _fetchOffersInternal(
+      repo: repo,
+      sessionGen: sessionGen,
+      sessionUser: sessionUser,
+    );
+    if (_isCurrentSession(sessionGen, sessionUser)) {
+      notifyListeners();
+    }
+  }
+
+  /// Reconciles offers and status when the application resumes from the background.
+  Future<void> reconcileOnResume({DriverRepository? repository}) async {
+    final repo = repository ?? driverRepository;
+    if (repo == null) return;
+    if (_status == null || !_status!.isApproved || !_status!.isOnline) return;
+
+    final sessionGen = _sessionGeneration;
+    final sessionUser = _currentUserId;
+
+    await _fetchOffersInternal(
+      repo: repo,
+      sessionGen: sessionGen,
+      sessionUser: sessionUser,
+    );
+    if (_isCurrentSession(sessionGen, sessionUser)) {
       notifyListeners();
     }
   }
 
   Future<void> _fetchOffersInternal({
     required DriverRepository repo,
-    required int requestGen,
-    required String? requestUser,
+    required int sessionGen,
+    required String? sessionUser,
   }) async {
+    final requestGen = ++_offersRequestGeneration;
     try {
       final offersList = await repo.getPendingOffers();
-      if (!_isCurrentRequest(requestGen, requestUser)) return;
+      if (!_isCurrentSession(sessionGen, sessionUser) ||
+          requestGen != _offersRequestGeneration) {
+        return;
+      }
 
       if (offersList.isEmpty) {
         _inboxState = DispatchInboxState.empty;
         _offers = const [];
+        _cancelCountdownTimer();
       } else {
         _inboxState = DispatchInboxState.ready;
         _offers = offersList.map((o) => o.toPresentationItem()).toList();
+        _startCountdownTimer();
       }
       _offersError = null;
     } catch (e) {
-      if (!_isCurrentRequest(requestGen, requestUser)) return;
+      if (!_isCurrentSession(sessionGen, sessionUser) ||
+          requestGen != _offersRequestGeneration) {
+        return;
+      }
       _inboxState = DispatchInboxState.error;
       _offersError = e is ApiException ? e.message : e.toString();
+      _cancelCountdownTimer();
+    }
+  }
+
+  void _startCountdownTimer() {
+    _countdownTimer?.cancel();
+    if (!enableCountdownTimer || _offers.isEmpty) return;
+
+    final hasPendingUnexpired = _offers.any(
+      (o) =>
+          !o.isExpired &&
+          o.status == DispatchOfferStatus.pending &&
+          (o.remainingSeconds != null && o.remainingSeconds! > 0),
+    );
+    if (!hasPendingUnexpired) return;
+
+    _countdownTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      _tickCountdown();
+    });
+  }
+
+  void _cancelCountdownTimer() {
+    _countdownTimer?.cancel();
+    _countdownTimer = null;
+  }
+
+  void _tickCountdown() {
+    bool hasChanged = false;
+    bool hasRemaining = false;
+
+    final updated = <DispatchOfferItem>[];
+    for (final offer in _offers) {
+      if (offer.status == DispatchOfferStatus.pending &&
+          offer.remainingSeconds != null &&
+          offer.remainingSeconds! > 0) {
+        final nextRemaining = offer.remainingSeconds! - 1;
+        hasChanged = true;
+        if (nextRemaining <= 0) {
+          updated.add(offer.copyWith(
+            remainingSeconds: 0,
+            status: DispatchOfferStatus.expired,
+          ));
+        } else {
+          hasRemaining = true;
+          updated.add(offer.copyWith(remainingSeconds: nextRemaining));
+        }
+      } else {
+        updated.add(offer);
+        if (offer.status == DispatchOfferStatus.pending &&
+            offer.remainingSeconds != null &&
+            offer.remainingSeconds! > 0) {
+          hasRemaining = true;
+        }
+      }
+    }
+
+    if (hasChanged) {
+      _offers = List.unmodifiable(updated);
+      notifyListeners();
+    }
+
+    if (!hasRemaining) {
+      _cancelCountdownTimer();
     }
   }
 
   /// Driver accepts a dispatch offer with mandatory `Idempotency-Key`
   /// (`POST /api/v1/drivers/offers/:id/accept`).
+  ///
+  /// Concurrency & Ambiguity Guardrails:
+  /// 1. Action is isolated from dashboard/offer request counters.
+  /// 2. If driver is already RESERVED, secondary accept is blocked.
+  /// 3. Idempotency key is retained on ambiguous failure for retries.
+  /// 4. Reconciles server status on ambiguous network failure to recover server-side acceptance.
+  /// 5. Coordinated post-accept refresh updates status and offers without clashing.
   Future<bool> acceptOffer(String offerId, {DriverRepository? repository}) async {
     final repo = repository ?? driverRepository;
     if (repo == null || _isProcessingAction) return false;
+
+    // Reject offer acceptance if already actively assigned
+    if (_status?.operationalStatus == 'RESERVED') return false;
 
     final offerIndex = _offers.indexWhere((o) => o.id == offerId);
     if (offerIndex == -1) return false;
@@ -455,24 +618,16 @@ class DriverHomeProvider extends ChangeNotifier {
     final targetOffer = _offers[offerIndex];
     if (targetOffer.isActionPending || targetOffer.isExpired) return false;
 
-    final requestGen = ++_requestGeneration;
-    final requestUser = _currentUserId;
+    final sessionGen = _sessionGeneration;
+    final sessionUser = _currentUserId;
+    final requestGen = ++_actionRequestGeneration;
 
     _isProcessingAction = true;
+    _actionSuccessMessage = null;
     _offers = [
       for (int i = 0; i < _offers.length; i++)
         if (i == offerIndex)
-          DispatchOfferItem(
-            id: targetOffer.id,
-            groupId: targetOffer.groupId,
-            pickupLocationName: targetOffer.pickupLocationName,
-            dropoffLocationName: targetOffer.dropoffLocationName,
-            passengerCount: targetOffer.passengerCount,
-            estimatedEarnings: targetOffer.estimatedEarnings,
-            estimatedDistance: targetOffer.estimatedDistance,
-            detourPercentage: targetOffer.detourPercentage,
-            status: DispatchOfferStatus.accepting,
-          )
+          _offers[i].copyWith(status: DispatchOfferStatus.accepting)
         else
           _offers[i],
     ];
@@ -488,9 +643,15 @@ class DriverHomeProvider extends ChangeNotifier {
         offerId: offerId,
         idempotencyKey: idempotencyKey,
       );
-      if (!_isCurrentRequest(requestGen, requestUser)) return false;
+      if (!_isCurrentSession(sessionGen, sessionUser) ||
+          requestGen != _actionRequestGeneration) {
+        return false;
+      }
 
-      // Update local operational status to RESERVED
+      // Successful acceptance: prune key and update status
+      _offerIdempotencyKeys.remove(offerId);
+      _actionSuccessMessage = 'Offer accepted successfully!';
+
       if (_status != null) {
         _status = DriverStatusResponse(
           id: _status!.id,
@@ -501,30 +662,69 @@ class DriverHomeProvider extends ChangeNotifier {
         );
       }
 
-      // Authoritative refresh of offers and dashboard
-      await Future.wait([
-        refreshDashboard(
-          verificationStatus: _status?.verificationStatus ?? 'APPROVED',
-          userId: _currentUserId,
-          repository: repo,
-        ),
-        loadOffers(repository: repo),
-      ]);
+      // Coordinated post-accept reconciliation (no cross-invalidation)
+      await _reconcileAfterSuccessfulAccept(
+        repo: repo,
+        sessionGen: sessionGen,
+        sessionUser: sessionUser,
+      );
 
       return true;
     } catch (e) {
-      if (!_isCurrentRequest(requestGen, requestUser)) return false;
+      if (!_isCurrentSession(sessionGen, sessionUser) ||
+          requestGen != _actionRequestGeneration) {
+        return false;
+      }
       final actionError = e is ApiException ? e.message : e.toString();
-      // On failure (e.g. OFFER_EXPIRED, OFFER_ALREADY_TAKEN), reconcile pending offers
+
+      // Ambiguous Outcome Check (Requirement 6):
+      // Network loss, timeout, or 502/503/504 might mean server succeeded
+      final isAmbiguous = e is ApiException &&
+          (e.statusCode == null ||
+              e.statusCode == 502 ||
+              e.statusCode == 503 ||
+              e.statusCode == 504 ||
+              e.errorCode == 'NETWORK_UNAVAILABLE' ||
+              e.errorCode == 'REQUEST_TIMEOUT');
+
+      if (isAmbiguous) {
+        try {
+          final serverStatus = await repo.getDriverStatus();
+          if (!_isCurrentSession(sessionGen, sessionUser) ||
+              requestGen != _actionRequestGeneration) {
+            return false;
+          }
+
+          if (serverStatus.operationalStatus == 'RESERVED') {
+            // Server succeeded despite client-side network interruption!
+            _status = serverStatus;
+            _offerIdempotencyKeys.remove(offerId);
+            _actionSuccessMessage =
+                'Offer accepted (recovered after network interruption).';
+            _offersError = null;
+            await _reconcileAfterSuccessfulAccept(
+              repo: repo,
+              sessionGen: sessionGen,
+              sessionUser: sessionUser,
+            );
+            return true;
+          }
+        } catch (_) {
+          // Status check failed; keep key for user retry
+        }
+      }
+
+      // Reconcile remaining offers to show current state
       await _fetchOffersInternal(
         repo: repo,
-        requestGen: requestGen,
-        requestUser: requestUser,
+        sessionGen: sessionGen,
+        sessionUser: sessionUser,
       );
       _offersError = actionError;
       return false;
     } finally {
-      if (_isCurrentRequest(requestGen, requestUser)) {
+      if (_isCurrentSession(sessionGen, sessionUser) &&
+          requestGen == _actionRequestGeneration) {
         _isProcessingAction = false;
         notifyListeners();
       }
@@ -546,24 +746,16 @@ class DriverHomeProvider extends ChangeNotifier {
     final targetOffer = _offers[offerIndex];
     if (targetOffer.isActionPending || targetOffer.isExpired) return false;
 
-    final requestGen = ++_requestGeneration;
-    final requestUser = _currentUserId;
+    final sessionGen = _sessionGeneration;
+    final sessionUser = _currentUserId;
+    final requestGen = ++_actionRequestGeneration;
 
     _isProcessingAction = true;
+    _actionSuccessMessage = null;
     _offers = [
       for (int i = 0; i < _offers.length; i++)
         if (i == offerIndex)
-          DispatchOfferItem(
-            id: targetOffer.id,
-            groupId: targetOffer.groupId,
-            pickupLocationName: targetOffer.pickupLocationName,
-            dropoffLocationName: targetOffer.dropoffLocationName,
-            passengerCount: targetOffer.passengerCount,
-            estimatedEarnings: targetOffer.estimatedEarnings,
-            estimatedDistance: targetOffer.estimatedDistance,
-            detourPercentage: targetOffer.detourPercentage,
-            status: DispatchOfferStatus.declining,
-          )
+          _offers[i].copyWith(status: DispatchOfferStatus.declining)
         else
           _offers[i],
     ];
@@ -580,28 +772,86 @@ class DriverHomeProvider extends ChangeNotifier {
         idempotencyKey: idempotencyKey,
         reason: reason,
       );
-      if (!_isCurrentRequest(requestGen, requestUser)) return false;
+      if (!_isCurrentSession(sessionGen, sessionUser) ||
+          requestGen != _actionRequestGeneration) {
+        return false;
+      }
 
+      _offerIdempotencyKeys.remove('reject_$offerId');
       _offers = _offers.where((o) => o.id != offerId).toList();
       if (_offers.isEmpty) {
         _inboxState = DispatchInboxState.empty;
+        _cancelCountdownTimer();
       }
       return true;
     } catch (e) {
-      if (!_isCurrentRequest(requestGen, requestUser)) return false;
+      if (!_isCurrentSession(sessionGen, sessionUser) ||
+          requestGen != _actionRequestGeneration) {
+        return false;
+      }
       final actionError = e is ApiException ? e.message : e.toString();
+
+      // Ambiguous outcome check for rejection
+      final isAmbiguous = e is ApiException &&
+          (e.statusCode == null ||
+              e.statusCode == 502 ||
+              e.statusCode == 503 ||
+              e.statusCode == 504 ||
+              e.errorCode == 'NETWORK_UNAVAILABLE' ||
+              e.errorCode == 'REQUEST_TIMEOUT');
+
       await _fetchOffersInternal(
         repo: repo,
-        requestGen: requestGen,
-        requestUser: requestUser,
+        sessionGen: sessionGen,
+        sessionUser: sessionUser,
       );
+
+      final stillPresent = _offers.any((o) => o.id == offerId);
+      if (isAmbiguous && !stillPresent) {
+        // Offer is gone server-side: rejection succeeded
+        _offerIdempotencyKeys.remove('reject_$offerId');
+        _offersError = null;
+        return true;
+      }
+
       _offersError = actionError;
       return false;
     } finally {
-      if (_isCurrentRequest(requestGen, requestUser)) {
+      if (_isCurrentSession(sessionGen, sessionUser) &&
+          requestGen == _actionRequestGeneration) {
         _isProcessingAction = false;
         notifyListeners();
       }
+    }
+  }
+
+  /// Single coordinated reconciliation method for status and offers after successful acceptance.
+  Future<void> _reconcileAfterSuccessfulAccept({
+    required DriverRepository repo,
+    required int sessionGen,
+    required String? sessionUser,
+  }) async {
+    try {
+      final results = await Future.wait([
+        repo.getDriverStatus(),
+        repo.getPendingOffers(),
+      ]);
+      if (!_isCurrentSession(sessionGen, sessionUser)) return;
+
+      _status = results[0] as DriverStatusResponse;
+      final pendingOffers = results[1] as List<DriverDispatchOffer>;
+
+      if (pendingOffers.isEmpty) {
+        _inboxState = DispatchInboxState.empty;
+        _offers = const [];
+        _cancelCountdownTimer();
+      } else {
+        _inboxState = DispatchInboxState.ready;
+        _offers = pendingOffers.map((o) => o.toPresentationItem()).toList();
+        _startCountdownTimer();
+      }
+    } catch (_) {
+      // Maintain local RESERVED status if post-accept refresh encounters an issue
     }
   }
 
@@ -620,8 +870,14 @@ class DriverHomeProvider extends ChangeNotifier {
     notifyListeners();
   }
 
+  void clearActionSuccessMessage() {
+    _actionSuccessMessage = null;
+    notifyListeners();
+  }
+
   @override
   void dispose() {
+    _cancelCountdownTimer();
     _locationTracker.dispose();
     super.dispose();
   }

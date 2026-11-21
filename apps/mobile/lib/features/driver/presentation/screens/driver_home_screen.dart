@@ -45,7 +45,15 @@ class _DriverHomeScreenState extends State<DriverHomeScreen>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (mounted) {
-      context.read<DriverHomeProvider>().updateAppLifecycle(state);
+      final provider = context.read<DriverHomeProvider>();
+      provider.updateAppLifecycle(state);
+      if (state == AppLifecycleState.resumed) {
+        DriverRepository? repo;
+        try {
+          repo = Provider.of<DriverRepository>(context, listen: false);
+        } catch (_) {}
+        provider.reconcileOnResume(repository: repo);
+      }
     }
   }
 
@@ -111,9 +119,11 @@ class _DriverHomeScreenState extends State<DriverHomeScreen>
     if (!mounted) return;
     if (success) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          key: Key('driver_offer_accepted_snackbar'),
-          content: Text('Offer accepted successfully!'),
+        SnackBar(
+          key: const Key('driver_offer_accepted_snackbar'),
+          content: Text(
+            provider.actionSuccessMessage ?? 'Offer accepted successfully!',
+          ),
           backgroundColor: AppColors.success,
         ),
       );

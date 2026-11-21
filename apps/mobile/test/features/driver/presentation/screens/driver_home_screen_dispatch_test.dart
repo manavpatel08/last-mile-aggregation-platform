@@ -145,6 +145,7 @@ void main() {
         driverRepository: driverRepo,
         locationTracker: const NoOpDriverLocationTracker(),
       );
+      addTearDown(homeProvider.dispose);
 
       await tester.pumpWidget(
         LastMileApp(
@@ -217,6 +218,7 @@ void main() {
         driverRepository: driverRepo,
         locationTracker: const NoOpDriverLocationTracker(),
       );
+      addTearDown(homeProvider.dispose);
 
       await tester.pumpWidget(
         LastMileApp(
@@ -279,6 +281,7 @@ void main() {
         driverRepository: driverRepo,
         locationTracker: const NoOpDriverLocationTracker(),
       );
+      addTearDown(homeProvider.dispose);
 
       await tester.pumpWidget(
         LastMileApp(
@@ -450,6 +453,7 @@ void main() {
         driverRepository: driverRepo,
         locationTracker: const NoOpDriverLocationTracker(),
       );
+      addTearDown(homeProvider.dispose);
 
       await tester.pumpWidget(
         LastMileApp(
@@ -517,6 +521,7 @@ void main() {
         driverRepository: driverRepo,
         locationTracker: const NoOpDriverLocationTracker(),
       );
+      addTearDown(homeProvider.dispose);
 
       await tester.pumpWidget(
         LastMileApp(
@@ -585,6 +590,7 @@ void main() {
         driverRepository: driverRepo,
         locationTracker: const NoOpDriverLocationTracker(),
       );
+      addTearDown(homeProvider.dispose);
 
       await tester.pumpWidget(
         LastMileApp(
@@ -648,6 +654,7 @@ void main() {
         driverRepository: driverRepo,
         locationTracker: const NoOpDriverLocationTracker(),
       );
+      addTearDown(homeProvider.dispose);
 
       await tester.pumpWidget(
         LastMileApp(
@@ -710,6 +717,7 @@ void main() {
         driverRepository: driverRepo,
         locationTracker: const NoOpDriverLocationTracker(),
       );
+      addTearDown(homeProvider.dispose);
 
       await tester.pumpWidget(
         LastMileApp(
@@ -767,6 +775,7 @@ void main() {
         driverRepository: driverRepo,
         locationTracker: const NoOpDriverLocationTracker(),
       );
+      addTearDown(homeProvider.dispose);
 
       await tester.pumpWidget(
         LastMileApp(

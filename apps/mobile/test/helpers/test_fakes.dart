@@ -403,7 +403,7 @@ class FakeDriverRepository implements DriverRepository {
         message: 'Cannot go offline while driver has an active or reserved assignment',
       );
     }
-    return updateStatusResponse ??
+    final res = updateStatusResponse ??
         DriverStatusResponse(
           id: statusResponse?.id ?? 'dp-fake-123',
           verificationStatus: statusResponse?.verificationStatus ?? 'APPROVED',
@@ -411,6 +411,8 @@ class FakeDriverRepository implements DriverRepository {
           isOnline: isOnline,
           vehiclesCount: statusResponse?.vehiclesCount ?? 1,
         );
+    statusResponse = res;
+    return res;
   }
 
   @override

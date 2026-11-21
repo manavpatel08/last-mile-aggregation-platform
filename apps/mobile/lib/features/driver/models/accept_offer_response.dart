@@ -72,19 +72,21 @@ class NavigationRouteData {
 
   factory NavigationRouteData.fromJson(Map<String, dynamic> json) {
     final rawGeometry = json['geometry'];
-    final rawStops = json['stops'];
-
-    final List<NavigationStop> stopsList;
-    if (rawStops is List) {
-      stopsList = rawStops.map((item) {
-        if (item is! Map<String, dynamic>) {
-          throw const FormatException('Navigation stop item is not a JSON object');
-        }
-        return NavigationStop.fromJson(item);
-      }).toList();
-    } else {
-      stopsList = const [];
+    if (rawGeometry == null) {
+      throw const FormatException('Missing geometry in NavigationRouteData');
     }
+
+    final rawStops = json['stops'];
+    if (rawStops == null || rawStops is! List) {
+      throw const FormatException('Missing or invalid stops in NavigationRouteData');
+    }
+
+    final List<NavigationStop> stopsList = rawStops.map((item) {
+      if (item is! Map<String, dynamic>) {
+        throw const FormatException('Navigation stop item is not a JSON object');
+      }
+      return NavigationStop.fromJson(item);
+    }).toList();
 
     return NavigationRouteData(
       geometry: rawGeometry is Map<String, dynamic>

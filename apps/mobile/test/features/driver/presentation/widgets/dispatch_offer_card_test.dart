@@ -261,5 +261,46 @@ void main() {
       expect(find.text('+18% detour'), findsOneWidget);
       expect(find.text('₹64.50'), findsOneWidget);
     });
+
+    testWidgets('renders verified pickup-only layout when dropoffLocationName is null', (tester) async {
+      const verifiedOffer = DispatchOfferItem(
+        id: 'off-verified-1',
+        pickupLocationName: 'PDEU Gate 1 (Koba Highway)',
+        dropoffLocationName: null,
+        passengerCount: 3,
+        estimatedEarnings: '₹48.00',
+        remainingSeconds: 18,
+      );
+
+      await tester.pumpWidget(buildTestWidget(offer: verifiedOffer));
+
+      expect(find.text('Pickup Hub'), findsOneWidget);
+      expect(find.text('PDEU Gate 1 (Koba Highway)'), findsOneWidget);
+      expect(find.textContaining('Drop-off'), findsNothing);
+      expect(find.textContaining('Corridor'), findsNothing);
+      expect(find.text('Pending (18s)'), findsOneWidget);
+    });
+
+    testWidgets('automatically marks expired and disables buttons when remainingSeconds <= 0', (tester) async {
+      const expiredCountOffer = DispatchOfferItem(
+        id: 'off-expired-0s',
+        pickupLocationName: 'PDEU Gate 1',
+        passengerCount: 2,
+        estimatedEarnings: '₹32.00',
+        remainingSeconds: 0,
+      );
+
+      await tester.pumpWidget(buildTestWidget(offer: expiredCountOffer));
+
+      expect(find.text('Expired'), findsOneWidget);
+      final acceptBtn = tester.widget<FilledButton>(
+        find.byKey(const Key('dispatch_offer_accept_button_off-expired-0s')),
+      );
+      final rejectBtn = tester.widget<OutlinedButton>(
+        find.byKey(const Key('dispatch_offer_reject_button_off-expired-0s')),
+      );
+      expect(acceptBtn.onPressed, isNull);
+      expect(rejectBtn.onPressed, isNull);
+    });
   });
 }

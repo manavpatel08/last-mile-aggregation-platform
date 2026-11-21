@@ -26,6 +26,14 @@ void main() {
     vehiclesCount: 1,
   );
 
+  const approvedReservedStatus = DriverStatusResponse(
+    id: 'dp-1',
+    verificationStatus: 'APPROVED',
+    operationalStatus: 'RESERVED',
+    isOnline: true,
+    vehiclesCount: 1,
+  );
+
   final sampleOffer1 = DriverDispatchOffer(
     offerId: 'off-101',
     dispatchAttemptId: 'att-101',
@@ -68,6 +76,10 @@ void main() {
         driverRepository: fakeRepo,
         locationTracker: fakeTracker,
       );
+    });
+
+    tearDown(() {
+      provider.dispose();
     });
 
     test('initial state has disconnected offers and no tracking', () {
@@ -161,7 +173,7 @@ void main() {
       expect(provider.offersError, 'Failed to retrieve dispatch offers');
     });
 
-    test('acceptOffer sends unique Idempotency-Key and updates driver status and offers', () async {
+    test('acceptOffer sends unique Idempotency-Key and updates driver status and offers without stuck flags', () async {
       fakeRepo.statusResponse = approvedOnlineStatus;
       fakeRepo.offersResponse = [sampleOffer1, sampleOffer2];
       await provider.loadDashboard(verificationStatus: 'APPROVED', userId: 'user-1');
@@ -177,7 +189,8 @@ void main() {
         navigationRoute: NavigationRouteData(geometry: {}, stops: []),
       );
 
-      // Subsequent fetch after accept returns remaining offer
+      // Status changes to RESERVED and subsequent fetch after accept returns remaining offer
+      fakeRepo.statusResponse = approvedReservedStatus;
       fakeRepo.offersResponse = [sampleOffer2];
 
       final success = await provider.acceptOffer('off-101');
@@ -191,6 +204,10 @@ void main() {
       expect(provider.operationalStatus, 'RESERVED');
       expect(provider.offers.length, 1);
       expect(provider.offers[0].id, 'off-102');
+      // Verifies flags are cleanly reset and not permanently stuck
+      expect(provider.isProcessingAction, isFalse);
+      expect(provider.isRefreshing, isFalse);
+      expect(provider.isLoading, isFalse);
     });
 
     test('acceptOffer handles OFFER_EXPIRED conflict and reconciles offers', () async {
@@ -214,6 +231,7 @@ void main() {
       expect(success, isFalse);
       expect(provider.offersError, 'Offer has expired');
       expect(provider.inboxState, DispatchInboxState.empty);
+      expect(provider.isProcessingAction, isFalse);
     });
 
     test('rejectOffer sends Idempotency-Key with reason and removes offer from inbox', () async {
@@ -231,6 +249,7 @@ void main() {
 
       expect(provider.offers.length, 1);
       expect(provider.offers[0].id, 'off-102');
+      expect(provider.isProcessingAction, isFalse);
     });
 
     test('rejectOffer falls back to empty state when all offers rejected', () async {
@@ -243,6 +262,7 @@ void main() {
       expect(success, isTrue);
       expect(provider.offers, isEmpty);
       expect(provider.inboxState, DispatchInboxState.empty);
+      expect(provider.isProcessingAction, isFalse);
     });
 
     test('clear stops location tracking, resets generation, and cleans up offers and availability', () async {
@@ -253,14 +273,189 @@ void main() {
       expect(fakeTracker.isTracking, isTrue);
       expect(provider.offers, isNotEmpty);
 
-      final prevGen = provider.requestGeneration;
+      final prevGen = provider.sessionGeneration;
       provider.clear();
 
-      expect(provider.requestGeneration, greaterThan(prevGen));
+      expect(provider.sessionGeneration, greaterThan(prevGen));
       expect(fakeTracker.isTracking, isFalse);
       expect(provider.offers, isEmpty);
       expect(provider.inboxState, DispatchInboxState.disconnected);
       expect(provider.currentUserId, isNull);
+    });
+
+    test('concurrency: refresh during availability mutation completes both cleanly without invalidation', () async {
+      await provider.loadDashboard(verificationStatus: 'APPROVED', userId: 'user-1');
+      fakeRepo.updateStatusResponse = approvedOnlineStatus;
+
+      // Start setOnline and refreshDashboard concurrently
+      final f1 = provider.setOnline(true);
+      final f2 = provider.refreshDashboard(verificationStatus: 'APPROVED', userId: 'user-1');
+
+      await Future.wait([f1, f2]);
+
+      expect(provider.isOnline, isTrue);
+      expect(provider.isUpdatingStatus, isFalse);
+      expect(provider.isRefreshing, isFalse);
+    });
+
+    test('concurrency: logout/account switch during in-flight operations resets all flags and drops responses', () async {
+      fakeRepo.statusResponse = approvedOnlineStatus;
+      fakeRepo.offersResponse = [sampleOffer1];
+      await provider.loadDashboard(verificationStatus: 'APPROVED', userId: 'user-1');
+
+      // Start in-flight accept
+      final acceptFuture = provider.acceptOffer('off-101');
+
+      // Abrupt logout during in-flight accept
+      provider.clear();
+
+      expect(provider.isProcessingAction, isFalse);
+      expect(provider.currentUserId, isNull);
+      expect(provider.offers, isEmpty);
+
+      // Original future completes with false because session was invalidated
+      final result = await acceptFuture;
+      expect(result, isFalse);
+      expect(provider.isProcessingAction, isFalse);
+    });
+
+    test('countdown: ticks remaining seconds and transitions to expired at 0', () async {
+      final shortOffer = DriverDispatchOffer(
+        offerId: 'off-short',
+        dispatchAttemptId: 'att-1',
+        rideGroupId: 'grp-1',
+        groupVersion: 1,
+        pickupPoint: const DriverPickupPoint(id: 'pnt-1', name: 'PDEU Gate 1'),
+        passengerCount: 2,
+        totalEstimatedFare: '32.00',
+        totalDistanceMeters: 1000,
+        totalDurationSec: 120,
+        offeredAt: DateTime.now(),
+        expiresAt: DateTime.now().add(const Duration(seconds: 2)),
+        remainingSeconds: 2,
+      );
+
+      fakeRepo.statusResponse = approvedOnlineStatus;
+      fakeRepo.offersResponse = [shortOffer];
+      await provider.loadDashboard(verificationStatus: 'APPROVED', userId: 'user-1');
+
+      expect(provider.offers.first.remainingSeconds, 2);
+      expect(provider.offers.first.isExpired, isFalse);
+
+      // Wait 1.1s for first tick
+      await Future<void>.delayed(const Duration(milliseconds: 1100));
+      expect(provider.offers.first.remainingSeconds, 1);
+      expect(provider.offers.first.isExpired, isFalse);
+
+      // Wait another 1.1s for second tick (reaches 0)
+      await Future<void>.delayed(const Duration(milliseconds: 1100));
+      expect(provider.offers.first.remainingSeconds, 0);
+      expect(provider.offers.first.isExpired, isTrue);
+      expect(provider.offers.first.status, DispatchOfferStatus.expired);
+
+      // Expired offer cannot be accepted
+      final success = await provider.acceptOffer('off-short');
+      expect(success, isFalse);
+      expect(fakeRepo.acceptOfferCallCount, 0);
+    });
+
+    test('ambiguous accept recovery: recovers server success when response was lost', () async {
+      fakeRepo.statusResponse = approvedOnlineStatus;
+      fakeRepo.offersResponse = [sampleOffer1];
+      await provider.loadDashboard(verificationStatus: 'APPROVED', userId: 'user-1');
+
+      // Accept call throws network timeout
+      fakeRepo.shouldThrowOnAcceptOffer = true;
+      fakeRepo.acceptOfferException = const ApiException(
+        statusCode: null,
+        errorCode: 'REQUEST_TIMEOUT',
+        message: 'The request timed out.',
+      );
+
+      // But server-side the assignment actually succeeded!
+      fakeRepo.statusResponse = approvedReservedStatus;
+      fakeRepo.offersResponse = const [];
+
+      final success = await provider.acceptOffer('off-101');
+
+      expect(success, isTrue);
+      expect(provider.operationalStatus, 'RESERVED');
+      expect(provider.actionSuccessMessage, contains('recovered after network interruption'));
+      expect(provider.offersError, isNull);
+      expect(provider.isProcessingAction, isFalse);
+    });
+
+    test('ambiguous accept retry: reuses identical Idempotency-Key on retry', () async {
+      fakeRepo.statusResponse = approvedOnlineStatus;
+      fakeRepo.offersResponse = [sampleOffer1];
+      await provider.loadDashboard(verificationStatus: 'APPROVED', userId: 'user-1');
+
+      // First call throws network error and server is NOT reserved
+      fakeRepo.shouldThrowOnAcceptOffer = true;
+      fakeRepo.acceptOfferException = const ApiException(
+        statusCode: null,
+        errorCode: 'NETWORK_UNAVAILABLE',
+        message: 'Network connection lost.',
+      );
+
+      final f1 = await provider.acceptOffer('off-101');
+      expect(f1, isFalse);
+      expect(provider.offersError, 'Network connection lost.');
+      final firstKey = fakeRepo.lastAcceptedIdempotencyKey;
+      expect(firstKey, isNotNull);
+
+      // Driver retries acceptance
+      fakeRepo.shouldThrowOnAcceptOffer = false;
+      fakeRepo.acceptOfferResponse = const AcceptOfferResponse(
+        assignmentId: 'asgn-1',
+        tripId: 'trip-1',
+        rideGroupId: 'grp-101',
+        passengerCount: 2,
+        totalEstimatedFare: '32.00',
+        navigationRoute: NavigationRouteData(geometry: {}, stops: []),
+      );
+      fakeRepo.statusResponse = approvedReservedStatus;
+
+      final f2 = await provider.acceptOffer('off-101');
+      expect(f2, isTrue);
+      final secondKey = fakeRepo.lastAcceptedIdempotencyKey;
+
+      // Verifies exact same idempotency key was reused for the retry!
+      expect(secondKey, equals(firstKey));
+    });
+
+    test('ambiguous reject recovery: detects server rejection when response was lost', () async {
+      fakeRepo.statusResponse = approvedOnlineStatus;
+      fakeRepo.offersResponse = [sampleOffer1];
+      await provider.loadDashboard(verificationStatus: 'APPROVED', userId: 'user-1');
+
+      // Reject call throws 503
+      fakeRepo.shouldThrowOnRejectOffer = true;
+      fakeRepo.rejectOfferException = const ApiException(
+        statusCode: 503,
+        errorCode: 'SERVICE_UNAVAILABLE',
+        message: 'Gateway timeout',
+      );
+
+      // Server already marked offer rejected, so pending offers is now empty
+      fakeRepo.offersResponse = const [];
+
+      final success = await provider.rejectOffer('off-101');
+
+      expect(success, isTrue);
+      expect(provider.offers, isEmpty);
+      expect(provider.inboxState, DispatchInboxState.empty);
+      expect(provider.isProcessingAction, isFalse);
+    });
+
+    test('cannot accept offer when driver is already RESERVED', () async {
+      fakeRepo.statusResponse = approvedReservedStatus;
+      fakeRepo.offersResponse = [sampleOffer1];
+      await provider.loadDashboard(verificationStatus: 'APPROVED', userId: 'user-1');
+
+      final success = await provider.acceptOffer('off-101');
+      expect(success, isFalse);
+      expect(fakeRepo.acceptOfferCallCount, 0);
     });
   });
 }

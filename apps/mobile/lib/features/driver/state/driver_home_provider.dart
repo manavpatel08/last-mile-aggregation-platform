@@ -1,9 +1,12 @@
-import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart';
+import 'package:uuid/uuid.dart';
 
 import '../../../core/network/api_exception.dart';
 import '../data/driver_repository.dart';
 import '../models/driver_status_response.dart';
 import '../models/driver_vehicle.dart';
+import '../presentation/models/dispatch_offer_item.dart';
+import '../services/driver_location_tracker.dart';
 
 /// Immutable descriptor for a placeholder section shown on the Driver Home screen.
 class DriverPlaceholderItem {
@@ -18,11 +21,16 @@ class DriverPlaceholderItem {
   final String description;
 }
 
-/// Feature-scoped Provider managing Driver Home presentation and readiness dashboard state.
+/// Feature-scoped Provider managing Driver Home presentation, readiness dashboard,
+/// driver availability toggle, dispatch offers inbox, and foreground GPS tracking.
 class DriverHomeProvider extends ChangeNotifier {
-  DriverHomeProvider({this.driverRepository});
+  DriverHomeProvider({
+    this.driverRepository,
+    DriverLocationTracker? locationTracker,
+  }) : _locationTracker = locationTracker ?? const NoOpDriverLocationTracker();
 
   final DriverRepository? driverRepository;
+  final DriverLocationTracker _locationTracker;
 
   final List<DriverPlaceholderItem> _sections = const [
     DriverPlaceholderItem(
@@ -57,6 +65,15 @@ class DriverHomeProvider extends ChangeNotifier {
   String? _currentUserId;
   int _requestGeneration = 0;
 
+  // Availability & Dispatch Offers State (TASK-009 Phase 2)
+  bool _isUpdatingStatus = false;
+  String? _statusUpdateError;
+  DispatchInboxState _inboxState = DispatchInboxState.disconnected;
+  List<DispatchOfferItem> _offers = const [];
+  String? _offersError;
+  bool _isProcessingAction = false;
+  final Map<String, String> _offerIdempotencyKeys = {};
+
   bool get isLoading => _isLoading;
   bool get isRefreshing => _isRefreshing;
   String? get error => _error;
@@ -69,6 +86,16 @@ class DriverHomeProvider extends ChangeNotifier {
   String? get operationalStatus => _status?.operationalStatus;
   bool get hasLoaded => _hasLoaded;
   String? get currentUserId => _currentUserId;
+
+  bool get isUpdatingStatus => _isUpdatingStatus;
+  String? get statusUpdateError => _statusUpdateError;
+  DispatchInboxState get inboxState => _inboxState;
+  List<DispatchOfferItem> get offers => _offers;
+  String? get offersError => _offersError;
+  bool get isProcessingAction => _isProcessingAction;
+
+  @visibleForTesting
+  DriverLocationTracker get locationTracker => _locationTracker;
 
   @visibleForTesting
   int get requestGeneration => _requestGeneration;
@@ -85,7 +112,7 @@ class DriverHomeProvider extends ChangeNotifier {
     return 'Driver application foundation is ready. Operational driver access is enforced by backend verification status.';
   }
 
-  /// Clears all user-session and dashboard state across logout or account switch.
+  /// Clears all user-session, dashboard, availability, and dispatch offer state across logout or account switch.
   ///
   /// Increments [_requestGeneration] so all in-flight asynchronous operations
   /// from the previous account session are immediately invalidated.
@@ -98,6 +125,14 @@ class DriverHomeProvider extends ChangeNotifier {
     _status = null;
     _vehicles = const [];
     _hasLoaded = false;
+    _isUpdatingStatus = false;
+    _statusUpdateError = null;
+    _inboxState = DispatchInboxState.disconnected;
+    _offers = const [];
+    _offersError = null;
+    _isProcessingAction = false;
+    _offerIdempotencyKeys.clear();
+    _locationTracker.stopTracking();
     notifyListeners();
   }
 
@@ -114,7 +149,20 @@ class DriverHomeProvider extends ChangeNotifier {
     _status = null;
     _vehicles = const [];
     _hasLoaded = false;
+    _isUpdatingStatus = false;
+    _statusUpdateError = null;
+    _inboxState = DispatchInboxState.disconnected;
+    _offers = const [];
+    _offersError = null;
+    _isProcessingAction = false;
+    _offerIdempotencyKeys.clear();
+    _locationTracker.stopTracking();
     notifyListeners();
+  }
+
+  /// Updates app lifecycle state for foreground-only GPS telemetry.
+  void updateAppLifecycle(AppLifecycleState state) {
+    _locationTracker.updateAppLifecycle(state);
   }
 
   /// Loads driver dashboard data (operational status and registered vehicles).
@@ -135,9 +183,6 @@ class DriverHomeProvider extends ChangeNotifier {
       return;
     }
 
-    // Account isolation: If user changed, clear previous user state immediately,
-    // reset loading flags, and bump generation so all in-flight requests from the
-    // previous account are invalidated and cannot block the new user.
     if (userId != null && userId != _currentUserId) {
       _requestGeneration++;
       _currentUserId = userId;
@@ -147,6 +192,14 @@ class DriverHomeProvider extends ChangeNotifier {
       _hasLoaded = false;
       _isLoading = false;
       _isRefreshing = false;
+      _isUpdatingStatus = false;
+      _statusUpdateError = null;
+      _inboxState = DispatchInboxState.disconnected;
+      _offers = const [];
+      _offersError = null;
+      _isProcessingAction = false;
+      _offerIdempotencyKeys.clear();
+      _locationTracker.stopTracking();
     } else if (userId != null) {
       _currentUserId = userId;
     }
@@ -172,13 +225,26 @@ class DriverHomeProvider extends ChangeNotifier {
         if (!_isCurrentRequest(requestGen, requestUser)) return;
         _status = results[0] as DriverStatusResponse;
         _vehicles = results[1] as List<DriverVehicle>;
+
+        // Coordinate online foreground location reporting and offers
+        if (_status!.isOnline) {
+          _locationTracker.startTracking(repository: repo);
+          await _fetchOffersInternal(repo: repo, requestGen: requestGen, requestUser: requestUser);
+        } else {
+          _locationTracker.stopTracking();
+          _inboxState = DispatchInboxState.disconnected;
+          _offers = const [];
+        }
       } else {
-        // For non-approved drivers (PENDING, REJECTED, SUSPENDED):
+        // For non-approved drivers:
         // Never call the approval-protected operational-status endpoint!
         final fetchedVehicles = await repo.getVehicles();
         if (!_isCurrentRequest(requestGen, requestUser)) return;
         _status = null;
         _vehicles = fetchedVehicles;
+        _locationTracker.stopTracking();
+        _inboxState = DispatchInboxState.disconnected;
+        _offers = const [];
       }
       _error = null;
       _hasLoaded = true;
@@ -212,6 +278,14 @@ class DriverHomeProvider extends ChangeNotifier {
       _hasLoaded = false;
       _isLoading = false;
       _isRefreshing = false;
+      _isUpdatingStatus = false;
+      _statusUpdateError = null;
+      _inboxState = DispatchInboxState.disconnected;
+      _offers = const [];
+      _offersError = null;
+      _isProcessingAction = false;
+      _offerIdempotencyKeys.clear();
+      _locationTracker.stopTracking();
     } else if (userId != null) {
       _currentUserId = userId;
     }
@@ -235,13 +309,23 @@ class DriverHomeProvider extends ChangeNotifier {
         if (!_isCurrentRequest(requestGen, requestUser)) return;
         _status = results[0] as DriverStatusResponse;
         _vehicles = results[1] as List<DriverVehicle>;
+
+        if (_status!.isOnline) {
+          _locationTracker.startTracking(repository: repo);
+          await _fetchOffersInternal(repo: repo, requestGen: requestGen, requestUser: requestUser);
+        } else {
+          _locationTracker.stopTracking();
+          _inboxState = DispatchInboxState.disconnected;
+          _offers = const [];
+        }
       } else {
-        // Preserve existing vehicle data during a failed refresh:
-        // Await the vehicle list before updating _vehicles so errors leave existing data intact.
         final updatedVehicles = await repo.getVehicles();
         if (!_isCurrentRequest(requestGen, requestUser)) return;
         _status = null;
         _vehicles = updatedVehicles;
+        _locationTracker.stopTracking();
+        _inboxState = DispatchInboxState.disconnected;
+        _offers = const [];
       }
       _error = null;
       _hasLoaded = true;
@@ -258,8 +342,287 @@ class DriverHomeProvider extends ChangeNotifier {
     }
   }
 
+  /// Updates driver online/offline duty status (`PATCH /api/v1/drivers/status`).
+  ///
+  /// CRITICAL INVARIANTS:
+  /// 1. Enforces driver approval gating: only approved drivers can mutate status.
+  /// 2. Sets [_isUpdatingStatus] while in flight to prevent duplicate taps.
+  /// 3. Does NOT optimistically alter [_status]; only sets authoritative server response.
+  /// 4. Handles 409 Conflict (e.g. driver has active trip/assignment) and captures message.
+  Future<bool> setOnline(bool online, {DriverRepository? repository}) async {
+    final repo = repository ?? driverRepository;
+    if (repo == null || _isUpdatingStatus) return false;
+
+    if (_status == null || !_status!.isApproved) {
+      _statusUpdateError = 'Driver operational status is not approved';
+      notifyListeners();
+      return false;
+    }
+
+    final requestGen = ++_requestGeneration;
+    final requestUser = _currentUserId;
+
+    _isUpdatingStatus = true;
+    _statusUpdateError = null;
+    notifyListeners();
+
+    try {
+      final updatedStatus = await repo.updateStatus(isOnline: online);
+      if (!_isCurrentRequest(requestGen, requestUser)) return false;
+
+      _status = updatedStatus;
+      _statusUpdateError = null;
+
+      if (updatedStatus.isOnline) {
+        _locationTracker.startTracking(repository: repo);
+        await _fetchOffersInternal(repo: repo, requestGen: requestGen, requestUser: requestUser);
+      } else {
+        _locationTracker.stopTracking();
+        _inboxState = DispatchInboxState.disconnected;
+        _offers = const [];
+      }
+      return true;
+    } catch (e) {
+      if (!_isCurrentRequest(requestGen, requestUser)) return false;
+      _statusUpdateError = e is ApiException ? e.message : e.toString();
+      return false;
+    } finally {
+      if (_isCurrentRequest(requestGen, requestUser)) {
+        _isUpdatingStatus = false;
+        notifyListeners();
+      }
+    }
+  }
+
+  /// Retrieves pending dispatch offers (`GET /api/v1/drivers/offers/pending`).
+  Future<void> loadOffers({DriverRepository? repository}) async {
+    final repo = repository ?? driverRepository;
+    if (repo == null) return;
+
+    if (_status == null || !_status!.isApproved || !_status!.isOnline) {
+      _inboxState = DispatchInboxState.disconnected;
+      _offers = const [];
+      notifyListeners();
+      return;
+    }
+
+    final requestGen = ++_requestGeneration;
+    final requestUser = _currentUserId;
+
+    _inboxState = DispatchInboxState.loading;
+    _offersError = null;
+    notifyListeners();
+
+    await _fetchOffersInternal(repo: repo, requestGen: requestGen, requestUser: requestUser);
+    if (_isCurrentRequest(requestGen, requestUser)) {
+      notifyListeners();
+    }
+  }
+
+  Future<void> _fetchOffersInternal({
+    required DriverRepository repo,
+    required int requestGen,
+    required String? requestUser,
+  }) async {
+    try {
+      final offersList = await repo.getPendingOffers();
+      if (!_isCurrentRequest(requestGen, requestUser)) return;
+
+      if (offersList.isEmpty) {
+        _inboxState = DispatchInboxState.empty;
+        _offers = const [];
+      } else {
+        _inboxState = DispatchInboxState.ready;
+        _offers = offersList.map((o) => o.toPresentationItem()).toList();
+      }
+      _offersError = null;
+    } catch (e) {
+      if (!_isCurrentRequest(requestGen, requestUser)) return;
+      _inboxState = DispatchInboxState.error;
+      _offersError = e is ApiException ? e.message : e.toString();
+    }
+  }
+
+  /// Driver accepts a dispatch offer with mandatory `Idempotency-Key`
+  /// (`POST /api/v1/drivers/offers/:id/accept`).
+  Future<bool> acceptOffer(String offerId, {DriverRepository? repository}) async {
+    final repo = repository ?? driverRepository;
+    if (repo == null || _isProcessingAction) return false;
+
+    final offerIndex = _offers.indexWhere((o) => o.id == offerId);
+    if (offerIndex == -1) return false;
+
+    final targetOffer = _offers[offerIndex];
+    if (targetOffer.isActionPending || targetOffer.isExpired) return false;
+
+    final requestGen = ++_requestGeneration;
+    final requestUser = _currentUserId;
+
+    _isProcessingAction = true;
+    _offers = [
+      for (int i = 0; i < _offers.length; i++)
+        if (i == offerIndex)
+          DispatchOfferItem(
+            id: targetOffer.id,
+            groupId: targetOffer.groupId,
+            pickupLocationName: targetOffer.pickupLocationName,
+            dropoffLocationName: targetOffer.dropoffLocationName,
+            passengerCount: targetOffer.passengerCount,
+            estimatedEarnings: targetOffer.estimatedEarnings,
+            estimatedDistance: targetOffer.estimatedDistance,
+            detourPercentage: targetOffer.detourPercentage,
+            status: DispatchOfferStatus.accepting,
+          )
+        else
+          _offers[i],
+    ];
+    notifyListeners();
+
+    final idempotencyKey = _offerIdempotencyKeys.putIfAbsent(
+      offerId,
+      () => const Uuid().v4(),
+    );
+
+    try {
+      await repo.acceptOffer(
+        offerId: offerId,
+        idempotencyKey: idempotencyKey,
+      );
+      if (!_isCurrentRequest(requestGen, requestUser)) return false;
+
+      // Update local operational status to RESERVED
+      if (_status != null) {
+        _status = DriverStatusResponse(
+          id: _status!.id,
+          verificationStatus: _status!.verificationStatus,
+          operationalStatus: 'RESERVED',
+          isOnline: _status!.isOnline,
+          vehiclesCount: _status!.vehiclesCount,
+        );
+      }
+
+      // Authoritative refresh of offers and dashboard
+      await Future.wait([
+        refreshDashboard(
+          verificationStatus: _status?.verificationStatus ?? 'APPROVED',
+          userId: _currentUserId,
+          repository: repo,
+        ),
+        loadOffers(repository: repo),
+      ]);
+
+      return true;
+    } catch (e) {
+      if (!_isCurrentRequest(requestGen, requestUser)) return false;
+      final actionError = e is ApiException ? e.message : e.toString();
+      // On failure (e.g. OFFER_EXPIRED, OFFER_ALREADY_TAKEN), reconcile pending offers
+      await _fetchOffersInternal(
+        repo: repo,
+        requestGen: requestGen,
+        requestUser: requestUser,
+      );
+      _offersError = actionError;
+      return false;
+    } finally {
+      if (_isCurrentRequest(requestGen, requestUser)) {
+        _isProcessingAction = false;
+        notifyListeners();
+      }
+    }
+  }
+
+  /// Driver explicitly rejects a dispatch offer (`POST /api/v1/drivers/offers/:id/reject`).
+  Future<bool> rejectOffer(
+    String offerId, {
+    String? reason,
+    DriverRepository? repository,
+  }) async {
+    final repo = repository ?? driverRepository;
+    if (repo == null || _isProcessingAction) return false;
+
+    final offerIndex = _offers.indexWhere((o) => o.id == offerId);
+    if (offerIndex == -1) return false;
+
+    final targetOffer = _offers[offerIndex];
+    if (targetOffer.isActionPending || targetOffer.isExpired) return false;
+
+    final requestGen = ++_requestGeneration;
+    final requestUser = _currentUserId;
+
+    _isProcessingAction = true;
+    _offers = [
+      for (int i = 0; i < _offers.length; i++)
+        if (i == offerIndex)
+          DispatchOfferItem(
+            id: targetOffer.id,
+            groupId: targetOffer.groupId,
+            pickupLocationName: targetOffer.pickupLocationName,
+            dropoffLocationName: targetOffer.dropoffLocationName,
+            passengerCount: targetOffer.passengerCount,
+            estimatedEarnings: targetOffer.estimatedEarnings,
+            estimatedDistance: targetOffer.estimatedDistance,
+            detourPercentage: targetOffer.detourPercentage,
+            status: DispatchOfferStatus.declining,
+          )
+        else
+          _offers[i],
+    ];
+    notifyListeners();
+
+    final idempotencyKey = _offerIdempotencyKeys.putIfAbsent(
+      'reject_$offerId',
+      () => const Uuid().v4(),
+    );
+
+    try {
+      await repo.rejectOffer(
+        offerId: offerId,
+        idempotencyKey: idempotencyKey,
+        reason: reason,
+      );
+      if (!_isCurrentRequest(requestGen, requestUser)) return false;
+
+      _offers = _offers.where((o) => o.id != offerId).toList();
+      if (_offers.isEmpty) {
+        _inboxState = DispatchInboxState.empty;
+      }
+      return true;
+    } catch (e) {
+      if (!_isCurrentRequest(requestGen, requestUser)) return false;
+      final actionError = e is ApiException ? e.message : e.toString();
+      await _fetchOffersInternal(
+        repo: repo,
+        requestGen: requestGen,
+        requestUser: requestUser,
+      );
+      _offersError = actionError;
+      return false;
+    } finally {
+      if (_isCurrentRequest(requestGen, requestUser)) {
+        _isProcessingAction = false;
+        notifyListeners();
+      }
+    }
+  }
+
   void clearError() {
     _error = null;
     notifyListeners();
+  }
+
+  void clearStatusUpdateError() {
+    _statusUpdateError = null;
+    notifyListeners();
+  }
+
+  void clearOffersError() {
+    _offersError = null;
+    notifyListeners();
+  }
+
+  @override
+  void dispose() {
+    _locationTracker.dispose();
+    super.dispose();
   }
 }

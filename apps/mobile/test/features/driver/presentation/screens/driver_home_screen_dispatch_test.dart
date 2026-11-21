@@ -7,8 +7,11 @@ import 'package:lastmile_mobile/core/network/auth_token_store.dart';
 import 'package:lastmile_mobile/core/storage/secure_token_storage.dart';
 import 'package:lastmile_mobile/features/auth/models/auth_user.dart';
 import 'package:lastmile_mobile/features/auth/state/auth_provider.dart';
+import 'package:lastmile_mobile/features/driver/models/accept_offer_response.dart';
+import 'package:lastmile_mobile/features/driver/models/driver_dispatch_offer.dart';
 import 'package:lastmile_mobile/features/driver/models/driver_status_response.dart';
 import 'package:lastmile_mobile/features/driver/models/driver_vehicle.dart';
+import 'package:lastmile_mobile/features/driver/services/driver_location_tracker.dart';
 import 'package:lastmile_mobile/features/driver/state/driver_home_provider.dart';
 
 import '../../../../helpers/test_fakes.dart';
@@ -94,8 +97,26 @@ void main() {
     isActive: true,
   );
 
+  final sampleOffer = DriverDispatchOffer(
+    offerId: 'off-real-123',
+    dispatchAttemptId: 'att-123',
+    rideGroupId: 'grp-real-123',
+    groupVersion: 1,
+    pickupPoint: const DriverPickupPoint(
+      id: 'pnt-pdeu-gate-1',
+      name: 'PDEU Gate 1 (Koba Highway)',
+    ),
+    passengerCount: 3,
+    totalEstimatedFare: '48.00',
+    totalDistanceMeters: 2400,
+    totalDurationSec: 360,
+    offeredAt: DateTime.now(),
+    expiresAt: DateTime.now().add(const Duration(seconds: 20)),
+    remainingSeconds: 20,
+  );
+
   group('DriverHomeScreen Dispatch UI Integration Tests', () {
-    testWidgets('approved driver sees DriverAvailabilityCard and Disconnected DispatchOffersInbox', (tester) async {
+    testWidgets('approved driver sees DriverAvailabilityCard and interactive switch', (tester) async {
       final tokenStore = AuthTokenStore();
       final secureStorage = SecureTokenStorage.inMemory({
         SecureTokenStorage.refreshTokenKey: 'existing-refresh-token',
@@ -120,7 +141,10 @@ void main() {
       );
       await authProvider.restoreSession();
 
-      final homeProvider = DriverHomeProvider(driverRepository: driverRepo);
+      final homeProvider = DriverHomeProvider(
+        driverRepository: driverRepo,
+        locationTracker: const NoOpDriverLocationTracker(),
+      );
 
       await tester.pumpWidget(
         LastMileApp(
@@ -140,28 +164,146 @@ void main() {
       expect(find.text('Driver Availability'), findsOneWidget);
       expect(find.byKey(const Key('driver_availability_explanation')), findsOneWidget);
 
-      // Verify availability switch is disabled
+      // Verify availability switch is enabled and online
       final switchFinder = find.byKey(const Key('driver_availability_switch'));
       expect(switchFinder, findsOneWidget);
       final switchWidget = tester.widget<Switch>(switchFinder);
-      expect(switchWidget.onChanged, isNull,
-          reason: 'Availability toggle must be disabled pending backend dispatch integration.');
+      expect(switchWidget.value, isTrue);
+      expect(switchWidget.onChanged, isNotNull);
 
-      // Verify Dispatch Offers Inbox is displayed in disconnected state
+      // Verify Dispatch Offers Inbox is displayed
       expect(find.text('Dispatch Offers'), findsOneWidget);
-      expect(find.byKey(const Key('driver_offers_disconnected_card')), findsOneWidget);
-      expect(find.byKey(const Key('driver_offers_disconnected_badge')), findsOneWidget);
-      expect(find.text('Not Connected'), findsOneWidget);
-      expect(find.text('Dispatch Offers Not Connected'), findsOneWidget);
-
-      // Verify no fabricated counts, fake offers, or accept/decline buttons exist
-      expect(find.textContaining('active'), findsNothing);
-      expect(find.textContaining('Accept'), findsNothing);
-      expect(find.textContaining('Decline'), findsNothing);
+      expect(find.byKey(const Key('driver_offers_empty_card')), findsOneWidget);
+      expect(find.text('No Pending Offers'), findsOneWidget);
 
       // Verify registered vehicles are still properly rendered below
       expect(find.text('Registered Vehicles'), findsOneWidget);
       expect(find.byKey(const Key('driver_vehicle_card_veh-dispatch-1')), findsOneWidget);
+    });
+
+    testWidgets('tapping availability switch calls PATCH /drivers/status and updates state', (tester) async {
+      final tokenStore = AuthTokenStore();
+      final secureStorage = SecureTokenStorage.inMemory({
+        SecureTokenStorage.refreshTokenKey: 'existing-refresh-token',
+      });
+      final authRepo = FakeAuthRepository(currentUser: approvedDriverUser);
+      final driverRepo = FakeDriverRepository(
+        statusResponse: const DriverStatusResponse(
+          id: 'dp-approved-1',
+          verificationStatus: 'APPROVED',
+          operationalStatus: 'AVAILABLE',
+          isOnline: true,
+          vehiclesCount: 1,
+        ),
+        updateStatusResponse: const DriverStatusResponse(
+          id: 'dp-approved-1',
+          verificationStatus: 'APPROVED',
+          operationalStatus: 'OFFLINE',
+          isOnline: false,
+          vehiclesCount: 1,
+        ),
+        vehiclesResponse: [sampleVehicle],
+      );
+
+      final authProvider = AuthProvider(
+        authRepository: authRepo,
+        googleSignInService: FakeGoogleSignInService(),
+        tokenStore: tokenStore,
+        secureStorage: secureStorage,
+      );
+      await authProvider.restoreSession();
+
+      final homeProvider = DriverHomeProvider(
+        driverRepository: driverRepo,
+        locationTracker: const NoOpDriverLocationTracker(),
+      );
+
+      await tester.pumpWidget(
+        LastMileApp(
+          config: testConfig,
+          authProvider: authProvider,
+          tokenStore: tokenStore,
+          secureStorage: secureStorage,
+          authRepository: authRepo,
+          driverRepository: driverRepo,
+          driverHomeProvider: homeProvider,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final switchFinder = find.byKey(const Key('driver_availability_switch'));
+      await tester.tap(switchFinder);
+      await tester.pumpAndSettle();
+
+      // Confirms backend PATCH called with isOnline: false
+      expect(driverRepo.updateStatusCallCount, 1);
+      expect(driverRepo.lastUpdateStatusIsOnline, isFalse);
+
+      // Confirms updated offline state
+      final switchWidget = tester.widget<Switch>(switchFinder);
+      expect(switchWidget.value, isFalse);
+    });
+
+    testWidgets('tapping availability switch with conflict error displays error snackbar', (tester) async {
+      final tokenStore = AuthTokenStore();
+      final secureStorage = SecureTokenStorage.inMemory({
+        SecureTokenStorage.refreshTokenKey: 'existing-refresh-token',
+      });
+      final authRepo = FakeAuthRepository(currentUser: approvedDriverUser);
+      final driverRepo = FakeDriverRepository(
+        statusResponse: const DriverStatusResponse(
+          id: 'dp-approved-1',
+          verificationStatus: 'APPROVED',
+          operationalStatus: 'AVAILABLE',
+          isOnline: true,
+          vehiclesCount: 1,
+        ),
+        shouldThrowOnUpdateStatus: true,
+        updateStatusException: const ApiException(
+          statusCode: 409,
+          errorCode: 'CONFLICT',
+          message: 'Cannot go offline while driver has an active trip',
+        ),
+        vehiclesResponse: [sampleVehicle],
+      );
+
+      final authProvider = AuthProvider(
+        authRepository: authRepo,
+        googleSignInService: FakeGoogleSignInService(),
+        tokenStore: tokenStore,
+        secureStorage: secureStorage,
+      );
+      await authProvider.restoreSession();
+
+      final homeProvider = DriverHomeProvider(
+        driverRepository: driverRepo,
+        locationTracker: const NoOpDriverLocationTracker(),
+      );
+
+      await tester.pumpWidget(
+        LastMileApp(
+          config: testConfig,
+          authProvider: authProvider,
+          tokenStore: tokenStore,
+          secureStorage: secureStorage,
+          authRepository: authRepo,
+          driverRepository: driverRepo,
+          driverHomeProvider: homeProvider,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final switchFinder = find.byKey(const Key('driver_availability_switch'));
+      await tester.tap(switchFinder);
+      await tester.pumpAndSettle();
+
+      // Error snackbar should be displayed
+      expect(find.byKey(const Key('driver_availability_error_snackbar')), findsOneWidget);
+      expect(find.text('Cannot go offline while driver has an active trip'), findsOneWidget);
+
+      // Switch should remain online (un-toggled)
+      final switchWidget = tester.widget<Switch>(switchFinder);
+      expect(switchWidget.value, isTrue);
     });
 
     testWidgets('unapproved driver (PENDING) does NOT see availability card or dispatch offers inbox', (tester) async {
@@ -197,15 +339,10 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      // Verification warning banner should be visible
       expect(find.text('Driver Verification: PENDING'), findsOneWidget);
-
-      // Availability and Dispatch offers must NOT be visible for PENDING drivers
       expect(find.byKey(const Key('driver_availability_card')), findsNothing);
       expect(find.byKey(const Key('driver_offers_disconnected_card')), findsNothing);
       expect(find.text('Dispatch Offers'), findsNothing);
-
-      // Status endpoint must NOT have been called
       expect(driverRepo.getStatusCallCount, 0);
     });
 
@@ -244,7 +381,6 @@ void main() {
 
       expect(find.text('Driver Application: REJECTED'), findsOneWidget);
       expect(find.byKey(const Key('driver_availability_card')), findsNothing);
-      expect(find.byKey(const Key('driver_offers_disconnected_card')), findsNothing);
       expect(driverRepo.getStatusCallCount, 0);
     });
 
@@ -283,111 +419,7 @@ void main() {
 
       expect(find.text('Driver Account: SUSPENDED'), findsOneWidget);
       expect(find.byKey(const Key('driver_availability_card')), findsNothing);
-      expect(find.byKey(const Key('driver_offers_disconnected_card')), findsNothing);
       expect(driverRepo.getStatusCallCount, 0);
-    });
-
-    testWidgets('tapping disabled availability switch does not toggle state or call backend', (tester) async {
-      final tokenStore = AuthTokenStore();
-      final secureStorage = SecureTokenStorage.inMemory({
-        SecureTokenStorage.refreshTokenKey: 'existing-refresh-token',
-      });
-      final authRepo = FakeAuthRepository(currentUser: approvedDriverUser);
-      final driverRepo = FakeDriverRepository(
-        statusResponse: const DriverStatusResponse(
-          id: 'dp-approved-1',
-          verificationStatus: 'APPROVED',
-          operationalStatus: 'AVAILABLE',
-          isOnline: true,
-          vehiclesCount: 1,
-        ),
-        vehiclesResponse: [sampleVehicle],
-      );
-
-      final authProvider = AuthProvider(
-        authRepository: authRepo,
-        googleSignInService: FakeGoogleSignInService(),
-        tokenStore: tokenStore,
-        secureStorage: secureStorage,
-      );
-      await authProvider.restoreSession();
-
-      final homeProvider = DriverHomeProvider(driverRepository: driverRepo);
-
-      await tester.pumpWidget(
-        LastMileApp(
-          config: testConfig,
-          authProvider: authProvider,
-          tokenStore: tokenStore,
-          secureStorage: secureStorage,
-          authRepository: authRepo,
-          driverRepository: driverRepo,
-          driverHomeProvider: homeProvider,
-        ),
-      );
-      await tester.pumpAndSettle();
-
-      final switchFinder = find.byKey(const Key('driver_availability_switch'));
-      await tester.tap(switchFinder);
-      await tester.pumpAndSettle();
-
-      final switchWidget = tester.widget<Switch>(switchFinder);
-      expect(switchWidget.onChanged, isNull);
-      // Status call count should still be 1 (only the initial loadDashboard)
-      expect(driverRepo.getStatusCallCount, 1);
-    });
-
-    testWidgets('logout clears driver home state including availability and offers', (tester) async {
-      final tokenStore = AuthTokenStore();
-      final secureStorage = SecureTokenStorage.inMemory({
-        SecureTokenStorage.refreshTokenKey: 'existing-refresh-token',
-      });
-      final authRepo = FakeAuthRepository(currentUser: approvedDriverUser);
-      final driverRepo = FakeDriverRepository(
-        statusResponse: const DriverStatusResponse(
-          id: 'dp-approved-1',
-          verificationStatus: 'APPROVED',
-          operationalStatus: 'AVAILABLE',
-          isOnline: true,
-          vehiclesCount: 1,
-        ),
-        vehiclesResponse: [sampleVehicle],
-      );
-
-      final authProvider = AuthProvider(
-        authRepository: authRepo,
-        googleSignInService: FakeGoogleSignInService(),
-        tokenStore: tokenStore,
-        secureStorage: secureStorage,
-      );
-      await authProvider.restoreSession();
-
-      final homeProvider = DriverHomeProvider(driverRepository: driverRepo);
-
-      await tester.pumpWidget(
-        LastMileApp(
-          config: testConfig,
-          authProvider: authProvider,
-          tokenStore: tokenStore,
-          secureStorage: secureStorage,
-          authRepository: authRepo,
-          driverRepository: driverRepo,
-          driverHomeProvider: homeProvider,
-        ),
-      );
-      await tester.pumpAndSettle();
-
-      expect(homeProvider.hasLoaded, isTrue);
-
-      // Tap logout button
-      await tester.tap(find.byKey(const Key('logout_button')));
-      await tester.pumpAndSettle();
-
-      // Home provider state must be reset
-      expect(homeProvider.hasLoaded, isFalse);
-      expect(homeProvider.status, isNull);
-      expect(homeProvider.vehicles, isEmpty);
-      expect(homeProvider.currentUserId, isNull);
     });
 
     testWidgets('initial status-fetch failure displays Status unavailable on dashboard and availability card', (tester) async {
@@ -414,7 +446,10 @@ void main() {
       );
       await authProvider.restoreSession();
 
-      final homeProvider = DriverHomeProvider(driverRepository: driverRepo);
+      final homeProvider = DriverHomeProvider(
+        driverRepository: driverRepo,
+        locationTracker: const NoOpDriverLocationTracker(),
+      );
 
       await tester.pumpWidget(
         LastMileApp(
@@ -444,13 +479,9 @@ void main() {
       final switchWidget = tester.widget<Switch>(switchFinder);
       expect(switchWidget.value, isFalse);
       expect(switchWidget.onChanged, isNull);
-
-      // Verify neither Offline nor Online is falsely claimed
-      expect(find.text('Offline'), findsNothing);
-      expect(find.text('Online'), findsNothing);
     });
 
-    testWidgets('authoritative response with isOnline=false confirms and displays Offline', (tester) async {
+    testWidgets('authoritative response with isOnline=false confirms and displays Offline and allows going online', (tester) async {
       final tokenStore = AuthTokenStore();
       final secureStorage = SecureTokenStorage.inMemory({
         SecureTokenStorage.refreshTokenKey: 'existing-refresh-token',
@@ -464,6 +495,13 @@ void main() {
           isOnline: false,
           vehiclesCount: 1,
         ),
+        updateStatusResponse: const DriverStatusResponse(
+          id: 'dp-approved-1',
+          verificationStatus: 'APPROVED',
+          operationalStatus: 'AVAILABLE',
+          isOnline: true,
+          vehiclesCount: 1,
+        ),
         vehiclesResponse: [sampleVehicle],
       );
 
@@ -475,7 +513,10 @@ void main() {
       );
       await authProvider.restoreSession();
 
-      final homeProvider = DriverHomeProvider(driverRepository: driverRepo);
+      final homeProvider = DriverHomeProvider(
+        driverRepository: driverRepo,
+        locationTracker: const NoOpDriverLocationTracker(),
+      );
 
       await tester.pumpWidget(
         LastMileApp(
@@ -496,15 +537,262 @@ void main() {
       expect(find.byKey(const Key('driver_operational_status')), findsOneWidget);
       expect(find.text('OFFLINE'), findsOneWidget);
 
-      // Availability card displays Offline (Disabled)
+      // Availability card displays Offline (Inactive)
       final badgeFinder = find.byKey(const Key('driver_availability_status_badge'));
-      expect(find.descendant(of: badgeFinder, matching: find.text('Offline (Disabled)')), findsOneWidget);
+      expect(find.descendant(of: badgeFinder, matching: find.text('Offline (Inactive)')), findsOneWidget);
 
-      // Switch is disabled with false value
+      // Switch is enabled with false value
       final switchFinder = find.byKey(const Key('driver_availability_switch'));
       final switchWidget = tester.widget<Switch>(switchFinder);
       expect(switchWidget.value, isFalse);
-      expect(switchWidget.onChanged, isNull);
+      expect(switchWidget.onChanged, isNotNull);
+
+      // Tap to go online
+      await tester.tap(switchFinder);
+      await tester.pumpAndSettle();
+
+      expect(driverRepo.updateStatusCallCount, 1);
+      expect(driverRepo.lastUpdateStatusIsOnline, isTrue);
+    });
+
+    testWidgets('approved online driver receives pending offers and displays them in inbox', (tester) async {
+      final tokenStore = AuthTokenStore();
+      final secureStorage = SecureTokenStorage.inMemory({
+        SecureTokenStorage.refreshTokenKey: 'existing-refresh-token',
+      });
+      final authRepo = FakeAuthRepository(currentUser: approvedDriverUser);
+      final driverRepo = FakeDriverRepository(
+        statusResponse: const DriverStatusResponse(
+          id: 'dp-approved-1',
+          verificationStatus: 'APPROVED',
+          operationalStatus: 'AVAILABLE',
+          isOnline: true,
+          vehiclesCount: 1,
+        ),
+        offersResponse: [sampleOffer],
+        vehiclesResponse: [sampleVehicle],
+      );
+
+      final authProvider = AuthProvider(
+        authRepository: authRepo,
+        googleSignInService: FakeGoogleSignInService(),
+        tokenStore: tokenStore,
+        secureStorage: secureStorage,
+      );
+      await authProvider.restoreSession();
+
+      final homeProvider = DriverHomeProvider(
+        driverRepository: driverRepo,
+        locationTracker: const NoOpDriverLocationTracker(),
+      );
+
+      await tester.pumpWidget(
+        LastMileApp(
+          config: testConfig,
+          authProvider: authProvider,
+          tokenStore: tokenStore,
+          secureStorage: secureStorage,
+          authRepository: authRepo,
+          driverRepository: driverRepo,
+          driverHomeProvider: homeProvider,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Verify pending offer is displayed in inbox
+      expect(find.byKey(const Key('driver_offers_count_badge')), findsOneWidget);
+      expect(find.text('1 active'), findsOneWidget);
+      expect(find.text('Offer #off-real-123 • Group #grp-real-123'), findsOneWidget);
+      expect(find.text('PDEU Gate 1 (Koba Highway)'), findsOneWidget);
+      expect(find.text('3 riders'), findsOneWidget);
+      expect(find.text('₹48.00'), findsOneWidget);
+      expect(find.byKey(const Key('dispatch_offer_accept_button_off-real-123')), findsOneWidget);
+      expect(find.byKey(const Key('dispatch_offer_reject_button_off-real-123')), findsOneWidget);
+    });
+
+    testWidgets('accepting an offer invokes acceptOffer with Idempotency-Key and refreshes offers', (tester) async {
+      final tokenStore = AuthTokenStore();
+      final secureStorage = SecureTokenStorage.inMemory({
+        SecureTokenStorage.refreshTokenKey: 'existing-refresh-token',
+      });
+      final authRepo = FakeAuthRepository(currentUser: approvedDriverUser);
+      final driverRepo = FakeDriverRepository(
+        statusResponse: const DriverStatusResponse(
+          id: 'dp-approved-1',
+          verificationStatus: 'APPROVED',
+          operationalStatus: 'AVAILABLE',
+          isOnline: true,
+          vehiclesCount: 1,
+        ),
+        offersResponse: [sampleOffer],
+        acceptOfferResponse: const AcceptOfferResponse(
+          assignmentId: 'asgn-real-123',
+          tripId: 'trip-real-123',
+          rideGroupId: 'grp-real-123',
+          passengerCount: 3,
+          totalEstimatedFare: '48.00',
+          navigationRoute: NavigationRouteData(geometry: {}, stops: []),
+        ),
+        vehiclesResponse: [sampleVehicle],
+      );
+
+      final authProvider = AuthProvider(
+        authRepository: authRepo,
+        googleSignInService: FakeGoogleSignInService(),
+        tokenStore: tokenStore,
+        secureStorage: secureStorage,
+      );
+      await authProvider.restoreSession();
+
+      final homeProvider = DriverHomeProvider(
+        driverRepository: driverRepo,
+        locationTracker: const NoOpDriverLocationTracker(),
+      );
+
+      await tester.pumpWidget(
+        LastMileApp(
+          config: testConfig,
+          authProvider: authProvider,
+          tokenStore: tokenStore,
+          secureStorage: secureStorage,
+          authRepository: authRepo,
+          driverRepository: driverRepo,
+          driverHomeProvider: homeProvider,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // When accept succeeds, offer list is refreshed (now empty)
+      driverRepo.offersResponse = const [];
+
+      final acceptBtn = find.byKey(const Key('dispatch_offer_accept_button_off-real-123'));
+      await tester.ensureVisible(acceptBtn);
+      await tester.tap(acceptBtn);
+      await tester.pumpAndSettle();
+
+      expect(driverRepo.acceptOfferCallCount, 1);
+      expect(driverRepo.lastAcceptedOfferId, 'off-real-123');
+      expect(driverRepo.lastAcceptedIdempotencyKey, isNotNull);
+      expect(driverRepo.lastAcceptedIdempotencyKey, isNotEmpty);
+
+      // Verify success snackbar
+      expect(find.byKey(const Key('driver_offer_accepted_snackbar')), findsOneWidget);
+      expect(find.text('Offer accepted successfully!'), findsOneWidget);
+    });
+
+    testWidgets('rejecting an offer invokes rejectOffer with Idempotency-Key and removes offer', (tester) async {
+      final tokenStore = AuthTokenStore();
+      final secureStorage = SecureTokenStorage.inMemory({
+        SecureTokenStorage.refreshTokenKey: 'existing-refresh-token',
+      });
+      final authRepo = FakeAuthRepository(currentUser: approvedDriverUser);
+      final driverRepo = FakeDriverRepository(
+        statusResponse: const DriverStatusResponse(
+          id: 'dp-approved-1',
+          verificationStatus: 'APPROVED',
+          operationalStatus: 'AVAILABLE',
+          isOnline: true,
+          vehiclesCount: 1,
+        ),
+        offersResponse: [sampleOffer],
+        vehiclesResponse: [sampleVehicle],
+      );
+
+      final authProvider = AuthProvider(
+        authRepository: authRepo,
+        googleSignInService: FakeGoogleSignInService(),
+        tokenStore: tokenStore,
+        secureStorage: secureStorage,
+      );
+      await authProvider.restoreSession();
+
+      final homeProvider = DriverHomeProvider(
+        driverRepository: driverRepo,
+        locationTracker: const NoOpDriverLocationTracker(),
+      );
+
+      await tester.pumpWidget(
+        LastMileApp(
+          config: testConfig,
+          authProvider: authProvider,
+          tokenStore: tokenStore,
+          secureStorage: secureStorage,
+          authRepository: authRepo,
+          driverRepository: driverRepo,
+          driverHomeProvider: homeProvider,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final rejectBtn = find.byKey(const Key('dispatch_offer_reject_button_off-real-123'));
+      await tester.ensureVisible(rejectBtn);
+      await tester.tap(rejectBtn);
+      await tester.pumpAndSettle();
+
+      expect(driverRepo.rejectOfferCallCount, 1);
+      expect(driverRepo.lastRejectedOfferId, 'off-real-123');
+      expect(driverRepo.lastRejectedIdempotencyKey, isNotNull);
+
+      // Rejected offer is removed from the inbox, falling back to empty state
+      expect(find.text('Offer #off-real-123 • Group #grp-real-123'), findsNothing);
+      expect(find.text('No Pending Offers'), findsOneWidget);
+    });
+
+    testWidgets('logout clears driver home state including availability and offers', (tester) async {
+      final tokenStore = AuthTokenStore();
+      final secureStorage = SecureTokenStorage.inMemory({
+        SecureTokenStorage.refreshTokenKey: 'existing-refresh-token',
+      });
+      final authRepo = FakeAuthRepository(currentUser: approvedDriverUser);
+      final driverRepo = FakeDriverRepository(
+        statusResponse: const DriverStatusResponse(
+          id: 'dp-approved-1',
+          verificationStatus: 'APPROVED',
+          operationalStatus: 'AVAILABLE',
+          isOnline: true,
+          vehiclesCount: 1,
+        ),
+        vehiclesResponse: [sampleVehicle],
+      );
+
+      final authProvider = AuthProvider(
+        authRepository: authRepo,
+        googleSignInService: FakeGoogleSignInService(),
+        tokenStore: tokenStore,
+        secureStorage: secureStorage,
+      );
+      await authProvider.restoreSession();
+
+      final homeProvider = DriverHomeProvider(
+        driverRepository: driverRepo,
+        locationTracker: const NoOpDriverLocationTracker(),
+      );
+
+      await tester.pumpWidget(
+        LastMileApp(
+          config: testConfig,
+          authProvider: authProvider,
+          tokenStore: tokenStore,
+          secureStorage: secureStorage,
+          authRepository: authRepo,
+          driverRepository: driverRepo,
+          driverHomeProvider: homeProvider,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(homeProvider.hasLoaded, isTrue);
+
+      // Tap logout button
+      await tester.tap(find.byKey(const Key('logout_button')));
+      await tester.pumpAndSettle();
+
+      // Home provider state must be reset
+      expect(homeProvider.hasLoaded, isFalse);
+      expect(homeProvider.status, isNull);
+      expect(homeProvider.vehicles, isEmpty);
+      expect(homeProvider.currentUserId, isNull);
+      expect(homeProvider.offers, isEmpty);
     });
   });
 }

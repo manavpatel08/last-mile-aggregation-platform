@@ -3,6 +3,8 @@ import 'dart:async';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:lastmile_mobile/core/network/api_exception.dart';
 import 'package:lastmile_mobile/features/driver/data/driver_repository.dart';
+import 'package:lastmile_mobile/features/driver/models/accept_offer_response.dart';
+import 'package:lastmile_mobile/features/driver/models/driver_dispatch_offer.dart';
 import 'package:lastmile_mobile/features/driver/models/driver_onboarding_request.dart';
 import 'package:lastmile_mobile/features/driver/models/driver_status_response.dart';
 import 'package:lastmile_mobile/features/driver/models/driver_vehicle.dart';
@@ -45,6 +47,49 @@ class ControllableDriverRepository implements DriverRepository {
     }
     return const [];
   }
+
+  @override
+  Future<DriverStatusResponse> updateStatus({required bool isOnline}) async {
+    return const DriverStatusResponse(
+      id: 'default-status',
+      verificationStatus: 'APPROVED',
+      operationalStatus: 'AVAILABLE',
+      isOnline: true,
+      vehiclesCount: 1,
+    );
+  }
+
+  @override
+  Future<void> reportLocation({
+    required double latitude,
+    required double longitude,
+    double? heading,
+    double? speed,
+  }) async {}
+
+  @override
+  Future<List<DriverDispatchOffer>> getPendingOffers() async => const [];
+
+  @override
+  Future<AcceptOfferResponse> acceptOffer({
+    required String offerId,
+    required String idempotencyKey,
+  }) async =>
+      const AcceptOfferResponse(
+        assignmentId: 'asgn-1',
+        tripId: 'trip-1',
+        rideGroupId: 'grp-1',
+        passengerCount: 2,
+        totalEstimatedFare: '40.00',
+        navigationRoute: NavigationRouteData(geometry: {}, stops: []),
+      );
+
+  @override
+  Future<void> rejectOffer({
+    required String offerId,
+    required String idempotencyKey,
+    String? reason,
+  }) async {}
 }
 
 void main() {

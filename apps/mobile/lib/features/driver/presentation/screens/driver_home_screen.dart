@@ -11,7 +11,6 @@ import '../../../auth/state/auth_provider.dart';
 import '../../data/driver_repository.dart';
 import '../../state/driver_home_provider.dart';
 import '../../state/driver_onboarding_provider.dart';
-import '../models/dispatch_offer_item.dart';
 import '../widgets/dispatch_offers_inbox.dart';
 import '../widgets/driver_availability_card.dart';
 
@@ -24,15 +23,30 @@ class DriverHomeScreen extends StatefulWidget {
   State<DriverHomeScreen> createState() => _DriverHomeScreenState();
 }
 
-class _DriverHomeScreenState extends State<DriverHomeScreen> {
+class _DriverHomeScreenState extends State<DriverHomeScreen>
+    with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
         _loadDashboard();
       }
     });
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (mounted) {
+      context.read<DriverHomeProvider>().updateAppLifecycle(state);
+    }
   }
 
   void _loadDashboard() {
@@ -63,6 +77,82 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
     if (!mounted) return;
     if (success) {
       _loadDashboard();
+    }
+  }
+
+  Future<void> _handleToggleAvailability(bool value) async {
+    DriverRepository? repo;
+    try {
+      repo = Provider.of<DriverRepository>(context, listen: false);
+    } catch (_) {}
+
+    final provider = context.read<DriverHomeProvider>();
+    final success = await provider.setOnline(value, repository: repo);
+    if (!mounted) return;
+    if (!success && provider.statusUpdateError != null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          key: const Key('driver_availability_error_snackbar'),
+          content: Text(provider.statusUpdateError!),
+          backgroundColor: AppColors.error,
+        ),
+      );
+    }
+  }
+
+  Future<void> _handleAcceptOffer(String offerId) async {
+    DriverRepository? repo;
+    try {
+      repo = Provider.of<DriverRepository>(context, listen: false);
+    } catch (_) {}
+
+    final provider = context.read<DriverHomeProvider>();
+    final success = await provider.acceptOffer(offerId, repository: repo);
+    if (!mounted) return;
+    if (success) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          key: Key('driver_offer_accepted_snackbar'),
+          content: Text('Offer accepted successfully!'),
+          backgroundColor: AppColors.success,
+        ),
+      );
+    } else if (provider.offersError != null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          key: const Key('driver_offer_error_snackbar'),
+          content: Text(provider.offersError!),
+          backgroundColor: AppColors.error,
+        ),
+      );
+    }
+  }
+
+  Future<void> _handleRejectOffer(String offerId) async {
+    DriverRepository? repo;
+    try {
+      repo = Provider.of<DriverRepository>(context, listen: false);
+    } catch (_) {}
+
+    final provider = context.read<DriverHomeProvider>();
+    final success = await provider.rejectOffer(offerId, repository: repo);
+    if (!mounted) return;
+    if (success) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          key: Key('driver_offer_rejected_snackbar'),
+          content: Text('Offer declined.'),
+          backgroundColor: AppColors.textSecondary,
+        ),
+      );
+    } else if (provider.offersError != null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          key: const Key('driver_offer_error_snackbar'),
+          content: Text(provider.offersError!),
+          backgroundColor: AppColors.error,
+        ),
+      );
     }
   }
 
@@ -582,10 +672,27 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
                   const SizedBox(height: 20),
                   DriverAvailabilityCard(
                     isOnline: driverProvider.isOnline,
+                    isLoading: driverProvider.isUpdatingStatus,
+                    onChanged: driverProvider.hasStatus &&
+                            !driverProvider.isUpdatingStatus
+                        ? _handleToggleAvailability
+                        : null,
                   ),
                   const SizedBox(height: 20),
-                  const DispatchOffersInbox(
-                    state: DispatchInboxState.disconnected,
+                  DispatchOffersInbox(
+                    state: driverProvider.inboxState,
+                    offers: driverProvider.offers,
+                    errorMessage: driverProvider.offersError,
+                    onRetry: () {
+                      DriverRepository? repo;
+                      try {
+                        repo = Provider.of<DriverRepository>(context,
+                            listen: false);
+                      } catch (_) {}
+                      driverProvider.loadOffers(repository: repo);
+                    },
+                    onAcceptOffer: _handleAcceptOffer,
+                    onRejectOffer: _handleRejectOffer,
                   ),
                 ],
                 const SizedBox(height: 20),

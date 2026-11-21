@@ -4,30 +4,76 @@ import '../../../../core/theme/app_colors.dart';
 
 /// Presentation card displaying the driver availability (duty toggle) section.
 ///
-/// In Phase 1, the backend availability endpoint (`PATCH /api/v1/drivers/status`)
-/// is not yet implemented. The control is intentionally rendered disabled (`onChanged: null`)
-/// with a clear explanatory notice that online availability will be activated once
-/// backend dispatch integration (Stage 6) is complete.
+/// In Phase 2, this is integrated with `PATCH /api/v1/drivers/status`.
+/// When [onChanged] is provided and the driver is approved, the switch is interactive.
+/// When [onChanged] is null or [isLoading] is true, the switch is disabled.
 class DriverAvailabilityCard extends StatelessWidget {
   const DriverAvailabilityCard({
     super.key,
     this.isOnline,
+    this.isLoading = false,
+    this.onChanged,
   });
 
   /// Authoritative server online state (null if status is unavailable).
   final bool? isOnline;
+
+  /// Whether an operational status mutation is currently in flight.
+  final bool isLoading;
+
+  /// Callback when driver toggles availability. Null if disabled or unapproved.
+  final ValueChanged<bool>? onChanged;
 
   @override
   Widget build(BuildContext context) {
     final textTheme = Theme.of(context).textTheme;
 
     final String statusBadgeLabel;
-    if (isOnline == true) {
-      statusBadgeLabel = 'Online (Disabled)';
-    } else if (isOnline == false) {
-      statusBadgeLabel = 'Offline (Disabled)';
+    final Color badgeBg;
+    final Color badgeFg;
+
+    if (onChanged != null) {
+      if (isOnline == true) {
+        statusBadgeLabel = 'Online (Active)';
+        badgeBg = AppColors.success.withValues(alpha: 0.15);
+        badgeFg = AppColors.success;
+      } else if (isOnline == false) {
+        statusBadgeLabel = 'Offline (Inactive)';
+        badgeBg = AppColors.textSecondary.withValues(alpha: 0.12);
+        badgeFg = AppColors.textSecondary;
+      } else {
+        statusBadgeLabel = 'Status unavailable';
+        badgeBg = AppColors.textSecondary.withValues(alpha: 0.12);
+        badgeFg = AppColors.textSecondary;
+      }
     } else {
-      statusBadgeLabel = 'Status unavailable';
+      if (isOnline == true) {
+        statusBadgeLabel = 'Online (Disabled)';
+        badgeBg = AppColors.textSecondary.withValues(alpha: 0.12);
+        badgeFg = AppColors.textSecondary;
+      } else if (isOnline == false) {
+        statusBadgeLabel = 'Offline (Disabled)';
+        badgeBg = AppColors.textSecondary.withValues(alpha: 0.12);
+        badgeFg = AppColors.textSecondary;
+      } else {
+        statusBadgeLabel = 'Status unavailable';
+        badgeBg = AppColors.textSecondary.withValues(alpha: 0.12);
+        badgeFg = AppColors.textSecondary;
+      }
+    }
+
+    final String explanationText;
+    if (onChanged != null) {
+      if (isOnline == true) {
+        explanationText =
+            'You are online and eligible to receive sequential dispatch offers. Switch off when ending your shift.';
+      } else {
+        explanationText =
+            'You are currently offline. Switch on to start receiving ride group dispatch offers.';
+      }
+    } else {
+      explanationText =
+          'Online availability will be enabled once backend dispatch integration is connected. You cannot go online at this time.';
     }
 
     return Card(
@@ -75,15 +121,31 @@ class DriverAvailabilityCard extends StatelessWidget {
                     vertical: 4,
                   ),
                   decoration: BoxDecoration(
-                    color: AppColors.textSecondary.withValues(alpha: 0.12),
+                    color: badgeBg,
                     borderRadius: BorderRadius.circular(6),
                   ),
-                  child: Text(
-                    statusBadgeLabel,
-                    style: textTheme.bodySmall?.copyWith(
-                      color: AppColors.textSecondary,
-                      fontWeight: FontWeight.bold,
-                    ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (isLoading) ...[
+                        const SizedBox(
+                          width: 10,
+                          height: 10,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: AppColors.textSecondary,
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                      ],
+                      Text(
+                        statusBadgeLabel,
+                        style: textTheme.bodySmall?.copyWith(
+                          color: badgeFg,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ],
@@ -117,8 +179,7 @@ class DriverAvailabilityCard extends StatelessWidget {
                 Switch(
                   key: const Key('driver_availability_switch'),
                   value: isOnline == true,
-                  // Intentionally null in Phase 1: backend endpoint is not yet connected.
-                  onChanged: null,
+                  onChanged: isLoading ? null : onChanged,
                 ),
               ],
             ),
@@ -144,7 +205,7 @@ class DriverAvailabilityCard extends StatelessWidget {
                   const SizedBox(width: 10),
                   Expanded(
                     child: Text(
-                      'Online availability will be enabled once backend dispatch integration is connected. You cannot go online at this time.',
+                      explanationText,
                       style: textTheme.bodySmall?.copyWith(
                         color: AppColors.textPrimary,
                         height: 1.35,

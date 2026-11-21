@@ -18,6 +18,8 @@ import 'package:lastmile_mobile/features/booking/models/location_validation.dart
 import 'package:lastmile_mobile/features/booking/models/pickup_point.dart';
 import 'package:lastmile_mobile/features/booking/models/service_region.dart';
 import 'package:lastmile_mobile/features/driver/data/driver_repository.dart';
+import 'package:lastmile_mobile/features/driver/models/accept_offer_response.dart';
+import 'package:lastmile_mobile/features/driver/models/driver_dispatch_offer.dart';
 import 'package:lastmile_mobile/features/driver/models/driver_onboarding_request.dart';
 import 'package:lastmile_mobile/features/driver/models/driver_status_response.dart';
 import 'package:lastmile_mobile/features/driver/models/driver_vehicle.dart';
@@ -273,6 +275,19 @@ class FakeDriverRepository implements DriverRepository {
     this.shouldThrowOnVehicles = false,
     this.statusException,
     this.vehiclesException,
+    this.updateStatusResponse,
+    this.shouldThrowOnUpdateStatus = false,
+    this.updateStatusException,
+    this.offersResponse,
+    this.shouldThrowOnOffers = false,
+    this.offersException,
+    this.acceptOfferResponse,
+    this.shouldThrowOnAcceptOffer = false,
+    this.acceptOfferException,
+    this.shouldThrowOnRejectOffer = false,
+    this.rejectOfferException,
+    this.shouldThrowOnReportLocation = false,
+    this.reportLocationException,
   });
 
   DriverOnboardingResponse? response;
@@ -289,6 +304,36 @@ class FakeDriverRepository implements DriverRepository {
   Exception? vehiclesException;
   int getStatusCallCount = 0;
   int getVehiclesCallCount = 0;
+
+  DriverStatusResponse? updateStatusResponse;
+  bool shouldThrowOnUpdateStatus;
+  Exception? updateStatusException;
+  int updateStatusCallCount = 0;
+  bool? lastUpdateStatusIsOnline;
+
+  List<DriverDispatchOffer>? offersResponse;
+  bool shouldThrowOnOffers;
+  Exception? offersException;
+  int getPendingOffersCallCount = 0;
+
+  AcceptOfferResponse? acceptOfferResponse;
+  bool shouldThrowOnAcceptOffer;
+  Exception? acceptOfferException;
+  int acceptOfferCallCount = 0;
+  String? lastAcceptedOfferId;
+  String? lastAcceptedIdempotencyKey;
+
+  bool shouldThrowOnRejectOffer;
+  Exception? rejectOfferException;
+  int rejectOfferCallCount = 0;
+  String? lastRejectedOfferId;
+  String? lastRejectedIdempotencyKey;
+  String? lastRejectedReason;
+
+  bool shouldThrowOnReportLocation;
+  Exception? reportLocationException;
+  int reportLocationCallCount = 0;
+  Map<String, dynamic>? lastReportedLocation;
 
   @override
   Future<DriverOnboardingResponse> onboardDriver(
@@ -344,6 +389,116 @@ class FakeDriverRepository implements DriverRepository {
           isOnline: false,
           vehiclesCount: 1,
         );
+  }
+
+  @override
+  Future<DriverStatusResponse> updateStatus({required bool isOnline}) async {
+    updateStatusCallCount++;
+    lastUpdateStatusIsOnline = isOnline;
+    if (updateStatusException != null) throw updateStatusException!;
+    if (shouldThrowOnUpdateStatus) {
+      throw const ApiException(
+        statusCode: 409,
+        errorCode: 'CONFLICT',
+        message: 'Cannot go offline while driver has an active or reserved assignment',
+      );
+    }
+    return updateStatusResponse ??
+        DriverStatusResponse(
+          id: statusResponse?.id ?? 'dp-fake-123',
+          verificationStatus: statusResponse?.verificationStatus ?? 'APPROVED',
+          operationalStatus: isOnline ? 'AVAILABLE' : 'OFFLINE',
+          isOnline: isOnline,
+          vehiclesCount: statusResponse?.vehiclesCount ?? 1,
+        );
+  }
+
+  @override
+  Future<void> reportLocation({
+    required double latitude,
+    required double longitude,
+    double? heading,
+    double? speed,
+  }) async {
+    reportLocationCallCount++;
+    lastReportedLocation = {
+      'latitude': latitude,
+      'longitude': longitude,
+      'heading': heading,
+      'speed': speed,
+    };
+    if (reportLocationException != null) throw reportLocationException!;
+    if (shouldThrowOnReportLocation) {
+      throw const ApiException(
+        statusCode: 503,
+        errorCode: 'SERVICE_UNAVAILABLE',
+        message: 'Telemetry service temporarily unavailable',
+      );
+    }
+  }
+
+  @override
+  Future<List<DriverDispatchOffer>> getPendingOffers() async {
+    getPendingOffersCallCount++;
+    if (offersException != null) throw offersException!;
+    if (shouldThrowOnOffers) {
+      throw const ApiException(
+        statusCode: 500,
+        errorCode: 'SERVER_ERROR',
+        message: 'Failed to retrieve pending offers',
+      );
+    }
+    return offersResponse ?? const [];
+  }
+
+  @override
+  Future<AcceptOfferResponse> acceptOffer({
+    required String offerId,
+    required String idempotencyKey,
+  }) async {
+    acceptOfferCallCount++;
+    lastAcceptedOfferId = offerId;
+    lastAcceptedIdempotencyKey = idempotencyKey;
+    if (acceptOfferException != null) throw acceptOfferException!;
+    if (shouldThrowOnAcceptOffer) {
+      throw const ApiException(
+        statusCode: 409,
+        errorCode: 'OFFER_EXPIRED',
+        message: 'Offer has expired',
+      );
+    }
+    return acceptOfferResponse ??
+        AcceptOfferResponse(
+          assignmentId: 'asgn-fake-123',
+          tripId: 'trip-fake-123',
+          rideGroupId: 'grp-fake-123',
+          passengerCount: 2,
+          totalEstimatedFare: '48.00',
+          navigationRoute: const NavigationRouteData(
+            geometry: {},
+            stops: [],
+          ),
+        );
+  }
+
+  @override
+  Future<void> rejectOffer({
+    required String offerId,
+    required String idempotencyKey,
+    String? reason,
+  }) async {
+    rejectOfferCallCount++;
+    lastRejectedOfferId = offerId;
+    lastRejectedIdempotencyKey = idempotencyKey;
+    lastRejectedReason = reason;
+    if (rejectOfferException != null) throw rejectOfferException!;
+    if (shouldThrowOnRejectOffer) {
+      throw const ApiException(
+        statusCode: 409,
+        errorCode: 'OFFER_EXPIRED',
+        message: 'Offer has expired',
+      );
+    }
   }
 
   @override

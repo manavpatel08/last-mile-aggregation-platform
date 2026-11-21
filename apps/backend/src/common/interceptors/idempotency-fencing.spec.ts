@@ -4,6 +4,9 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import * as crypto from 'crypto';
 import { PrismaModule } from '../../infrastructure/prisma/prisma.module.js';
 import { PrismaService } from '../../infrastructure/prisma/prisma.service.js';
+import { RedisModule } from '../../infrastructure/redis/redis.module.js';
+import { RedisService } from '../../infrastructure/redis/redis.service.js';
+import { CACHE_KEYS } from '../constants/index.js';
 import { BookingsService } from '../../modules/bookings/bookings.service.js';
 import { TripsService } from '../../modules/trips/trips.service.js';
 import { LocationsService } from '../../modules/locations/locations.service.js';
@@ -18,6 +21,7 @@ describe('Idempotency Fencing & Transactional Commit Safety', () => {
   let bookingsService: BookingsService;
   let tripsService: TripsService;
   let locationsService: LocationsService;
+  let redisService: RedisService;
 
   let testPassengerUserId: string;
   let testDriverUserId: string;
@@ -32,7 +36,7 @@ describe('Idempotency Fencing & Transactional Commit Safety', () => {
 
   beforeAll(async () => {
     module = await Test.createTestingModule({
-      imports: [PrismaModule],
+      imports: [PrismaModule, RedisModule],
       providers: [BookingsService, TripsService, LocationsService],
     }).compile();
 
@@ -42,6 +46,7 @@ describe('Idempotency Fencing & Transactional Commit Safety', () => {
     bookingsService = module.get<BookingsService>(BookingsService);
     tripsService = module.get<TripsService>(TripsService);
     locationsService = module.get<LocationsService>(LocationsService);
+    redisService = module.get<RedisService>(RedisService);
 
     await locationsService.bootstrapDefaults();
     const pickup = await prisma.pickupPoint.findFirst({
@@ -447,6 +452,20 @@ describe('Idempotency Fencing & Transactional Commit Safety', () => {
         idempotencyKey,
         userId: testDriverUserId,
       };
+
+      // Seed Redis with fresh GPS fix for driver at PDEU
+      await redisService.getClient().set(
+        `${CACHE_KEYS.DRIVER_GPS_PREFIX}${testDriverProfileId}`,
+        JSON.stringify({
+          latitude: 23.155,
+          longitude: 72.6668,
+          heading: 0,
+          speed: 0,
+          updatedAt: new Date().toISOString(),
+        }),
+        'EX',
+        60,
+      );
 
       // Driver Request 1 attempts reportArrival with claim1 -> must fail
       let req1Err: any = null;
@@ -1387,7 +1406,7 @@ describe('Idempotency Fencing & Transactional Commit Safety', () => {
       expect(collectedCount).toBe(1);
     });
 
-    it('should coordinate concurrent passenger completion requests, collecting fee exactly once and rejecting duplicate drop-off', async () => {
+    it('should coordinate concurrent passenger completion requests, rejecting duplicate drop-off while leaving cancellation fees OUTSTANDING', async () => {
       // 1. Clean up
       await prisma.driverAssignment.updateMany({
         where: { driverId: testDriverProfileId, status: { in: ['RESERVED', 'ACTIVE'] } },
@@ -1522,13 +1541,12 @@ describe('Idempotency Fencing & Transactional Commit Safety', () => {
       expect(fulfilled.length).toBe(1);
       expect(rejected.length).toBe(1);
 
-      // Verify the successful request collected the fee and computed correct cash total
+      // Verify the successful request completed passenger with allocated fare (no cancellation fee settlement in Stage 7)
       const successData = fulfilled[0].value;
       expect(successData.passengerId).toBe(testPassengerUserId);
       expect(successData.rideFarePaise).toBe(2500);
-      expect(successData.outstandingLateFeeSurchargePaise).toBe(3000);
-      expect(successData.totalCashToCollectPaise).toBe(5500); // 2500 + 3000
-      expect(successData.collectedFeeIds).toEqual([fee.id]);
+      expect(successData.waitingChargePaise).toBe(0);
+      expect(successData.totalCashToCollectPaise).toBe(2500);
 
       // Verify the rejected request failed with INVALID_PASSENGER_STATUS_FOR_COMPLETION
       expect(rejected[0].reason).toBeInstanceOf(BadRequestException);
@@ -1538,13 +1556,14 @@ describe('Idempotency Fencing & Transactional Commit Safety', () => {
         }),
       );
 
-      // 3. Verify DB state: fee collected exactly once
+      // 3. Verify DB state: cancellation fee remains strictly OUTSTANDING and uncollected in Stage 7
       const feeInDb = await prisma.cancellationFee.findUnique({
         where: { id: fee.id },
       });
-      expect(feeInDb?.status).toBe('COLLECTED');
-      expect(feeInDb?.collectedBookingId).toBe(activeBookingId);
-      expect(feeInDb?.collectedAt).not.toBeNull();
+      expect(feeInDb?.status).toBe('OUTSTANDING');
+      expect(feeInDb?.collectedBookingId).toBeNull();
+      expect(feeInDb?.collectedAt).toBeNull();
+      expect(feeInDb?.amountPaise).toBe(3000);
 
       // Exactly one PASSENGER_DROPPED_OFF outbox event
       const tp = await prisma.tripPassenger.findFirst({
@@ -1556,7 +1575,7 @@ describe('Idempotency Fencing & Transactional Commit Safety', () => {
       expect(events.length).toBe(1);
     });
 
-    it('should prevent duplicate fee collection on idempotency replay, keeping fee row immutable after collection', async () => {
+    it('should prevent mutation on idempotency replay, keeping cancellation fee OUTSTANDING and uncollected in Stage 7', async () => {
       // 1. Clean up
       await prisma.driverAssignment.updateMany({
         where: { driverId: testDriverProfileId, status: { in: ['RESERVED', 'ACTIVE'] } },
@@ -1654,8 +1673,9 @@ describe('Idempotency Fencing & Transactional Commit Safety', () => {
         claim,
       );
 
-      expect(result.outstandingLateFeeSurchargePaise).toBe(3000);
-      expect(result.totalCashToCollectPaise).toBe(5500);
+      expect(result.rideFarePaise).toBe(2500);
+      expect(result.waitingChargePaise).toBe(0);
+      expect(result.totalCashToCollectPaise).toBe(2500);
 
       // Verify idempotency record is COMPLETED with cached payload
       const finalizedRec = await prisma.idempotencyRecord.findUnique({
@@ -1667,19 +1687,20 @@ describe('Idempotency Fencing & Transactional Commit Safety', () => {
         expect.objectContaining({
           success: true,
           data: expect.objectContaining({
-            outstandingLateFeeSurchargePaise: 3000,
-            totalCashToCollectPaise: 5500,
-            collectedFeeIds: [fee.id],
+            rideFarePaise: 2500,
+            waitingChargePaise: 0,
+            totalCashToCollectPaise: 2500,
           }),
         }),
       );
 
-      // Snapshot fee state in DB
+      // Snapshot fee state in DB: remains OUTSTANDING in Stage 7
       const feeAfterFirstCommit = await prisma.cancellationFee.findUnique({
         where: { id: fee.id },
       });
-      expect(feeAfterFirstCommit?.status).toBe('COLLECTED');
-      const firstCollectedAt = feeAfterFirstCommit!.collectedAt!.getTime();
+      expect(feeAfterFirstCommit?.status).toBe('OUTSTANDING');
+      expect(feeAfterFirstCommit?.collectedBookingId).toBeNull();
+      expect(feeAfterFirstCommit?.collectedAt).toBeNull();
 
       // 3. Replay with the same claim directly against service must be rejected
       // because status is COMPLETED (fencing protects mutation from running again)
@@ -1692,13 +1713,13 @@ describe('Idempotency Fencing & Transactional Commit Safety', () => {
         ),
       ).rejects.toThrow(ConflictException);
 
-      // 4. Verify DB fee record remains completely unchanged (collected at most once)
+      // 4. Verify DB fee record remains completely unchanged and OUTSTANDING
       const feeAfterReplay = await prisma.cancellationFee.findUnique({
         where: { id: fee.id },
       });
-      expect(feeAfterReplay?.status).toBe('COLLECTED');
-      expect(feeAfterReplay?.collectedAt!.getTime()).toBe(firstCollectedAt);
-      expect(feeAfterReplay?.collectedBookingId).toBe(activeBookingId);
+      expect(feeAfterReplay?.status).toBe('OUTSTANDING');
+      expect(feeAfterReplay?.collectedAt).toBeNull();
+      expect(feeAfterReplay?.collectedBookingId).toBeNull();
       expect(feeAfterReplay?.amountPaise).toBe(3000);
     });
   });

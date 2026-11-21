@@ -10,6 +10,7 @@ import {
 } from '@nestjs/common';
 import { TripsService } from './trips.service.js';
 import { VerifyBoardingDto } from './dto/verify-boarding.dto.js';
+import { ArrivePickupDto } from './dto/arrive-pickup.dto.js';
 import { Roles } from '../../common/decorators/roles.decorator.js';
 import { CurrentUser } from '../../common/decorators/current-user.decorator.js';
 import { RequireDriverApproval } from '../../common/decorators/driver-approval.decorator.js';
@@ -29,6 +30,7 @@ export class TripsController {
   async reportArrival(
     @CurrentUser() user: { id: string },
     @Param('id', new ParseUUIDPipe()) tripId: string,
+    @Body() _dto?: ArrivePickupDto,
     @CurrentIdempotencyClaim() claim?: IdempotencyClaimContext,
   ) {
     const result = await this.tripsService.reportArrival(

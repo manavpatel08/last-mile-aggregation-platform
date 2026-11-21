@@ -12,4 +12,5 @@ export const CACHE_KEYS = {
   DRIVER_GPS_PREFIX: 'driver:gps:',
   ZONE_MATCHING_LEASE: 'lease:matching:',
   SOCKET_TICKET_PREFIX: 'socket_ticket:',
+  PASSENGER_OTP_PREFIX: 'passenger:otp:',
 } as const;

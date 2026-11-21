@@ -11,12 +11,13 @@ import {
 } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import type { Queue } from 'bullmq';
-import * as crypto from 'node:crypto';
 import { PrismaService } from '../../infrastructure/prisma/prisma.service.js';
+import { RedisService } from '../../infrastructure/redis/redis.service.js';
 import { DriversService } from '../drivers/drivers.service.js';
 import { RoutingService } from '../routing/routing.service.js';
 import { OutboxService } from '../../infrastructure/outbox/outbox.service.js';
 import { QUEUES } from '../../common/constants/index.js';
+import { deriveBoardingOtp, hashBoardingOtp } from '../../common/utils/otp.util.js';
 import { fenceAndCompleteIdempotentTransaction } from '../../common/interceptors/idempotency.interceptor.js';
 import type { IdempotencyClaimContext } from '../../common/interceptors/idempotency.interceptor.js';
 import {
@@ -87,6 +88,8 @@ export class DispatchService {
     @Optional()
     @Inject(forwardRef(() => OutboxService))
     private readonly outboxService?: OutboxService,
+    @Optional()
+    private readonly redisService?: RedisService,
   ) {}
 
   /**
@@ -1346,6 +1349,7 @@ export class DispatchService {
 
     // Identify offers to cascade after commit (multi-offer withdrawal)
     const withdrawnGroupIds: string[] = [];
+    const memberOtps: Array<{ bookingId: string; otp: string }> = [];
 
     const responseData = await this.prisma.$transaction(async (tx) => {
       // Step 1: Pre-fetch offer basic details
@@ -1593,8 +1597,8 @@ export class DispatchService {
           },
         });
 
-        const otp = crypto.randomInt(1000, 10000).toString();
-        const otpHash = crypto.createHash('sha256').update(otp).digest('hex');
+        const otp = deriveBoardingOtp(b.id, assignment.id);
+        const otpHash = hashBoardingOtp(otp);
 
         await tx.boardingVerification.create({
           data: {
@@ -1605,6 +1609,8 @@ export class DispatchService {
             expiresAt: new Date(Date.now() + 30 * 60 * 1000), // 30 min expiry
           },
         });
+
+        memberOtps.push({ bookingId: b.id, otp });
       }
 
       // Step 12: Multi-Offer Withdrawal (ADR-018)
@@ -1750,6 +1756,17 @@ export class DispatchService {
           `Post-withdrawal cascade for group ${gId} encountered error: ${err?.message}`,
         );
       });
+    }
+
+    // Step 16: Cache generated boarding OTPs in Redis outside the PostgreSQL transaction
+    if (this.redisService) {
+      for (const m of memberOtps) {
+        this.redisService.setPassengerBoardingOtp(m.bookingId, m.otp, 1800).catch((err) => {
+          this.logger.warn(
+            `Failed to cache boarding OTP for booking ${m.bookingId} in Redis: ${err?.message}`,
+          );
+        });
+      }
     }
 
     return responseData;

@@ -5,10 +5,15 @@ import {
   ForbiddenException,
   HttpStatus,
   Logger,
+  Optional,
 } from '@nestjs/common';
 import * as crypto from 'crypto';
 import { PrismaService } from '../../infrastructure/prisma/prisma.service.js';
+import { RedisService } from '../../infrastructure/redis/redis.service.js';
+import { CACHE_KEYS } from '../../common/constants/index.js';
+import { hashBoardingOtp } from '../../common/utils/otp.util.js';
 import { VerifyBoardingDto } from './dto/verify-boarding.dto.js';
+import { calculateWaitingChargePaise } from './trips.util.js';
 import {
   IdempotencyClaimContext,
   verifyIdempotencyClaim,
@@ -41,7 +46,11 @@ export interface TripDetailResponse {
 export class TripsService {
   private readonly logger = new Logger(TripsService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    @Optional()
+    private readonly redisService?: RedisService,
+  ) {}
 
   /**
    * Helper to verify calling driver exists, is approved, and matches assigned trip driver
@@ -70,14 +79,58 @@ export class TripsService {
 
   /**
    * Driver reports arrival at pickup hub (PDEU Main Gate).
-   * Starts individual 5-minute free waiting timer.
+   * Strictly evaluates the server-recorded GPS telemetry in Redis (<= 30s fresh).
+   * Frontend-supplied coordinates are never evaluated or trusted.
+   * Enforces 150m geofence via PostGIS ST_DWithin.
+   * Transitions trip to AT_PICKUP, persists driver_arrived_at exactly once,
+   * updates associated bookings to DRIVER_ARRIVED, and is idempotent on duplicate arrival calls.
    */
   async reportArrival(
     driverUserId: string,
     tripId: string,
-    claim?: IdempotencyClaimContext,
+    claimOrMaybeDto?: IdempotencyClaimContext | Record<string, unknown>,
+    maybeClaim?: IdempotencyClaimContext,
   ) {
+    let claim: IdempotencyClaimContext | undefined;
+
+    if (
+      claimOrMaybeDto &&
+      ('ownerToken' in claimOrMaybeDto || 'idempotencyKey' in claimOrMaybeDto)
+    ) {
+      claim = claimOrMaybeDto as IdempotencyClaimContext;
+    } else if (
+      maybeClaim &&
+      ('ownerToken' in maybeClaim || 'idempotencyKey' in maybeClaim)
+    ) {
+      claim = maybeClaim;
+    }
+
     const driver = await this.getVerifiedDriverProfile(driverUserId);
+
+    // Retrieve driver GPS fix strictly from Redis before opening DB transaction
+    let gpsFix: {
+      latitude: number;
+      longitude: number;
+      heading?: number | null;
+      speed?: number | null;
+      updatedAt?: string;
+    } | null = null;
+
+    if (this.redisService) {
+      try {
+        const client = this.redisService.getClient();
+        const raw = await client.get(
+          `${CACHE_KEYS.DRIVER_GPS_PREFIX}${driver.id}`,
+        );
+        if (raw) {
+          gpsFix = JSON.parse(raw);
+        }
+      } catch (err: any) {
+        this.logger.warn(
+          `Failed to read driver GPS fix from Redis for arrival geofence check: ${err?.message}`,
+        );
+      }
+    }
 
     return this.prisma.$transaction(async (tx) => {
       // Verify claim ownership and lock idempotency record
@@ -91,9 +144,10 @@ export class TripsService {
           active_driver_id: string;
           driver_assignment_id: string;
           ride_group_id: string;
+          driver_arrived_at: Date | null;
         }>
       >`
-        SELECT id, status, active_driver_id, driver_assignment_id, ride_group_id
+        SELECT id, status, active_driver_id, driver_assignment_id, ride_group_id, driver_arrived_at
         FROM trips
         WHERE id = ${tripId}::uuid
         FOR UPDATE;
@@ -115,6 +169,33 @@ export class TripsService {
         });
       }
 
+      // Requirement: Duplicate arrival requests must return the existing successful arrival result
+      // without resetting driver_arrived_at or requiring another GPS check.
+      if (trip.status === 'AT_PICKUP') {
+        const arrivalResult = {
+          tripId: trip.id,
+          status: trip.status,
+          driverArrivedAt: trip.driver_arrived_at
+            ? new Date(trip.driver_arrived_at).toISOString()
+            : null,
+        };
+
+        const responsePayload = {
+          success: true,
+          message: 'Driver arrival confirmed',
+          data: arrivalResult,
+        };
+
+        await fenceAndCompleteIdempotentTransaction(
+          tx,
+          claim,
+          responsePayload,
+          HttpStatus.OK,
+        );
+
+        return arrivalResult;
+      }
+
       if (!['CREATED', 'DRIVER_EN_ROUTE'].includes(trip.status)) {
         throw new BadRequestException({
           errorCode: 'INVALID_TRIP_STATUS_FOR_ARRIVAL',
@@ -122,9 +203,96 @@ export class TripsService {
         });
       }
 
+      // Strict Server-Recorded GPS Telemetry Validation
+      if (!gpsFix) {
+        throw new BadRequestException({
+          errorCode: 'MISSING_GPS_FIX',
+          message:
+            'No recorded GPS telemetry found for driver. Active GPS fix is required to verify arrival at pickup hub.',
+        });
+      }
+
+      const lat = gpsFix.latitude;
+      const lng = gpsFix.longitude;
+
+      if (
+        typeof lat !== 'number' ||
+        typeof lng !== 'number' ||
+        isNaN(lat) ||
+        isNaN(lng) ||
+        lat < -90 ||
+        lat > 90 ||
+        lng < -180 ||
+        lng > 180
+      ) {
+        throw new BadRequestException({
+          errorCode: 'INVALID_GPS_FIX',
+          message: 'Driver GPS fix contains invalid coordinates.',
+        });
+      }
+
+      const fixTime = gpsFix.updatedAt
+        ? new Date(gpsFix.updatedAt).getTime()
+        : NaN;
+      const nowMs = Date.now();
+      const MAX_GPS_AGE_MS = 30_000;
+
+      if (isNaN(fixTime) || nowMs - fixTime > MAX_GPS_AGE_MS) {
+        throw new BadRequestException({
+          errorCode: 'STALE_GPS_FIX',
+          message:
+            'Driver GPS fix is stale (>30s old). Recent telemetry required to verify pickup arrival.',
+        });
+      }
+
+      // Enforce approved PDEU pickup geofence (150m radius) via PostGIS
+      const geofenceCheck = await tx.$queryRaw<
+        Array<{
+          id: string;
+          name: string;
+          radius_meters: number;
+          distance_meters: number;
+          is_valid: boolean;
+        }>
+      >`
+        SELECT
+          pp.id,
+          pp.name,
+          pp.radius_meters,
+          ST_Distance(pp.center_point::geography, ST_SetSRID(ST_MakePoint(${lng}, ${lat}), 4326)::geography) as distance_meters,
+          ST_DWithin(pp.center_point::geography, ST_SetSRID(ST_MakePoint(${lng}, ${lat}), 4326)::geography, pp.radius_meters) as is_valid
+        FROM ride_groups rg
+        JOIN pickup_points pp ON rg.pickup_point_id = pp.id
+        WHERE rg.id = ${trip.ride_group_id}::uuid;
+      `;
+
+      if (
+        !geofenceCheck ||
+        geofenceCheck.length === 0 ||
+        !geofenceCheck[0].is_valid
+      ) {
+        const distance =
+          geofenceCheck && geofenceCheck.length > 0
+            ? `${Math.round(Number(geofenceCheck[0].distance_meters))}m`
+            : 'unknown distance';
+        const hubName =
+          geofenceCheck && geofenceCheck.length > 0
+            ? geofenceCheck[0].name
+            : 'pickup hub';
+        const limit =
+          geofenceCheck && geofenceCheck.length > 0
+            ? `${geofenceCheck[0].radius_meters}m`
+            : '150m';
+
+        throw new BadRequestException({
+          errorCode: 'OUTSIDE_PICKUP_GEOFENCE',
+          message: `Driver location is ${distance} from ${hubName}, exceeding the authorized ${limit} geofence limit.`,
+        });
+      }
+
       const now = new Date();
 
-      // Update trip status to AT_PICKUP
+      // Update trip status to AT_PICKUP and persist driver_arrived_at exactly once
       const updatedTrip = await tx.trip.update({
         where: { id: tripId },
         data: {
@@ -299,9 +467,10 @@ export class TripsService {
           is_verified: boolean;
           attempts_count: number;
           max_attempts: number;
+          expires_at: Date;
         }>
       >`
-        SELECT id, trip_passenger_id, otp_hash, is_verified, attempts_count, max_attempts
+        SELECT id, trip_passenger_id, otp_hash, is_verified, attempts_count, max_attempts, expires_at
         FROM boarding_verifications
         WHERE trip_passenger_id = ${passenger.id}::uuid
         FOR UPDATE;
@@ -340,6 +509,7 @@ export class TripsService {
         return {
           outcome: 'ALREADY_BOARDED',
           data: alreadyBoardedResult,
+          bookingId: passenger.booking_id,
         };
       }
 
@@ -351,9 +521,39 @@ export class TripsService {
         });
       }
 
+      const now = new Date();
+
+      // Check if OTP has expired
+      if (
+        verification.expires_at &&
+        new Date(verification.expires_at).getTime() <= now.getTime()
+      ) {
+        const timestamp = now.toISOString();
+        const path =
+          claim?.requestUrl || `/api/v1/trips/${tripId}/verify-boarding`;
+
+        const errorPayload = {
+          success: false,
+          statusCode: HttpStatus.BAD_REQUEST,
+          errorCode: 'OTP_EXPIRED',
+          message: 'Boarding OTP has expired.',
+          errors: [],
+          timestamp,
+          path,
+        };
+
+        await fenceAndCompleteIdempotentTransaction(
+          tx,
+          claim,
+          errorPayload,
+          HttpStatus.BAD_REQUEST,
+        );
+
+        return { outcome: 'OTP_EXPIRED', timestamp };
+      }
+
       // Enforce maximum 3 attempts
       if (verification.attempts_count >= verification.max_attempts) {
-        const now = new Date();
         const timestamp = now.toISOString();
         const path =
           claim?.requestUrl || `/api/v1/trips/${tripId}/verify-boarding`;
@@ -378,11 +578,8 @@ export class TripsService {
         return { outcome: 'MAX_ATTEMPTS_EXCEEDED', timestamp };
       }
 
-      // Compare SHA-256 hash
-      const inputHash = crypto
-        .createHash('sha256')
-        .update(dto.otp)
-        .digest('hex');
+      // Compare SHA-256 hash using hashBoardingOtp
+      const inputHash = hashBoardingOtp(dto.otp);
 
       if (inputHash !== verification.otp_hash) {
         // Increment attempts count inside transaction
@@ -393,7 +590,6 @@ export class TripsService {
           },
         });
 
-        const now = new Date();
         const timestamp = now.toISOString();
         const path =
           claim?.requestUrl || `/api/v1/trips/${tripId}/verify-boarding`;
@@ -419,21 +615,11 @@ export class TripsService {
         return { outcome: 'INVALID_OTP', timestamp };
       }
 
-      // OTP matched: Calculate waiting charges
-      const now = new Date();
-      let waitingChargePaise = 0;
-
-      if (trip.driver_arrived_at) {
-        const arrivalTime = new Date(trip.driver_arrived_at).getTime();
-        const elapsedSec = (now.getTime() - arrivalTime) / 1000;
-        const elapsedMinutes = Math.max(0, elapsedSec / 60);
-
-        // Schedule: First 5 minutes free (<= 300s). ₹5/started min thereafter.
-        if (elapsedMinutes > 5) {
-          const startedMinutesOver = Math.ceil(elapsedMinutes - 5);
-          waitingChargePaise = Math.min(2500, startedMinutesOver * 500); // 500 paise/min, cap at 5 mins = 2500 paise
-        }
-      }
+      // OTP matched: Calculate waiting charges using authoritative rule
+      const waitingChargePaise = calculateWaitingChargePaise(
+        trip.driver_arrived_at,
+        now,
+      );
 
       // Mark verification completed
       await tx.boardingVerification.update({
@@ -507,8 +693,31 @@ export class TripsService {
       return {
         outcome: 'SUCCESS',
         data: boardingResult,
+        bookingId: passenger.booking_id,
       };
     });
+
+    const bookingIdToInvalidate = (result as any).bookingId;
+    if (
+      bookingIdToInvalidate &&
+      (result.outcome === 'SUCCESS' || result.outcome === 'ALREADY_BOARDED')
+    ) {
+      this.redisService
+        ?.deletePassengerBoardingOtp(bookingIdToInvalidate)
+        .catch((err) => {
+          this.logger.warn(
+            `Failed to invalidate Redis passenger boarding OTP for booking ${bookingIdToInvalidate}: ${(err as Error).message}`,
+          );
+        });
+    }
+
+    if (result.outcome === 'OTP_EXPIRED') {
+      throw new BadRequestException({
+        errorCode: 'OTP_EXPIRED',
+        message: 'Boarding OTP has expired.',
+        timestamp: result.timestamp,
+      });
+    }
 
     if (result.outcome === 'MAX_ATTEMPTS_EXCEEDED') {
       throw new BadRequestException({
@@ -531,7 +740,9 @@ export class TripsService {
 
   /**
    * Driver departs pickup hub: transitions vehicle trip from AT_PICKUP to IN_PROGRESS.
-   * Requires all active passengers to be BOARDED.
+   * Requires all active passengers to be BOARDED (at least 1 passenger boarded).
+   * Transitions ride_groups to IN_PROGRESS and boarded bookings to IN_PROGRESS.
+   * Idempotent on duplicate requests.
    */
   async startTrip(
     driverUserId: string,
@@ -551,9 +762,11 @@ export class TripsService {
           status: string;
           active_driver_id: string;
           driver_assignment_id: string;
+          ride_group_id: string;
+          started_at: Date | null;
         }>
       >`
-        SELECT id, status, active_driver_id, driver_assignment_id
+        SELECT id, status, active_driver_id, driver_assignment_id, ride_group_id, started_at
         FROM trips
         WHERE id = ${tripId}::uuid
         FOR UPDATE;
@@ -573,6 +786,32 @@ export class TripsService {
           errorCode: 'DRIVER_NOT_ASSIGNED_TO_TRIP',
           message: 'Caller is not the assigned active driver for this trip.',
         });
+      }
+
+      // Idempotent duplicate start: If trip is already IN_PROGRESS, return existing start result
+      if (trip.status === 'IN_PROGRESS') {
+        const startResult = {
+          tripId: trip.id,
+          status: trip.status,
+          startedAt: trip.started_at
+            ? new Date(trip.started_at).toISOString()
+            : null,
+        };
+
+        const responsePayload = {
+          success: true,
+          message: 'Trip started successfully',
+          data: startResult,
+        };
+
+        await fenceAndCompleteIdempotentTransaction(
+          tx,
+          claim,
+          responsePayload,
+          HttpStatus.OK,
+        );
+
+        return startResult;
       }
 
       if (trip.status !== 'AT_PICKUP') {
@@ -595,15 +834,30 @@ export class TripsService {
         });
       }
 
+      const boarded = passengers.filter((p) => p.status === 'BOARDED');
+      if (boarded.length === 0) {
+        throw new BadRequestException({
+          errorCode: 'NO_BOARDED_PASSENGERS',
+          message: 'Cannot start trip with zero boarded passengers.',
+        });
+      }
+
       const now = new Date();
 
-      // Update trip status
+      // Update trip status to IN_PROGRESS and persist started_at exactly once
       const updatedTrip = await tx.trip.update({
         where: { id: tripId },
         data: {
           status: 'IN_PROGRESS',
           startedAt: now,
+          currentStopOrder: 0,
         },
+      });
+
+      // Transition ride group from DRIVER_ASSIGNED to IN_PROGRESS per STATE_MACHINES.md
+      await tx.rideGroup.update({
+        where: { id: trip.ride_group_id },
+        data: { status: 'IN_PROGRESS' },
       });
 
       // Update driver assignment started_at
@@ -647,8 +901,10 @@ export class TripsService {
           aggregateId: tripId,
           payload: {
             tripId,
+            rideGroupId: trip.ride_group_id,
             driverId: driver.id,
-            startedAt: now,
+            startedAt: now.toISOString(),
+            status: 'IN_PROGRESS',
           },
         },
       });
@@ -656,7 +912,7 @@ export class TripsService {
       const startResult = {
         tripId: updatedTrip.id,
         status: updatedTrip.status,
-        startedAt: updatedTrip.startedAt?.toISOString(),
+        startedAt: now.toISOString(),
       };
 
       const responsePayload = {
@@ -678,7 +934,10 @@ export class TripsService {
 
   /**
    * Complete individual passenger drop-off.
-   * Atomically claims and settles outstanding cancellation fees with CAS lock.
+   * Validates sequential drop-off according to approved stop_order from group_route_stops.
+   * Advances trips.current_stop_order atomically.
+   * Finalizes passenger fare and waiting charges drop-off settlement.
+   * Idempotent on duplicate completion requests.
    */
   async completePassenger(
     driverUserId: string,
@@ -698,9 +957,12 @@ export class TripsService {
           id: string;
           status: string;
           active_driver_id: string;
+          driver_assignment_id: string;
+          ride_group_id: string;
+          current_stop_order: number;
         }>
       >`
-        SELECT id, status, active_driver_id
+        SELECT id, status, active_driver_id, driver_assignment_id, ride_group_id, current_stop_order
         FROM trips
         WHERE id = ${tripId}::uuid
         FOR UPDATE;
@@ -749,10 +1011,105 @@ export class TripsService {
 
       const passenger = passengers[0];
 
+      // Duplicate passenger completion idempotency
+      if (passenger.status === 'COMPLETED') {
+        if (claim) {
+          throw new BadRequestException({
+            errorCode: 'INVALID_PASSENGER_STATUS_FOR_COMPLETION',
+            message: `Cannot complete drop-off for passenger in status '${passenger.status}'.`,
+          });
+        }
+
+        const totalCashToCollectPaise =
+          passenger.final_ride_fare_paise + passenger.waiting_charge_paise;
+
+        const completionResult = {
+          passengerId,
+          status: 'COMPLETED',
+          rideFarePaise: passenger.final_ride_fare_paise,
+          rideFare: (passenger.final_ride_fare_paise / 100).toFixed(2),
+          waitingChargePaise: passenger.waiting_charge_paise,
+          waitingCharge: (passenger.waiting_charge_paise / 100).toFixed(2),
+          totalCashToCollectPaise,
+          totalCashToCollect: (totalCashToCollectPaise / 100).toFixed(2),
+        };
+
+        const responsePayload = {
+          success: true,
+          data: completionResult,
+        };
+
+        await fenceAndCompleteIdempotentTransaction(
+          tx,
+          claim,
+          responsePayload,
+          HttpStatus.OK,
+        );
+
+        return completionResult;
+      }
+
+      if (trip.status !== 'IN_PROGRESS') {
+        throw new BadRequestException({
+          errorCode: 'INVALID_TRIP_STATUS_FOR_COMPLETION',
+          message: `Trip must be 'IN_PROGRESS' to complete passenger drop-off (current: '${trip.status}').`,
+        });
+      }
+
       if (passenger.status !== 'BOARDED') {
         throw new BadRequestException({
           errorCode: 'INVALID_PASSENGER_STATUS_FOR_COMPLETION',
           message: `Cannot complete drop-off for passenger in status '${passenger.status}'.`,
+        });
+      }
+
+      // Sequential stop-order evaluation:
+      // Query all passengers on this trip and their associated route stops
+      const allTripPassengers = await tx.$queryRaw<
+        Array<{
+          id: string;
+          passenger_id: string;
+          booking_id: string;
+          status: string;
+          stop_order: number;
+        }>
+      >`
+        SELECT
+          tp.id,
+          tp.passenger_id,
+          tp.booking_id,
+          tp.status,
+          COALESCE(grs.stop_order, gm.dropoff_sequence_order, 1)::int as stop_order
+        FROM trip_passengers tp
+        JOIN trips t ON t.id = tp.trip_id
+        LEFT JOIN group_members gm ON gm.ride_group_id = t.ride_group_id AND gm.booking_id = tp.booking_id
+        LEFT JOIN LATERAL (
+          SELECT grv.id FROM group_route_versions grv
+          WHERE grv.ride_group_id = t.ride_group_id
+          ORDER BY grv.version_number DESC
+          LIMIT 1
+        ) latest_grv ON true
+        LEFT JOIN group_route_stops grs ON grs.group_route_version_id = latest_grv.id AND grs.group_member_id = gm.id
+        WHERE tp.trip_id = ${tripId}::uuid;
+      `;
+
+      const targetPassengerRecord = allTripPassengers.find(
+        (p) => p.passenger_id === passengerId,
+      );
+      const targetStopOrder = targetPassengerRecord?.stop_order ?? 1;
+
+      // Cannot drop off passenger at stop N if any passenger at earlier stop M < N is still BOARDED
+      const earlierIncompletePassengers = allTripPassengers.filter(
+        (p) => p.status === 'BOARDED' && p.stop_order < targetStopOrder,
+      );
+
+      if (earlierIncompletePassengers.length > 0) {
+        const earlierStop = Math.min(
+          ...earlierIncompletePassengers.map((p) => p.stop_order),
+        );
+        throw new BadRequestException({
+          errorCode: 'INVALID_STOP_SEQUENCE',
+          message: `Cannot drop off passenger at stop ${targetStopOrder} before completing earlier stop ${earlierStop}.`,
         });
       }
 
@@ -766,6 +1123,15 @@ export class TripsService {
           droppedOffAt: now,
         },
       });
+
+      // Advance trips.current_stop_order to targetStopOrder
+      const newStopOrder = Math.max(trip.current_stop_order, targetStopOrder);
+      if (newStopOrder !== trip.current_stop_order) {
+        await tx.trip.update({
+          where: { id: tripId },
+          data: { currentStopOrder: newStopOrder },
+        });
+      }
 
       // Mark booking completed
       await tx.booking.update({
@@ -793,28 +1159,10 @@ export class TripsService {
         },
       });
 
-      // Review Finding 2: Atomically claim and collect outstanding cancellation fees with CAS lock
-      const claimedFees = await tx.$queryRaw<
-        Array<{ id: string; amount_paise: number }>
-      >`
-        UPDATE cancellation_fees
-        SET
-          status = 'COLLECTED',
-          collected_booking_id = ${passenger.booking_id}::uuid,
-          collected_at = ${now}
-        WHERE passenger_id = ${passengerId}::uuid AND status = 'OUTSTANDING'
-        RETURNING id, amount_paise;
-      `;
-
-      const outstandingLateFeeSurchargePaise = claimedFees.reduce(
-        (sum, f) => sum + f.amount_paise,
-        0,
-      );
-
+      // Total cash to collect for Stage 7 covers allocated ride fare and waiting charges
+      // (Stage 8 handles cash confirmation and cancellation-fee surcharge settlement)
       const totalCashToCollectPaise =
-        passenger.final_ride_fare_paise +
-        passenger.waiting_charge_paise +
-        outstandingLateFeeSurchargePaise;
+        passenger.final_ride_fare_paise + passenger.waiting_charge_paise;
 
       await tx.outboxEvent.create({
         data: {
@@ -825,10 +1173,9 @@ export class TripsService {
             tripId,
             passengerId,
             bookingId: passenger.booking_id,
+            stopOrder: targetStopOrder,
             rideFarePaise: passenger.final_ride_fare_paise,
             waitingChargePaise: passenger.waiting_charge_paise,
-            outstandingLateFeeSurchargePaise,
-            collectedFeeIds: claimedFees.map((f) => f.id),
             totalCashToCollectPaise,
           },
         },
@@ -836,17 +1183,13 @@ export class TripsService {
 
       const completionResult = {
         passengerId,
+        status: 'COMPLETED',
         rideFarePaise: passenger.final_ride_fare_paise,
         rideFare: (passenger.final_ride_fare_paise / 100).toFixed(2),
         waitingChargePaise: passenger.waiting_charge_paise,
         waitingCharge: (passenger.waiting_charge_paise / 100).toFixed(2),
-        outstandingLateFeeSurchargePaise,
-        outstandingLateFeeSurcharge: (
-          outstandingLateFeeSurchargePaise / 100
-        ).toFixed(2),
         totalCashToCollectPaise,
         totalCashToCollect: (totalCashToCollectPaise / 100).toFixed(2),
-        collectedFeeIds: claimedFees.map((f) => f.id),
       };
 
       const responsePayload = {
@@ -868,6 +1211,7 @@ export class TripsService {
   /**
    * Driver declares passenger no-show after 10 minutes from driver arrival.
    * Assesses flat ₹30 no-show fee into cancellation_fees ledger. Zero waiting charge.
+   * Idempotent on duplicate requests.
    */
   async declareNoShow(
     driverUserId: string,
@@ -912,25 +1256,6 @@ export class TripsService {
         });
       }
 
-      if (!trip.driver_arrived_at) {
-        throw new BadRequestException({
-          errorCode: 'DRIVER_NOT_AT_PICKUP',
-          message: 'Driver arrival has not been recorded for this trip.',
-        });
-      }
-
-      // Check 10-minute threshold (600 seconds)
-      const now = new Date();
-      const arrivalTime = new Date(trip.driver_arrived_at).getTime();
-      const elapsedSeconds = (now.getTime() - arrivalTime) / 1000;
-
-      if (elapsedSeconds < 600) {
-        throw new BadRequestException({
-          errorCode: 'NO_SHOW_THRESHOLD_NOT_MET',
-          message: `No-show cannot be declared until 10 minutes have elapsed since arrival (${Math.floor(elapsedSeconds)}s elapsed).`,
-        });
-      }
-
       // Lock trip passenger row with SELECT ... FOR UPDATE
       const passengers = await tx.$queryRaw<
         Array<{
@@ -955,6 +1280,50 @@ export class TripsService {
       }
 
       const passenger = passengers[0];
+
+      // Idempotency check: if passenger is already NO_SHOW, return existing result
+      if (passenger.status === 'NO_SHOW') {
+        const noShowResult = {
+          passengerId,
+          status: 'NO_SHOW',
+          penaltyAssessedPaise: 3000,
+          penaltyAssessed: '30.00',
+        };
+
+        const responsePayload = {
+          success: true,
+          message: 'Passenger declared no-show',
+          data: noShowResult,
+        };
+
+        await fenceAndCompleteIdempotentTransaction(
+          tx,
+          claim,
+          responsePayload,
+          HttpStatus.OK,
+        );
+
+        return noShowResult;
+      }
+
+      if (!trip.driver_arrived_at) {
+        throw new BadRequestException({
+          errorCode: 'DRIVER_NOT_AT_PICKUP',
+          message: 'Driver arrival has not been recorded for this trip.',
+        });
+      }
+
+      // Check 10-minute threshold (600 seconds)
+      const now = new Date();
+      const arrivalTime = new Date(trip.driver_arrived_at).getTime();
+      const elapsedSeconds = (now.getTime() - arrivalTime) / 1000;
+
+      if (elapsedSeconds < 600) {
+        throw new BadRequestException({
+          errorCode: 'NO_SHOW_THRESHOLD_NOT_MET',
+          message: `No-show cannot be declared until 10 minutes have elapsed since arrival (${Math.floor(elapsedSeconds)}s elapsed).`,
+        });
+      }
 
       if (passenger.status !== 'WAITING') {
         throw new BadRequestException({
@@ -1040,7 +1409,8 @@ export class TripsService {
 
   /**
    * Finalize vehicle trip after all drop-offs or no-shows are resolved.
-   * Releases driver operational status back to AVAILABLE.
+   * Releases driver operational status back to AVAILABLE via atomic conditional update.
+   * Idempotent on duplicate completion requests.
    */
   async completeTrip(
     driverUserId: string,
@@ -1061,9 +1431,10 @@ export class TripsService {
           active_driver_id: string;
           driver_assignment_id: string;
           ride_group_id: string;
+          completed_at: Date | null;
         }>
       >`
-        SELECT id, status, active_driver_id, driver_assignment_id, ride_group_id
+        SELECT id, status, active_driver_id, driver_assignment_id, ride_group_id, completed_at
         FROM trips
         WHERE id = ${tripId}::uuid
         FOR UPDATE;
@@ -1085,6 +1456,33 @@ export class TripsService {
         });
       }
 
+      // Idempotent duplicate trip completion:
+      // If trip is already COMPLETED, return the existing result without resetting completed_at or duplicate side effects
+      if (trip.status === 'COMPLETED') {
+        const tripResult = {
+          tripId: trip.id,
+          status: trip.status,
+          completedAt: trip.completed_at
+            ? new Date(trip.completed_at).toISOString()
+            : null,
+        };
+
+        const responsePayload = {
+          success: true,
+          message: 'Trip completed successfully',
+          data: tripResult,
+        };
+
+        await fenceAndCompleteIdempotentTransaction(
+          tx,
+          claim,
+          responsePayload,
+          HttpStatus.OK,
+        );
+
+        return tripResult;
+      }
+
       if (trip.status !== 'IN_PROGRESS') {
         throw new BadRequestException({
           errorCode: 'INVALID_TRIP_STATUS_FOR_COMPLETION',
@@ -1092,12 +1490,12 @@ export class TripsService {
         });
       }
 
-      // Review Finding 6.2: Use $queryRaw for row-returning SELECT ... FOR UPDATE
+      // Lock driver profile row with SELECT ... FOR UPDATE
       await tx.$queryRaw`
         SELECT id FROM driver_profiles WHERE id = ${driver.id}::uuid FOR UPDATE;
       `;
 
-      // Verify all passengers are finalized
+      // Verify all passengers are finalized (COMPLETED, NO_SHOW, or CANCELLED)
       const passengers = await tx.tripPassenger.findMany({
         where: { tripId },
       });
@@ -1115,7 +1513,7 @@ export class TripsService {
 
       const now = new Date();
 
-      // Update trip
+      // Update trip to COMPLETED and set completed_at exactly once
       const updatedTrip = await tx.trip.update({
         where: { id: tripId },
         data: {
@@ -1124,7 +1522,7 @@ export class TripsService {
         },
       });
 
-      // Update assignment
+      // Update driver assignment to COMPLETED
       await tx.driverAssignment.update({
         where: { id: trip.driver_assignment_id },
         data: {
@@ -1133,19 +1531,33 @@ export class TripsService {
         },
       });
 
-      // Update ride group
+      // Update ride group to COMPLETED
       await tx.rideGroup.update({
         where: { id: trip.ride_group_id },
         data: { status: 'COMPLETED' },
       });
 
-      // Atomic CAS to release driver operational_status back to AVAILABLE
-      await tx.driverProfile.update({
-        where: { id: driver.id },
-        data: {
-          operationalStatus: 'AVAILABLE',
+      // Atomic conditional update to release driver operational_status back to AVAILABLE
+      // checking that the driver has no other active or reserved assignment
+      const otherActiveAssignments = await tx.driverAssignment.count({
+        where: {
+          driverId: driver.id,
+          id: { not: trip.driver_assignment_id },
+          status: { in: ['RESERVED', 'ACTIVE'] },
         },
       });
+
+      if (otherActiveAssignments === 0) {
+        await tx.driverProfile.updateMany({
+          where: {
+            id: driver.id,
+            operationalStatus: { not: 'SUSPENDED' },
+          },
+          data: {
+            operationalStatus: 'AVAILABLE',
+          },
+        });
+      }
 
       await tx.tripStatusHistory.create({
         data: {
@@ -1163,8 +1575,10 @@ export class TripsService {
           aggregateId: tripId,
           payload: {
             tripId,
+            rideGroupId: trip.ride_group_id,
             driverId: driver.id,
-            completedAt: now,
+            completedAt: now.toISOString(),
+            status: 'COMPLETED',
           },
         },
       });
@@ -1172,7 +1586,7 @@ export class TripsService {
       const tripResult = {
         tripId: updatedTrip.id,
         status: updatedTrip.status,
-        completedAt: updatedTrip.completedAt?.toISOString(),
+        completedAt: now.toISOString(),
       };
 
       const responsePayload = {

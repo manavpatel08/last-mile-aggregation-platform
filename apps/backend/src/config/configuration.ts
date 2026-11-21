@@ -24,6 +24,9 @@ export default () => ({
       10,
     ),
   },
+  otp: {
+    boardingSecret: process.env.BOARDING_OTP_SECRET || '',
+  },
   google: {
     clientIdIos: process.env.GOOGLE_CLIENT_ID_IOS || '',
     clientIdAndroid: process.env.GOOGLE_CLIENT_ID_ANDROID || '',

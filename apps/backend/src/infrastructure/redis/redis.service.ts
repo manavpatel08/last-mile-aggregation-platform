@@ -1,6 +1,7 @@
 import { Injectable, type OnModuleInit, type OnModuleDestroy, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Redis } from 'ioredis';
+import { CACHE_KEYS } from '../../common/constants/index.js';
 
 @Injectable()
 export class RedisService implements OnModuleInit, OnModuleDestroy {
@@ -73,5 +74,29 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     const data = await this.client.get(key);
     if (!data) return null;
     return JSON.parse(data) as { lat: number; lng: number };
+  }
+
+  /**
+   * Caches a passenger's ephemeral 4-digit boarding OTP with TTL in seconds (default 30m = 1800s).
+   */
+  async setPassengerBoardingOtp(bookingId: string, otp: string, ttlSeconds = 1800): Promise<void> {
+    const key = `${CACHE_KEYS.PASSENGER_OTP_PREFIX}${bookingId}`;
+    await this.client.set(key, otp, 'EX', ttlSeconds);
+  }
+
+  /**
+   * Retrieves a passenger's cached ephemeral 4-digit boarding OTP.
+   */
+  async getPassengerBoardingOtp(bookingId: string): Promise<string | null> {
+    const key = `${CACHE_KEYS.PASSENGER_OTP_PREFIX}${bookingId}`;
+    return this.client.get(key);
+  }
+
+  /**
+   * Deletes a passenger's cached boarding OTP upon successful verification or cancellation.
+   */
+  async deletePassengerBoardingOtp(bookingId: string): Promise<void> {
+    const key = `${CACHE_KEYS.PASSENGER_OTP_PREFIX}${bookingId}`;
+    await this.client.del(key);
   }
 }

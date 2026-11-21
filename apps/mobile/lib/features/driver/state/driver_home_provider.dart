@@ -64,8 +64,9 @@ class DriverHomeProvider extends ChangeNotifier {
   DriverStatusResponse? get status => _status;
   List<DriverVehicle> get vehicles => _vehicles;
   int get vehicleCount => _status?.vehiclesCount ?? _vehicles.length;
-  bool get isOnline => _status?.isOnline ?? false;
-  String get operationalStatus => _status?.operationalStatus ?? 'OFFLINE';
+  bool? get isOnline => _status?.isOnline;
+  bool get hasStatus => _status != null;
+  String? get operationalStatus => _status?.operationalStatus;
   bool get hasLoaded => _hasLoaded;
   String? get currentUserId => _currentUserId;
 

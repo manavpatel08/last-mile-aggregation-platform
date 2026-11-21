@@ -87,8 +87,9 @@ void main() {
       expect(provider.vehicles, isEmpty);
       expect(provider.hasLoaded, isFalse);
       expect(provider.vehicleCount, 0);
-      expect(provider.isOnline, isFalse);
-      expect(provider.operationalStatus, 'OFFLINE');
+      expect(provider.isOnline, isNull);
+      expect(provider.operationalStatus, isNull);
+      expect(provider.hasStatus, isFalse);
     });
 
     test('loadDashboard for APPROVED driver calls both status and vehicles', () async {
@@ -123,8 +124,9 @@ void main() {
       expect(provider.status, isNull);
       expect(provider.vehicles, equals([testVehicle]));
       expect(provider.vehicleCount, 1);
-      expect(provider.isOnline, isFalse);
-      expect(provider.operationalStatus, 'OFFLINE');
+      expect(provider.isOnline, isNull);
+      expect(provider.operationalStatus, isNull);
+      expect(provider.hasStatus, isFalse);
     });
 
     test('loadDashboard for REJECTED driver does NOT call getDriverStatus', () async {
@@ -201,7 +203,9 @@ void main() {
       expect(provider.hasLoaded, isFalse);
       expect(provider.currentUserId, isNull);
       expect(provider.vehicleCount, 0);
-      expect(provider.operationalStatus, 'OFFLINE');
+      expect(provider.operationalStatus, isNull);
+      expect(provider.isOnline, isNull);
+      expect(provider.hasStatus, isFalse);
     });
 
     test('loadDashboard with a different userId purges previous user data immediately', () async {
@@ -703,6 +707,125 @@ void main() {
 
       expect(provider.isRefreshing, isFalse);
       expect(provider.vehicles, equals([subsequentVehicle]));
+    });
+
+    test('initial status-fetch failure leaves status null and sets error', () async {
+      final failRepo = FakeDriverRepository(
+        shouldThrowOnStatus: true,
+        statusException: const ApiException(
+          statusCode: 500,
+          errorCode: 'SERVER_ERROR',
+          message: 'Status endpoint failed',
+        ),
+      );
+      final failProvider = DriverHomeProvider(driverRepository: failRepo);
+
+      await failProvider.loadDashboard(verificationStatus: 'APPROVED');
+      expect(failProvider.hasError, isTrue);
+      expect(failProvider.error, contains('Status endpoint failed'));
+      expect(failProvider.status, isNull);
+      expect(failProvider.isOnline, isNull);
+      expect(failProvider.operationalStatus, isNull);
+      expect(failProvider.hasStatus, isFalse);
+    });
+
+    test('successful status-fetch with isOnline=false confirms offline status', () async {
+      const offlineStatus = DriverStatusResponse(
+        id: 'dp-offline',
+        verificationStatus: 'APPROVED',
+        operationalStatus: 'OFFLINE',
+        isOnline: false,
+        vehiclesCount: 1,
+      );
+      final offlineRepo = FakeDriverRepository(
+        statusResponse: offlineStatus,
+      );
+      final offlineProvider = DriverHomeProvider(driverRepository: offlineRepo);
+
+      await offlineProvider.loadDashboard(verificationStatus: 'APPROVED');
+      expect(offlineProvider.status, equals(offlineStatus));
+      expect(offlineProvider.isOnline, isFalse);
+      expect(offlineProvider.operationalStatus, 'OFFLINE');
+      expect(offlineProvider.hasStatus, isTrue);
+    });
+
+    test('successful status-fetch with isOnline=true confirms online status', () async {
+      const onlineStatus = DriverStatusResponse(
+        id: 'dp-online',
+        verificationStatus: 'APPROVED',
+        operationalStatus: 'AVAILABLE',
+        isOnline: true,
+        vehiclesCount: 1,
+      );
+      final onlineRepo = FakeDriverRepository(
+        statusResponse: onlineStatus,
+      );
+      final onlineProvider = DriverHomeProvider(driverRepository: onlineRepo);
+
+      await onlineProvider.loadDashboard(verificationStatus: 'APPROVED');
+      expect(onlineProvider.status, equals(onlineStatus));
+      expect(onlineProvider.isOnline, isTrue);
+      expect(onlineProvider.operationalStatus, 'AVAILABLE');
+      expect(onlineProvider.hasStatus, isTrue);
+    });
+
+    test('failed refresh preserves existing status (stale data) and does not update status', () async {
+      const initialStatus = DriverStatusResponse(
+        id: 'dp-initial',
+        verificationStatus: 'APPROVED',
+        operationalStatus: 'AVAILABLE',
+        isOnline: true,
+        vehiclesCount: 1,
+      );
+      final repo = FakeDriverRepository(
+        statusResponse: initialStatus,
+      );
+      final p = DriverHomeProvider(driverRepository: repo);
+
+      // Successful initial load
+      await p.loadDashboard(verificationStatus: 'APPROVED');
+      expect(p.hasStatus, isTrue);
+      expect(p.isOnline, isTrue);
+      expect(p.operationalStatus, 'AVAILABLE');
+
+      // Now configure repo to fail on refresh
+      repo.shouldThrowOnStatus = true;
+      repo.statusException = const ApiException(
+        statusCode: 503,
+        errorCode: 'UNAVAILABLE',
+        message: 'Network drop during refresh',
+      );
+
+      await p.refreshDashboard(verificationStatus: 'APPROVED');
+
+      // Stale data must be preserved deliberately
+      expect(p.isRefreshing, isFalse);
+      expect(p.hasError, isTrue);
+      expect(p.error, contains('Network drop during refresh'));
+      expect(p.status, equals(initialStatus));
+      expect(p.isOnline, isTrue);
+      expect(p.operationalStatus, 'AVAILABLE');
+      expect(p.hasStatus, isTrue);
+    });
+
+    test('unapproved driver leaves status null and not interpreted as OFFLINE', () async {
+      const localVehicle = DriverVehicle(
+        id: 'veh-pending',
+        driverProfileId: 'dp-pending',
+        registrationNumber: 'GJ-01-PEND',
+        vehicleType: 'E_RICKSHAW',
+        passengerCapacity: 4,
+        makeModel: 'Pending Model',
+        isActive: true,
+      );
+      final unapprovedRepo = FakeDriverRepository(vehiclesResponse: [localVehicle]);
+      final unapprovedProvider = DriverHomeProvider(driverRepository: unapprovedRepo);
+
+      await unapprovedProvider.loadDashboard(verificationStatus: 'PENDING');
+      expect(unapprovedProvider.status, isNull);
+      expect(unapprovedProvider.isOnline, isNull);
+      expect(unapprovedProvider.operationalStatus, isNull);
+      expect(unapprovedProvider.hasStatus, isFalse);
     });
   });
 }

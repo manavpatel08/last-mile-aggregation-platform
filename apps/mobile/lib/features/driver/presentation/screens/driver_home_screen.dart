@@ -11,6 +11,9 @@ import '../../../auth/state/auth_provider.dart';
 import '../../data/driver_repository.dart';
 import '../../state/driver_home_provider.dart';
 import '../../state/driver_onboarding_provider.dart';
+import '../models/dispatch_offer_item.dart';
+import '../widgets/dispatch_offers_inbox.dart';
+import '../widgets/driver_availability_card.dart';
 
 /// Driver Home screen coordinating readiness dashboard, operational status,
 /// registered vehicle inspection, role switching, and onboarding state.
@@ -171,10 +174,12 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
               repository: repo,
             );
           },
-          child: ListView(
+          child: SingleChildScrollView(
             physics: const AlwaysScrollableScrollPhysics(),
             padding: const EdgeInsets.all(20),
-            children: [
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
               if (onboardingProvider.profileRefreshPending) ...[
                 Container(
                   key: const Key('pending_sync_banner'),
@@ -551,6 +556,16 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
                     ),
                   ),
                 ),
+                if (isApproved) ...[
+                  const SizedBox(height: 20),
+                  DriverAvailabilityCard(
+                    isOnline: driverProvider.isOnline,
+                  ),
+                  const SizedBox(height: 20),
+                  const DispatchOffersInbox(
+                    state: DispatchInboxState.disconnected,
+                  ),
+                ],
                 const SizedBox(height: 20),
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -781,6 +796,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
           ),
         ),
       ),
-    );
+    ),
+  );
   }
 }

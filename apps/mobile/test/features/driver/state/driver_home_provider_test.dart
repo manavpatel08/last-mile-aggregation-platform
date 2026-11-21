@@ -704,5 +704,40 @@ void main() {
       expect(provider.isRefreshing, isFalse);
       expect(provider.vehicles, equals([subsequentVehicle]));
     });
+
+    test('isOnline reflects authoritative server response and defaults to false for offline or unapproved driver', () async {
+      const localVehicle = DriverVehicle(
+        id: 'veh-offline',
+        driverProfileId: 'dp-offline',
+        registrationNumber: 'GJ-01-OFFL',
+        vehicleType: 'E_RICKSHAW',
+        passengerCapacity: 4,
+        makeModel: 'Offline Model',
+        isActive: true,
+      );
+      const offlineStatus = DriverStatusResponse(
+        id: 'dp-offline',
+        verificationStatus: 'APPROVED',
+        operationalStatus: 'OFFLINE',
+        isOnline: false,
+        vehiclesCount: 1,
+      );
+      final offlineRepo = FakeDriverRepository(
+        statusResponse: offlineStatus,
+        vehiclesResponse: [localVehicle],
+      );
+      final offlineProvider = DriverHomeProvider(driverRepository: offlineRepo);
+
+      await offlineProvider.loadDashboard(verificationStatus: 'APPROVED');
+      expect(offlineProvider.isOnline, isFalse);
+      expect(offlineProvider.operationalStatus, 'OFFLINE');
+
+      // Unapproved driver should never be online
+      final unapprovedRepo = FakeDriverRepository(vehiclesResponse: [localVehicle]);
+      final unapprovedProvider = DriverHomeProvider(driverRepository: unapprovedRepo);
+      await unapprovedProvider.loadDashboard(verificationStatus: 'PENDING');
+      expect(unapprovedProvider.isOnline, isFalse);
+      expect(unapprovedProvider.operationalStatus, 'OFFLINE');
+    });
   });
 }

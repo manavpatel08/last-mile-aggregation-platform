@@ -278,6 +278,85 @@ void main() {
       expect(platformService.requestPermissionCallCount, 2);
       expect(fakeRepo.reportLocationCallCount, 1);
     });
+
+    test('12. Stop tracking during in-flight fix and restart new session: old fix is dropped, new session reports cleanly', () async {
+      final oldPositionCompleter = Completer<Position>();
+      platformService.positionCompleter = oldPositionCompleter;
+
+      // Session 1 starts
+      tracker.startTracking(repository: fakeRepo);
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      expect(platformService.getPositionCallCount, 1);
+      expect(fakeRepo.reportLocationCallCount, 0);
+
+      // Session 1 stopped while fix is pending
+      tracker.stopTracking();
+      expect(tracker.isTracking, isFalse);
+
+      // Session 2 starts with a fresh repository before old fix completes
+      final secondRepo = FakeDriverRepository();
+      platformService.positionCompleter = null; // Next call will return immediate position
+      platformService.nextPosition = Position(
+        longitude: 72.6670,
+        latitude: 23.1560,
+        timestamp: DateTime.now(),
+        accuracy: 5.0,
+        altitude: 0.0,
+        altitudeAccuracy: 0.0,
+        heading: 180.0,
+        headingAccuracy: 0.0,
+        speed: 20.0,
+        speedAccuracy: 0.0,
+      );
+
+      tracker.startTracking(repository: secondRepo);
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+
+      // Session 2 successfully reported its own fix
+      expect(secondRepo.reportLocationCallCount, 1);
+      expect(secondRepo.lastReportedLocation?['latitude'], 23.1560);
+      expect(secondRepo.lastReportedLocation?['longitude'], 72.6670);
+
+      // Now old position from Session 1 finally completes
+      oldPositionCompleter.complete(
+        Position(
+          longitude: 72.6600,
+          latitude: 23.1500,
+          timestamp: DateTime.now(),
+          accuracy: 5.0,
+          altitude: 0.0,
+          altitudeAccuracy: 0.0,
+          heading: 0.0,
+          headingAccuracy: 0.0,
+          speed: 0.0,
+          speedAccuracy: 0.0,
+        ),
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+
+      // Old session fix was dropped: neither first repo nor second repo received the stale fix
+      expect(fakeRepo.reportLocationCallCount, 0);
+      expect(secondRepo.reportLocationCallCount, 1);
+    });
+
+    test('13. Temporary telemetry failure clears in-flight state and allows subsequent successful report', () async {
+      fakeRepo.shouldThrowOnReportLocation = true;
+      fakeRepo.reportLocationException = Exception('Transient connection failure');
+
+      tracker.startTracking(repository: fakeRepo);
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+
+      expect(fakeRepo.reportLocationCallCount, 1);
+      // Ensure in-flight operation flag was cleared even after exception
+      expect(tracker.isReportingLocation, isFalse);
+
+      // Network recovers before next timer tick
+      fakeRepo.shouldThrowOnReportLocation = false;
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+
+      // Subsequent periodic tick succeeds cleanly
+      expect(fakeRepo.reportLocationCallCount, greaterThanOrEqualTo(2));
+    });
   });
 
   group('FakeDriverLocationTracker & NoOpDriverLocationTracker', () {

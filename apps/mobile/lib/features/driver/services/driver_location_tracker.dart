@@ -91,7 +91,8 @@ class NoOpDriverLocationTracker implements DriverLocationTracker {
 /// 4. Catches permission denials and transient telemetry errors without throwing uncaught exceptions.
 /// 5. Never repeatedly prompts for permissions on periodic ticks after initial denial.
 /// 6. Guards against overlapping in-flight location fixes.
-/// 7. Checks operation generation tokens across async points to drop obsolete fixes.
+/// 7. Every tracking session is strictly isolated by [_currentSessionId] and [_inFlightOperationId]
+///    to eliminate stop/restart race conditions.
 class GeolocatorDriverLocationTracker implements DriverLocationTracker {
   GeolocatorDriverLocationTracker({
     this.reportInterval = const Duration(seconds: 10),
@@ -106,8 +107,11 @@ class GeolocatorDriverLocationTracker implements DriverLocationTracker {
   bool _isTracking = false;
   AppLifecycleState _lifecycleState = AppLifecycleState.resumed;
 
-  bool _isReportingLocation = false;
-  int _trackingGeneration = 0;
+  // Session & Operation Isolation (prevents stop/restart race)
+  int _currentSessionId = 0;
+  int _operationCounter = 0;
+  int? _inFlightOperationId;
+
   bool _hasPromptedPermission = false;
   LocationPermission? _lastPermission;
   bool _lastLocationServiceEnabled = true;
@@ -117,27 +121,27 @@ class GeolocatorDriverLocationTracker implements DriverLocationTracker {
 
   LocationPermission? get lastPermission => _lastPermission;
   bool get lastLocationServiceEnabled => _lastLocationServiceEnabled;
-  bool get isReportingLocation => _isReportingLocation;
+  bool get isReportingLocation => _inFlightOperationId != null;
 
   @override
   void startTracking({required DriverRepository repository}) {
+    final sessionId = ++_currentSessionId;
     _repository = repository;
     _isTracking = true;
-    _trackingGeneration++;
 
     if (_lifecycleState == AppLifecycleState.resumed) {
-      _startPeriodicTimer();
-      _reportCurrentFix();
+      _startPeriodicTimer(sessionId);
+      _reportCurrentFix(sessionId);
     }
   }
 
   @override
   void stopTracking() {
+    _currentSessionId++;
+    _inFlightOperationId = null;
     _isTracking = false;
-    _trackingGeneration++;
     _cancelTimer();
     _repository = null;
-    _isReportingLocation = false;
   }
 
   @override
@@ -146,9 +150,10 @@ class GeolocatorDriverLocationTracker implements DriverLocationTracker {
 
     if (!_isTracking) return;
 
+    final sessionId = _currentSessionId;
     if (state == AppLifecycleState.resumed) {
-      _startPeriodicTimer();
-      _reportCurrentFix();
+      _startPeriodicTimer(sessionId);
+      _reportCurrentFix(sessionId);
     } else {
       _cancelTimer();
     }
@@ -158,14 +163,14 @@ class GeolocatorDriverLocationTracker implements DriverLocationTracker {
   Future<void> retryPermission() async {
     _hasPromptedPermission = false;
     if (_isTracking && _lifecycleState == AppLifecycleState.resumed) {
-      await _reportCurrentFix();
+      await _reportCurrentFix(_currentSessionId);
     }
   }
 
-  void _startPeriodicTimer() {
+  void _startPeriodicTimer(int sessionId) {
     _cancelTimer();
     _timer = Timer.periodic(reportInterval, (_) {
-      _reportCurrentFix();
+      _reportCurrentFix(sessionId);
     });
   }
 
@@ -174,25 +179,29 @@ class GeolocatorDriverLocationTracker implements DriverLocationTracker {
     _timer = null;
   }
 
-  Future<void> _reportCurrentFix() async {
-    final repo = _repository;
-    if (repo == null || !_isTracking || _lifecycleState != AppLifecycleState.resumed) {
+  Future<void> _reportCurrentFix(int sessionId) async {
+    if (!_isTracking ||
+        _currentSessionId != sessionId ||
+        _lifecycleState != AppLifecycleState.resumed) {
       return;
     }
-    if (_isReportingLocation) {
-      // Prevent overlapping location requests
+    final repo = _repository;
+    if (repo == null) return;
+
+    if (_inFlightOperationId != null) {
+      // Overlapping fix in flight for this session: skip
       return;
     }
 
-    final currentGen = _trackingGeneration;
-    _isReportingLocation = true;
+    final operationId = ++_operationCounter;
+    _inFlightOperationId = operationId;
 
     try {
       final serviceEnabled = await _platformService.isLocationServiceEnabled();
       _lastLocationServiceEnabled = serviceEnabled;
       if (!_isTracking ||
+          _currentSessionId != sessionId ||
           _lifecycleState != AppLifecycleState.resumed ||
-          _trackingGeneration != currentGen ||
           _repository == null) {
         return;
       }
@@ -202,8 +211,8 @@ class GeolocatorDriverLocationTracker implements DriverLocationTracker {
 
       LocationPermission permission = await _platformService.checkPermission();
       if (!_isTracking ||
+          _currentSessionId != sessionId ||
           _lifecycleState != AppLifecycleState.resumed ||
-          _trackingGeneration != currentGen ||
           _repository == null) {
         return;
       }
@@ -214,14 +223,13 @@ class GeolocatorDriverLocationTracker implements DriverLocationTracker {
           _hasPromptedPermission = true;
           permission = await _platformService.requestPermission();
           if (!_isTracking ||
+              _currentSessionId != sessionId ||
               _lifecycleState != AppLifecycleState.resumed ||
-              _trackingGeneration != currentGen ||
               _repository == null) {
             return;
           }
           _lastPermission = permission;
         } else {
-          // Do not repeatedly prompt the driver on every periodic tick
           return;
         }
       }
@@ -233,8 +241,8 @@ class GeolocatorDriverLocationTracker implements DriverLocationTracker {
 
       final position = await _platformService.getCurrentPosition();
       if (!_isTracking ||
+          _currentSessionId != sessionId ||
           _lifecycleState != AppLifecycleState.resumed ||
-          _trackingGeneration != currentGen ||
           _repository == null) {
         return;
       }
@@ -246,10 +254,11 @@ class GeolocatorDriverLocationTracker implements DriverLocationTracker {
         speed: position.speed >= 0 ? position.speed : null,
       );
     } catch (_) {
-      // Safe telemetry absorption: network or GPS errors must never crash the app
+      // Safe telemetry absorption: network/GPS failure absorbed safely
     } finally {
-      if (_trackingGeneration == currentGen) {
-        _isReportingLocation = false;
+      // Stale operation protection: old operation never clears a newer session's in-flight state
+      if (_currentSessionId == sessionId && _inFlightOperationId == operationId) {
+        _inFlightOperationId = null;
       }
     }
   }

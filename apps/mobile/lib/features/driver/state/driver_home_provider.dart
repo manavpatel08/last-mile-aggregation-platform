@@ -87,6 +87,7 @@ class DriverHomeProvider extends ChangeNotifier {
   String? _offersError;
   String? _actionSuccessMessage;
   bool _isProcessingAction = false;
+  String? _unresolvedOfferId;
   final Map<String, String> _offerIdempotencyKeys = {};
 
   // Presentation Countdown Timer
@@ -112,6 +113,7 @@ class DriverHomeProvider extends ChangeNotifier {
   String? get offersError => _offersError;
   String? get actionSuccessMessage => _actionSuccessMessage;
   bool get isProcessingAction => _isProcessingAction;
+  String? get unresolvedOfferId => _unresolvedOfferId;
 
   @visibleForTesting
   DriverLocationTracker get locationTracker => _locationTracker;
@@ -167,6 +169,7 @@ class DriverHomeProvider extends ChangeNotifier {
     _offersError = null;
     _actionSuccessMessage = null;
     _isProcessingAction = false;
+    _unresolvedOfferId = null;
     _offerIdempotencyKeys.clear();
     _cancelCountdownTimer();
     _locationTracker.stopTracking();
@@ -194,6 +197,7 @@ class DriverHomeProvider extends ChangeNotifier {
     _offersError = null;
     _actionSuccessMessage = null;
     _isProcessingAction = false;
+    _unresolvedOfferId = null;
     _offerIdempotencyKeys.clear();
     _cancelCountdownTimer();
     _locationTracker.stopTracking();
@@ -203,6 +207,13 @@ class DriverHomeProvider extends ChangeNotifier {
   /// Updates app lifecycle state for foreground-only GPS telemetry.
   void updateAppLifecycle(AppLifecycleState state) {
     _locationTracker.updateAppLifecycle(state);
+  }
+
+  /// Explicitly halts foreground GPS telemetry when the driver leaves Driver Home
+  /// (e.g. switching to Passenger mode or unmounting the screen) without mutating
+  /// server-side online duty status.
+  void stopTrackingOnExitDriverMode() {
+    _locationTracker.stopTracking();
   }
 
   /// Loads driver dashboard data (operational status and registered vehicles).
@@ -599,18 +610,28 @@ class DriverHomeProvider extends ChangeNotifier {
   /// Driver accepts a dispatch offer with mandatory `Idempotency-Key`
   /// (`POST /api/v1/drivers/offers/:id/accept`).
   ///
-  /// Concurrency & Ambiguity Guardrails:
+  /// Concurrency & Ambiguity Guardrails (AGENTS.md & Review Directive):
   /// 1. Action is isolated from dashboard/offer request counters.
   /// 2. If driver is already RESERVED, secondary accept is blocked.
-  /// 3. Idempotency key is retained on ambiguous failure for retries.
-  /// 4. Reconciles server status on ambiguous network failure to recover server-side acceptance.
-  /// 5. Coordinated post-accept refresh updates status and offers without clashing.
+  /// 3. If an offer acceptance is unresolved, conflicting acceptances of other offers are blocked.
+  /// 4. Idempotency key is retained on ambiguous failure for retries of the same logical attempt.
+  /// 5. Never treats `operationalStatus == 'RESERVED'` as proof that a specific offer was accepted.
+  /// 6. Only claims success when the backend returns an authoritative 200 response with AcceptOfferResponse.
+  /// 7. Coordinated post-accept refresh updates status and offers without clashing.
   Future<bool> acceptOffer(String offerId, {DriverRepository? repository}) async {
     final repo = repository ?? driverRepository;
     if (repo == null || _isProcessingAction) return false;
 
     // Reject offer acceptance if already actively assigned
     if (_status?.operationalStatus == 'RESERVED') return false;
+
+    // Prevent starting conflicting acceptances while another offer is unresolved
+    if (_unresolvedOfferId != null && _unresolvedOfferId != offerId) {
+      _offersError =
+          'Another offer acceptance is unresolved. Please resolve or retry the previous offer.';
+      notifyListeners();
+      return false;
+    }
 
     final offerIndex = _offers.indexWhere((o) => o.id == offerId);
     if (offerIndex == -1) return false;
@@ -648,9 +669,11 @@ class DriverHomeProvider extends ChangeNotifier {
         return false;
       }
 
-      // Successful acceptance: prune key and update status
+      // Successful authoritative 200 acceptance: clear unresolved state & prune key
+      _unresolvedOfferId = null;
       _offerIdempotencyKeys.remove(offerId);
       _actionSuccessMessage = 'Offer accepted successfully!';
+      _offersError = null;
 
       if (_status != null) {
         _status = DriverStatusResponse(
@@ -677,49 +700,45 @@ class DriverHomeProvider extends ChangeNotifier {
       }
       final actionError = e is ApiException ? e.message : e.toString();
 
-      // Ambiguous Outcome Check (Requirement 6):
-      // Network loss, timeout, or 502/503/504 might mean server succeeded
-      final isAmbiguous = e is ApiException &&
-          (e.statusCode == null ||
-              e.statusCode == 502 ||
-              e.statusCode == 503 ||
-              e.statusCode == 504 ||
-              e.errorCode == 'NETWORK_UNAVAILABLE' ||
-              e.errorCode == 'REQUEST_TIMEOUT');
+      final isAmbiguous = (e is ApiException &&
+              (e.statusCode == null ||
+                  e.statusCode == 502 ||
+                  e.statusCode == 503 ||
+                  e.statusCode == 504 ||
+                  e.errorCode == 'NETWORK_UNAVAILABLE' ||
+                  e.errorCode == 'REQUEST_TIMEOUT')) ||
+          e is! ApiException;
 
-      if (isAmbiguous) {
-        try {
-          final serverStatus = await repo.getDriverStatus();
-          if (!_isCurrentSession(sessionGen, sessionUser) ||
-              requestGen != _actionRequestGeneration) {
-            return false;
-          }
-
-          if (serverStatus.operationalStatus == 'RESERVED') {
-            // Server succeeded despite client-side network interruption!
-            _status = serverStatus;
-            _offerIdempotencyKeys.remove(offerId);
-            _actionSuccessMessage =
-                'Offer accepted (recovered after network interruption).';
-            _offersError = null;
-            await _reconcileAfterSuccessfulAccept(
-              repo: repo,
-              sessionGen: sessionGen,
-              sessionUser: sessionUser,
-            );
-            return true;
-          }
-        } catch (_) {
-          // Status check failed; keep key for user retry
-        }
-      }
-
-      // Reconcile remaining offers to show current state
+      // Reconcile remaining offers to show current visible state
       await _fetchOffersInternal(
         repo: repo,
         sessionGen: sessionGen,
         sessionUser: sessionUser,
       );
+
+      // Restore offer status to pending if still present and stuck in accepting
+      _offers = [
+        for (final o in _offers)
+          if (o.id == offerId && o.status == DispatchOfferStatus.accepting)
+            o.copyWith(status: DispatchOfferStatus.pending)
+          else
+            o,
+      ];
+
+      if (isAmbiguous) {
+        // Ambiguous failure: never treat RESERVED as proof of this offer.
+        // Retain original idempotency key for retry of the same logical attempt.
+        _unresolvedOfferId = offerId;
+        _offersError =
+            'Acceptance outcome could not be confirmed. Please check your network and retry.';
+        return false;
+      }
+
+      // Definitive failure: clear unresolved state and prune idempotency key
+      if (_unresolvedOfferId == offerId) {
+        _unresolvedOfferId = null;
+      }
+      _offerIdempotencyKeys.remove(offerId);
       _offersError = actionError;
       return false;
     } finally {
@@ -791,14 +810,14 @@ class DriverHomeProvider extends ChangeNotifier {
       }
       final actionError = e is ApiException ? e.message : e.toString();
 
-      // Ambiguous outcome check for rejection
-      final isAmbiguous = e is ApiException &&
-          (e.statusCode == null ||
-              e.statusCode == 502 ||
-              e.statusCode == 503 ||
-              e.statusCode == 504 ||
-              e.errorCode == 'NETWORK_UNAVAILABLE' ||
-              e.errorCode == 'REQUEST_TIMEOUT');
+      final isAmbiguous = (e is ApiException &&
+              (e.statusCode == null ||
+                  e.statusCode == 502 ||
+                  e.statusCode == 503 ||
+                  e.statusCode == 504 ||
+                  e.errorCode == 'NETWORK_UNAVAILABLE' ||
+                  e.errorCode == 'REQUEST_TIMEOUT')) ||
+          e is! ApiException;
 
       await _fetchOffersInternal(
         repo: repo,
@@ -806,14 +825,30 @@ class DriverHomeProvider extends ChangeNotifier {
         sessionUser: sessionUser,
       );
 
+      // Restore offer status to pending if still present and stuck in declining
+      _offers = [
+        for (final o in _offers)
+          if (o.id == offerId && o.status == DispatchOfferStatus.declining)
+            o.copyWith(status: DispatchOfferStatus.pending)
+          else
+            o,
+      ];
+
       final stillPresent = _offers.any((o) => o.id == offerId);
-      if (isAmbiguous && !stillPresent) {
-        // Offer is gone server-side: rejection succeeded
-        _offerIdempotencyKeys.remove('reject_$offerId');
-        _offersError = null;
-        return true;
+      if (isAmbiguous) {
+        if (!stillPresent) {
+          // If rejection fails ambiguously and offer is no longer in pending offers,
+          // do not automatically claim success. Show neutral message and preserve idempotency key.
+          _offersError =
+              'Offer is no longer pending. Final outcome could not be confirmed.';
+        } else {
+          _offersError =
+              'Rejection outcome could not be confirmed. Please check your network and retry.';
+        }
+        return false;
       }
 
+      _offerIdempotencyKeys.remove('reject_$offerId');
       _offersError = actionError;
       return false;
     } finally {

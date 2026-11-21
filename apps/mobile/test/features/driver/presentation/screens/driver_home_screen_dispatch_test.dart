@@ -1,6 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:lastmile_mobile/app/app.dart';
+import 'package:lastmile_mobile/app/state/app_mode_provider.dart';
 import 'package:lastmile_mobile/core/config/app_config.dart';
 import 'package:lastmile_mobile/core/network/api_exception.dart';
 import 'package:lastmile_mobile/core/network/auth_token_store.dart';
@@ -802,6 +803,87 @@ void main() {
       expect(homeProvider.vehicles, isEmpty);
       expect(homeProvider.currentUserId, isNull);
       expect(homeProvider.offers, isEmpty);
+    });
+
+    testWidgets('dual-role driver switching mode stops GPS tracking without altering server online status', (tester) async {
+      const dualRoleApprovedDriver = AuthUser(
+        id: 'driver-dual-approved-1',
+        email: 'dual.driver@pdeu.ac.in',
+        fullName: 'Dual Role Driver',
+        role: 'PASSENGER',
+        roles: ['PASSENGER', 'DRIVER'],
+        driverVerificationStatus: 'APPROVED',
+        driverProfile: DriverProfile(
+          id: 'dp-dual-approved-1',
+          licenseNumber: 'GJ-01-2023-0088888',
+          verificationStatus: 'APPROVED',
+          operationalStatus: 'AVAILABLE',
+          isOnline: true,
+        ),
+      );
+
+      final tokenStore = AuthTokenStore();
+      final secureStorage = SecureTokenStorage.inMemory({
+        SecureTokenStorage.refreshTokenKey: 'existing-refresh-token',
+      });
+      final authRepo = FakeAuthRepository(currentUser: dualRoleApprovedDriver);
+      final driverRepo = FakeDriverRepository(
+        statusResponse: const DriverStatusResponse(
+          id: 'dp-dual-approved-1',
+          verificationStatus: 'APPROVED',
+          operationalStatus: 'AVAILABLE',
+          isOnline: true,
+          vehiclesCount: 1,
+        ),
+        vehiclesResponse: [sampleVehicle],
+      );
+      final fakeTracker = FakeDriverLocationTracker();
+
+      final authProvider = AuthProvider(
+        authRepository: authRepo,
+        googleSignInService: FakeGoogleSignInService(),
+        tokenStore: tokenStore,
+        secureStorage: secureStorage,
+      );
+      await authProvider.restoreSession();
+
+      final homeProvider = DriverHomeProvider(
+        driverRepository: driverRepo,
+        locationTracker: fakeTracker,
+      );
+      addTearDown(homeProvider.dispose);
+
+      await tester.pumpWidget(
+        LastMileApp(
+          config: testConfig,
+          authProvider: authProvider,
+          tokenStore: tokenStore,
+          secureStorage: secureStorage,
+          authRepository: authRepo,
+          driverRepository: driverRepo,
+          driverHomeProvider: homeProvider,
+          appModeProvider: AppModeProvider(initialMode: AppMode.driver),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Driver home loaded and online GPS tracking started
+      expect(homeProvider.isOnline, isTrue);
+      expect(fakeTracker.isTracking, isTrue);
+
+      // Tap Switch Mode button to exit Driver Home
+      final switchModeFinder = find.byKey(const Key('switch_mode_button'));
+      expect(switchModeFinder, findsOneWidget);
+      await tester.tap(switchModeFinder);
+      await tester.pumpAndSettle();
+
+      // GPS tracking was stopped on exit
+      expect(fakeTracker.isTracking, isFalse);
+      expect(fakeTracker.stopCallCount, greaterThanOrEqualTo(1));
+
+      // Server-side online duty status remains unchanged (isOnline: true)
+      expect(driverRepo.updateStatusCallCount, 0); // No PATCH /status was sent
+      expect(homeProvider.isOnline, isTrue);
     });
   });
 }

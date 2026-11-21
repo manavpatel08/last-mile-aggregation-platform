@@ -37,6 +37,14 @@ class _DriverHomeScreenState extends State<DriverHomeScreen>
   }
 
   @override
+  void deactivate() {
+    try {
+      context.read<DriverHomeProvider>().stopTrackingOnExitDriverMode();
+    } catch (_) {}
+    super.deactivate();
+  }
+
+  @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
@@ -240,6 +248,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen>
             TextButton.icon(
               key: const Key('switch_mode_button'),
               onPressed: () {
+                context.read<DriverHomeProvider>().stopTrackingOnExitDriverMode();
                 context.read<AppModeProvider>().clearMode();
                 context.go(AppRoutes.roleSelection);
               },

@@ -359,7 +359,7 @@ void main() {
       expect(fakeRepo.acceptOfferCallCount, 0);
     });
 
-    test('ambiguous accept recovery: recovers server success when response was lost', () async {
+    test('ambiguous accept failure: RESERVED status alone never confirms acceptance, marked uncertain for retry', () async {
       fakeRepo.statusResponse = approvedOnlineStatus;
       fakeRepo.offersResponse = [sampleOffer1];
       await provider.loadDashboard(verificationStatus: 'APPROVED', userId: 'user-1');
@@ -372,25 +372,29 @@ void main() {
         message: 'The request timed out.',
       );
 
-      // But server-side the assignment actually succeeded!
+      // Even if server status says RESERVED, client must NOT speculate or claim success!
       fakeRepo.statusResponse = approvedReservedStatus;
-      fakeRepo.offersResponse = const [];
+      fakeRepo.offersResponse = [sampleOffer1];
 
       final success = await provider.acceptOffer('off-101');
 
-      expect(success, isTrue);
-      expect(provider.operationalStatus, 'RESERVED');
-      expect(provider.actionSuccessMessage, contains('recovered after network interruption'));
-      expect(provider.offersError, isNull);
+      // Must NOT claim success without authoritative 200 response
+      expect(success, isFalse);
+      expect(provider.unresolvedOfferId, 'off-101');
+      expect(
+        provider.offersError,
+        'Acceptance outcome could not be confirmed. Please check your network and retry.',
+      );
+      expect(provider.actionSuccessMessage, isNull);
       expect(provider.isProcessingAction, isFalse);
     });
 
-    test('ambiguous accept retry: reuses identical Idempotency-Key on retry', () async {
+    test('ambiguous accept retry: reuses identical Idempotency-Key and succeeds upon authoritative 200', () async {
       fakeRepo.statusResponse = approvedOnlineStatus;
       fakeRepo.offersResponse = [sampleOffer1];
       await provider.loadDashboard(verificationStatus: 'APPROVED', userId: 'user-1');
 
-      // First call throws network error and server is NOT reserved
+      // First call throws network error
       fakeRepo.shouldThrowOnAcceptOffer = true;
       fakeRepo.acceptOfferException = const ApiException(
         statusCode: null,
@@ -400,12 +404,17 @@ void main() {
 
       final f1 = await provider.acceptOffer('off-101');
       expect(f1, isFalse);
-      expect(provider.offersError, 'Network connection lost.');
+      expect(provider.unresolvedOfferId, 'off-101');
+      expect(
+        provider.offersError,
+        'Acceptance outcome could not be confirmed. Please check your network and retry.',
+      );
       final firstKey = fakeRepo.lastAcceptedIdempotencyKey;
       expect(firstKey, isNotNull);
 
-      // Driver retries acceptance
+      // Driver retries acceptance with authoritative 200 response
       fakeRepo.shouldThrowOnAcceptOffer = false;
+      fakeRepo.acceptOfferException = null;
       fakeRepo.acceptOfferResponse = const AcceptOfferResponse(
         assignmentId: 'asgn-1',
         tripId: 'trip-1',
@@ -418,13 +427,42 @@ void main() {
 
       final f2 = await provider.acceptOffer('off-101');
       expect(f2, isTrue);
+      expect(provider.unresolvedOfferId, isNull);
+      expect(provider.actionSuccessMessage, 'Offer accepted successfully!');
       final secondKey = fakeRepo.lastAcceptedIdempotencyKey;
 
       // Verifies exact same idempotency key was reused for the retry!
       expect(secondKey, equals(firstKey));
     });
 
-    test('ambiguous reject recovery: detects server rejection when response was lost', () async {
+    test('unresolved acceptance blocks starting conflicting acceptance of another offer', () async {
+      fakeRepo.statusResponse = approvedOnlineStatus;
+      fakeRepo.offersResponse = [sampleOffer1, sampleOffer2];
+      await provider.loadDashboard(verificationStatus: 'APPROVED', userId: 'user-1');
+
+      // First offer fails ambiguously
+      fakeRepo.shouldThrowOnAcceptOffer = true;
+      fakeRepo.acceptOfferException = const ApiException(
+        statusCode: 504,
+        errorCode: 'GATEWAY_TIMEOUT',
+        message: 'Gateway timeout',
+      );
+
+      final f1 = await provider.acceptOffer('off-101');
+      expect(f1, isFalse);
+      expect(provider.unresolvedOfferId, 'off-101');
+
+      // Driver attempts to accept different offer while off-101 is unresolved
+      final f2 = await provider.acceptOffer('off-102');
+      expect(f2, isFalse);
+      expect(fakeRepo.lastAcceptedOfferId, 'off-101'); // off-102 was never dispatched
+      expect(
+        provider.offersError,
+        contains('Another offer acceptance is unresolved'),
+      );
+    });
+
+    test('ambiguous reject failure: does not claim success when offer is no longer pending, preserves key', () async {
       fakeRepo.statusResponse = approvedOnlineStatus;
       fakeRepo.offersResponse = [sampleOffer1];
       await provider.loadDashboard(verificationStatus: 'APPROVED', userId: 'user-1');
@@ -437,14 +475,19 @@ void main() {
         message: 'Gateway timeout',
       );
 
-      // Server already marked offer rejected, so pending offers is now empty
+      // Offer is no longer in pending offers (e.g. expired or withdrawn)
       fakeRepo.offersResponse = const [];
 
       final success = await provider.rejectOffer('off-101');
 
-      expect(success, isTrue);
+      // Must NOT claim success; must show neutral message that final outcome could not be confirmed
+      expect(success, isFalse);
       expect(provider.offers, isEmpty);
       expect(provider.inboxState, DispatchInboxState.empty);
+      expect(
+        provider.offersError,
+        'Offer is no longer pending. Final outcome could not be confirmed.',
+      );
       expect(provider.isProcessingAction, isFalse);
     });
 

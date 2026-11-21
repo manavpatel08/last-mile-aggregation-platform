@@ -545,7 +545,28 @@ export class BookingsService {
       // Verify claim ownership and lock idempotency record
       await verifyIdempotencyClaim(tx, claim);
 
-      // 1. Lock booking row with SELECT FOR UPDATE to coordinate concurrency
+      // Standard lock order across the monolith: trips -> bookings -> trip_passengers
+      // 1. If this booking is associated with an active trip, lock the trip row first
+      const activeTripLookup = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT t.id
+        FROM trips t
+        LEFT JOIN trip_passengers tp ON tp.trip_id = t.id AND tp.booking_id = ${bookingId}::uuid
+        LEFT JOIN group_members gm ON gm.ride_group_id = t.ride_group_id AND gm.booking_id = ${bookingId}::uuid
+        WHERE (tp.id IS NOT NULL OR gm.id IS NOT NULL)
+          AND t.status IN ('CREATED', 'DRIVER_EN_ROUTE', 'AT_PICKUP', 'IN_PROGRESS')
+        LIMIT 1;
+      `;
+
+      if (activeTripLookup && activeTripLookup.length > 0) {
+        await tx.$queryRaw`
+          SELECT id
+          FROM trips
+          WHERE id = ${activeTripLookup[0].id}::uuid
+          FOR UPDATE;
+        `;
+      }
+
+      // 2. Lock booking row with SELECT FOR UPDATE to coordinate concurrency
       const bookings = await tx.$queryRaw<
         Array<{
           id: string;
@@ -740,8 +761,24 @@ export class BookingsService {
           orderBy: { dropoffSequenceOrder: 'asc' },
         });
 
-        if (remainingActiveMembers.length < 2) {
-          // Scenario B: Fewer than two eligible passengers survive -> Dissolve group
+        // Check if any surviving member has already boarded a materialized trip.
+        // If a surviving passenger is already onboard, their journey and driver assignment
+        // must be preserved; the group must not be dissolved, and the onboard passenger
+        // must never be rematched.
+        const boardedSurvivor =
+          remainingActiveMembers.length > 0
+            ? await tx.tripPassenger.findFirst({
+                where: {
+                  bookingId: {
+                    in: remainingActiveMembers.map((m) => m.bookingId),
+                  },
+                  status: 'BOARDED',
+                },
+              })
+            : null;
+
+        if (remainingActiveMembers.length < 2 && !boardedSurvivor) {
+          // Scenario B: Fewer than two eligible passengers survive and NONE is boarded -> Dissolve group
           await tx.rideGroup.update({
             where: { id: activeMembership.rideGroupId },
             data: { status: 'DISSOLVED' },
@@ -937,7 +974,7 @@ export class BookingsService {
             }
           }
 
-          if (pickupPoint && memberDestinations.length >= 2) {
+          if (pickupPoint && memberDestinations.length >= 1) {
             routeReconciliationInfo = {
               rideGroupId: updatedGroup.id,
               expectedGroupVersion: updatedGroup.groupVersion,
@@ -996,7 +1033,7 @@ export class BookingsService {
 
     // Execute route recalculation outside the transaction to preserve Invariant 4
     if (result.routeReconciliationInfo && this.routingService) {
-      this.recalculateAndPersistRoute(result.routeReconciliationInfo).catch(
+      await this.recalculateAndPersistRoute(result.routeReconciliationInfo).catch(
         (err) => {
           this.logger.warn(
             `Route recalculation failed after passenger cancellation for group ${result.routeReconciliationInfo?.rideGroupId}: ${(err as Error).message}`,

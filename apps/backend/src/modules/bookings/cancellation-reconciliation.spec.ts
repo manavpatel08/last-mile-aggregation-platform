@@ -631,4 +631,176 @@ describe('Stage 8 — Phase 2: Booking Cancellation & Trip Hardening', () => {
     });
     expect(fees).toHaveLength(1);
   });
+
+  it('11. One boarded passenger remains when another cancels: preserves onboard journey and driver assignment without dissolution', async () => {
+    const p1 = await createTestPassengerAndBooking('DRIVER_ARRIVED');
+    const p2 = await createTestPassengerAndBooking('DRIVER_ARRIVED');
+
+    const group = await createTestSharedGroup([p1, p2], 'DRIVER_ASSIGNED');
+    const { trip, assignment, driverUser, driverProfile } =
+      await materializeTripForGroup(group, [p1, p2]);
+
+    // p1 boards the vehicle
+    await prisma.tripPassenger.updateMany({
+      where: { bookingId: p1.bookingId },
+      data: { status: 'BOARDED', boardedAt: new Date() },
+    });
+
+    // p2 cancels while p1 is boarded
+    const cancResult = await bookingsService.cancelBooking(
+      { id: p2.user.id, role: 'PASSENGER' },
+      p2.bookingId,
+      { reason: 'Passenger 2 cancelled at pickup' },
+    );
+
+    expect(cancResult.status).toBe('CANCELLED');
+    expect(cancResult.cancellationFeeAssessedPaise).toBe(3000);
+    expect(cancResult.cancellationFeeStatus).toBe('OUTSTANDING');
+
+    // Group must NOT be dissolved
+    const updatedGroup = await prisma.rideGroup.findUnique({
+      where: { id: group.id },
+    });
+    expect(updatedGroup!.status).toBe('DRIVER_ASSIGNED');
+    expect(updatedGroup!.groupVersion).toBe(2);
+
+    // Driver assignment must remain ACTIVE
+    const updatedAssignment = await prisma.driverAssignment.findUnique({
+      where: { id: assignment.id },
+    });
+    expect(updatedAssignment!.status).toBe('ACTIVE');
+
+    // Driver profile must remain RESERVED (actively driving/waiting)
+    const driver = await prisma.driverProfile.findUnique({
+      where: { id: driverProfile.id },
+    });
+    expect(driver!.operationalStatus).toBe('RESERVED');
+
+    // Trip must remain AT_PICKUP (not cancelled)
+    const updatedTrip = await prisma.trip.findUnique({ where: { id: trip.id } });
+    expect(updatedTrip!.status).toBe('AT_PICKUP');
+
+    // p1's booking must remain active (not rematched or set to REQUESTED)
+    const survivingBooking = await prisma.booking.findUnique({
+      where: { id: p1.bookingId },
+    });
+    expect(survivingBooking!.status).toBe('DRIVER_ARRIVED');
+
+    // p1's TripPassenger remains BOARDED, p2's is CANCELLED
+    const tp1 = await prisma.tripPassenger.findFirst({
+      where: { bookingId: p1.bookingId },
+    });
+    const tp2 = await prisma.tripPassenger.findFirst({
+      where: { bookingId: p2.bookingId },
+    });
+    expect(tp1!.status).toBe('BOARDED');
+    expect(tp2!.status).toBe('CANCELLED');
+
+    // Driver can start trip with remaining boarded passenger
+    const startResult = await tripsService.startTrip(driverUser.id, trip.id);
+    expect(startResult.status).toBe('IN_PROGRESS');
+  });
+
+  it('12. One passenger remains after another becomes a no-show: route recalculates and removes no-show destination', async () => {
+    const p1 = await createTestPassengerAndBooking('DRIVER_ARRIVED');
+    const p2 = await createTestPassengerAndBooking('DRIVER_ARRIVED');
+
+    const group = await createTestSharedGroup([p1, p2], 'DRIVER_ASSIGNED');
+    const { trip, assignment, driverUser } = await materializeTripForGroup(
+      group,
+      [p1, p2],
+    );
+
+    // p1 has boarded
+    await prisma.tripPassenger.updateMany({
+      where: { bookingId: p1.bookingId },
+      data: { status: 'BOARDED', boardedAt: new Date() },
+    });
+
+    // Driver declares p2 as no-show
+    const noShowResult = await tripsService.declareNoShow(
+      driverUser.id,
+      trip.id,
+      p2.user.id,
+    );
+
+    expect(noShowResult.status).toBe('NO_SHOW');
+    expect(noShowResult.penaltyAssessedPaise).toBe(3000);
+
+    // Ride group remains active and groupVersion incremented to 2
+    const updatedGroup = await prisma.rideGroup.findUnique({
+      where: { id: group.id },
+    });
+    expect(updatedGroup!.status).toBe('DRIVER_ASSIGNED');
+    expect(updatedGroup!.groupVersion).toBe(2);
+
+    // Driver assignment remains ACTIVE
+    const updatedAssignment = await prisma.driverAssignment.findUnique({
+      where: { id: assignment.id },
+    });
+    expect(updatedAssignment!.status).toBe('ACTIVE');
+
+    // Trip remains AT_PICKUP
+    const updatedTrip = await prisma.trip.findUnique({ where: { id: trip.id } });
+    expect(updatedTrip!.status).toBe('AT_PICKUP');
+
+    // Active group members: p1 remains active, p2 inactive
+    const members = await prisma.groupMember.findMany({
+      where: { rideGroupId: group.id },
+    });
+    const m1 = members.find((m) => m.bookingId === p1.bookingId);
+    const m2 = members.find((m) => m.bookingId === p2.bookingId);
+    expect(m1!.isActiveMember).toBe(true);
+    expect(m2!.isActiveMember).toBe(false);
+
+    // GroupRouteVersion 2 exists with exactly 1 stop (p1)
+    const newRouteVersion = await prisma.groupRouteVersion.findUnique({
+      where: {
+        rideGroupId_versionNumber: {
+          rideGroupId: group.id,
+          versionNumber: 2,
+        },
+      },
+      include: { stops: true },
+    });
+    expect(newRouteVersion).not.toBeNull();
+    expect(newRouteVersion!.stops).toHaveLength(1);
+    expect(newRouteVersion!.stops[0].groupMemberId).toBe(m1!.id);
+  });
+
+  it('13. Concurrent cancellation and no-show race condition executes without deadlock', async () => {
+    const p1 = await createTestPassengerAndBooking('DRIVER_ARRIVED');
+    const p2 = await createTestPassengerAndBooking('DRIVER_ARRIVED');
+
+    const group = await createTestSharedGroup([p1, p2], 'DRIVER_ASSIGNED');
+    const { trip, driverUser } = await materializeTripForGroup(group, [p1, p2]);
+
+    // Launch cancellation for p1 and no-show declaration for p2 simultaneously
+    const results = await Promise.allSettled([
+      bookingsService.cancelBooking(
+        { id: p1.user.id, role: 'PASSENGER' },
+        p1.bookingId,
+        { reason: 'Concurrent cancellation' },
+      ),
+      tripsService.declareNoShow(driverUser.id, trip.id, p2.user.id),
+    ]);
+
+    // Ensure neither failed with a database deadlock error
+    for (const r of results) {
+      if (r.status === 'rejected') {
+        const errorMsg = (r.reason as Error)?.message ?? '';
+        expect(errorMsg).not.toMatch(/deadlock detected/i);
+      }
+    }
+
+    // Both operations should resolve cleanly
+    const succeeded = results.filter((r) => r.status === 'fulfilled');
+    expect(succeeded.length).toBeGreaterThanOrEqual(1);
+
+    // Booking statuses should be non-null and valid terminal states
+    const b1 = await prisma.booking.findUnique({ where: { id: p1.bookingId } });
+    const b2 = await prisma.booking.findUnique({ where: { id: p2.bookingId } });
+    expect(['CANCELLED', 'NO_SHOW']).toContain(b1!.status);
+    expect(['CANCELLED', 'NO_SHOW']).toContain(b2!.status);
+  });
 });

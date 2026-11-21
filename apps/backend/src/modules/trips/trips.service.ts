@@ -1239,7 +1239,8 @@ export class TripsService {
       // Verify claim ownership and lock idempotency record
       await verifyIdempotencyClaim(tx, claim);
 
-      // Lock trip row with SELECT ... FOR UPDATE
+      // Standard lock order across the monolith: trips -> bookings -> trip_passengers
+      // 1. Lock trip row with SELECT ... FOR UPDATE
       const trips = await tx.$queryRaw<
         Array<{
           id: string;
@@ -1270,7 +1271,39 @@ export class TripsService {
         });
       }
 
-      // Lock trip passenger row with SELECT ... FOR UPDATE
+      // 2. Lock bookings row associated with passenger journey
+      const bookings = await tx.$queryRaw<
+        Array<{ id: string; status: string }>
+      >`
+        SELECT id, status
+        FROM bookings
+        WHERE id = (
+          SELECT booking_id
+          FROM trip_passengers
+          WHERE trip_id = ${tripId}::uuid AND passenger_id = ${passengerId}::uuid
+          LIMIT 1
+        )
+        FOR UPDATE;
+      `;
+
+      if (!bookings || bookings.length === 0) {
+        throw new NotFoundException({
+          errorCode: 'BOOKING_NOT_FOUND',
+          message: 'Booking not found for this passenger.',
+        });
+      }
+
+      const booking = bookings[0];
+
+      if (booking.status === 'CANCELLED') {
+        throw new BadRequestException({
+          errorCode: 'INVALID_PASSENGER_STATUS_FOR_NO_SHOW',
+          message:
+            "Cannot declare no-show for passenger in status 'CANCELLED'.",
+        });
+      }
+
+      // 3. Lock trip passenger row with SELECT ... FOR UPDATE
       const passengers = await tx.$queryRaw<
         Array<{
           id: string;
@@ -1295,26 +1328,7 @@ export class TripsService {
 
       const passenger = passengers[0];
 
-      // Strict lock ordering: lock bookings row associated with passenger journey
-      const bookings = await tx.$queryRaw<
-        Array<{ id: string; status: string }>
-      >`
-        SELECT id, status
-        FROM bookings
-        WHERE id = ${passenger.booking_id}::uuid
-        FOR UPDATE;
-      `;
-
-      if (!bookings || bookings.length === 0) {
-        throw new NotFoundException({
-          errorCode: 'BOOKING_NOT_FOUND',
-          message: 'Booking not found for this passenger.',
-        });
-      }
-
-      const booking = bookings[0];
-
-      if (booking.status === 'CANCELLED') {
+      if (passenger.status === 'CANCELLED') {
         throw new BadRequestException({
           errorCode: 'INVALID_PASSENGER_STATUS_FOR_NO_SHOW',
           message:
@@ -1542,7 +1556,7 @@ export class TripsService {
             orderBy: { dropoffSequenceOrder: 'asc' },
           });
 
-          if (activeMembers.length >= 2) {
+          if (activeMembers.length >= 1) {
             const updatedGroup = await tx.rideGroup.update({
               where: { id: tripRecord.rideGroupId },
               data: { groupVersion: { increment: 1 } },
@@ -1582,7 +1596,7 @@ export class TripsService {
               }
             }
 
-            if (pickupPoint && memberDestinations.length >= 2) {
+            if (pickupPoint && memberDestinations.length >= 1) {
               routeReconciliationInfo = {
                 rideGroupId: updatedGroup.id,
                 expectedGroupVersion: updatedGroup.groupVersion,
@@ -1639,7 +1653,7 @@ export class TripsService {
     });
 
     if (result.routeReconciliationInfo && this.routingService) {
-      this.recalculateAndPersistRoute(result.routeReconciliationInfo).catch(
+      await this.recalculateAndPersistRoute(result.routeReconciliationInfo).catch(
         (err) => {
           this.logger.warn(
             `Route recalculation failed after no-show declaration for group ${result.routeReconciliationInfo?.rideGroupId}: ${(err as Error).message}`,

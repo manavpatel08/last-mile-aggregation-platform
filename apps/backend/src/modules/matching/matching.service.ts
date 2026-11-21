@@ -3,12 +3,14 @@ import {
   Logger,
   ConflictException,
   ServiceUnavailableException,
+  Optional,
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../infrastructure/prisma/prisma.service.js';
 import { RedisService } from '../../infrastructure/redis/redis.service.js';
 import { RoutingService, RouteResult } from '../routing/routing.service.js';
 import { FaresService, FareAllocationMember } from '../fares/fares.service.js';
+import { OutboxService } from '../../infrastructure/outbox/outbox.service.js';
 import {
   PermutationSolver,
   CandidateMember,
@@ -43,6 +45,7 @@ export class MatchingService {
     private readonly routingService: RoutingService,
     private readonly faresService: FaresService,
     private readonly permutationSolver: PermutationSolver,
+    @Optional() private readonly outboxService?: OutboxService,
   ) {}
 
   /**
@@ -657,7 +660,7 @@ export class MatchingService {
       0,
     );
 
-    return this.prisma.$transaction(async (tx) => {
+    const groupId = await this.prisma.$transaction(async (tx) => {
       // 0a. Hub-Level Serialization: Lock pickup point to serialize persistence and registrations
       await tx.$executeRaw`
         SELECT id FROM pickup_points
@@ -920,5 +923,16 @@ export class MatchingService {
 
       return rideGroup.id;
     });
+
+    // Trigger immediate outbox processing post-commit for Stage 6 handoff
+    if (this.outboxService) {
+      this.outboxService.triggerImmediateProcessing().catch((err) => {
+        this.logger.warn(
+          `Failed to trigger immediate outbox processing after forming group ${groupId}: ${err?.message}`,
+        );
+      });
+    }
+
+    return groupId;
   }
 }

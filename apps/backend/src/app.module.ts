@@ -19,6 +19,8 @@ import { FaresModule } from './modules/fares/fares.module.js';
 import { BookingsModule } from './modules/bookings/bookings.module.js';
 import { TripsModule } from './modules/trips/trips.module.js';
 import { MatchingModule } from './modules/matching/matching.module.js';
+import { DispatchModule } from './modules/dispatch/dispatch.module.js';
+import { OutboxModule } from './infrastructure/outbox/outbox.module.js';
 import { JwtAuthGuard } from './common/guards/jwt-auth.guard.js';
 import { RolesGuard } from './common/guards/roles.guard.js';
 import { DriverApprovalGuard } from './common/guards/driver-approval.guard.js';
@@ -52,6 +54,8 @@ import { IdempotencyInterceptor } from './common/interceptors/idempotency.interc
     BookingsModule,
     TripsModule,
     MatchingModule,
+    DispatchModule,
+    OutboxModule,
   ],
   controllers: [AppController],
   providers: [

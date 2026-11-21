@@ -1,4 +1,12 @@
-import { Body, Controller, Get, Post } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  HttpCode,
+  HttpStatus,
+  Patch,
+  Post,
+} from '@nestjs/common';
 import { CurrentUser } from '../../common/decorators/current-user.decorator.js';
 import { Roles } from '../../common/decorators/roles.decorator.js';
 import { RequireDriverApproval } from '../../common/decorators/driver-approval.decorator.js';
@@ -6,6 +14,8 @@ import { DriversService } from './drivers.service.js';
 import { DriverOnboardDto } from './dto/driver-onboard.dto.js';
 import { DriverDocumentDto } from './dto/driver-document.dto.js';
 import { VehicleDto } from './dto/vehicle.dto.js';
+import { UpdateDriverStatusDto } from './dto/update-driver-status.dto.js';
+import { DriverLocationDto } from './dto/driver-location.dto.js';
 
 @Controller('drivers')
 export class DriversController {
@@ -70,6 +80,40 @@ export class DriversController {
     return {
       success: true,
       data: status,
+    };
+  }
+
+  @Roles('DRIVER')
+  @RequireDriverApproval()
+  @Patch('status')
+  async updateStatus(
+    @CurrentUser('id') userId: string,
+    @Body() dto: UpdateDriverStatusDto,
+  ) {
+    const data = await this.driversService.updateDriverOperationalStatus(
+      userId,
+      dto,
+    );
+    return {
+      success: true,
+      message: 'Driver operational status updated successfully',
+      data,
+    };
+  }
+
+  @Roles('DRIVER')
+  @RequireDriverApproval()
+  @Post('location')
+  @HttpCode(HttpStatus.OK)
+  async recordLocation(
+    @CurrentUser('id') userId: string,
+    @Body() dto: DriverLocationDto,
+  ) {
+    const data = await this.driversService.recordDriverLocation(userId, dto);
+    return {
+      success: true,
+      message: 'Driver location recorded successfully',
+      data,
     };
   }
 }

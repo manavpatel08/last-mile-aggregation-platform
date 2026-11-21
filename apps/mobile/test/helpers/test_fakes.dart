@@ -9,6 +9,8 @@ import 'package:lastmile_mobile/features/auth/models/auth_user.dart';
 import 'package:lastmile_mobile/features/auth/state/auth_provider.dart';
 import 'package:lastmile_mobile/features/driver/data/driver_repository.dart';
 import 'package:lastmile_mobile/features/driver/models/driver_onboarding_request.dart';
+import 'package:lastmile_mobile/features/driver/models/driver_status_response.dart';
+import 'package:lastmile_mobile/features/driver/models/driver_vehicle.dart';
 
 /// Test double for [GoogleSignInAccount].
 class FakeGoogleSignInAccount implements GoogleSignInAccount {
@@ -245,6 +247,12 @@ class FakeDriverRepository implements DriverRepository {
     this.response,
     this.shouldThrow = false,
     this.exceptionToThrow,
+    this.statusResponse,
+    this.vehiclesResponse,
+    this.shouldThrowOnStatus = false,
+    this.shouldThrowOnVehicles = false,
+    this.statusException,
+    this.vehiclesException,
   });
 
   DriverOnboardingResponse? response;
@@ -252,6 +260,15 @@ class FakeDriverRepository implements DriverRepository {
   Exception? exceptionToThrow;
   DriverOnboardingRequest? lastRequest;
   int onboardCallCount = 0;
+
+  DriverStatusResponse? statusResponse;
+  List<DriverVehicle>? vehiclesResponse;
+  bool shouldThrowOnStatus;
+  bool shouldThrowOnVehicles;
+  Exception? statusException;
+  Exception? vehiclesException;
+  int getStatusCallCount = 0;
+  int getVehiclesCallCount = 0;
 
   @override
   Future<DriverOnboardingResponse> onboardDriver(
@@ -286,6 +303,52 @@ class FakeDriverRepository implements DriverRepository {
           },
           message: 'Driver onboarding application submitted successfully',
         );
+  }
+
+  @override
+  Future<DriverStatusResponse> getDriverStatus() async {
+    getStatusCallCount++;
+    if (statusException != null) throw statusException!;
+    if (shouldThrowOnStatus) {
+      throw const ApiException(
+        statusCode: 500,
+        errorCode: 'SERVER_ERROR',
+        message: 'Failed to load driver status',
+      );
+    }
+    return statusResponse ??
+        const DriverStatusResponse(
+          id: 'dp-fake-123',
+          verificationStatus: 'APPROVED',
+          operationalStatus: 'OFFLINE',
+          isOnline: false,
+          vehiclesCount: 1,
+        );
+  }
+
+  @override
+  Future<List<DriverVehicle>> getVehicles() async {
+    getVehiclesCallCount++;
+    if (vehiclesException != null) throw vehiclesException!;
+    if (shouldThrowOnVehicles) {
+      throw const ApiException(
+        statusCode: 500,
+        errorCode: 'SERVER_ERROR',
+        message: 'Failed to load vehicles',
+      );
+    }
+    return vehiclesResponse ??
+        const [
+          DriverVehicle(
+            id: 'veh-fake-123',
+            driverProfileId: 'dp-fake-123',
+            registrationNumber: 'GJ-01-AB-1234',
+            vehicleType: 'E_RICKSHAW',
+            passengerCapacity: 4,
+            makeModel: 'Mahindra Treo',
+            isActive: true,
+          ),
+        ];
   }
 }
 

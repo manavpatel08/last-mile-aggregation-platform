@@ -43,12 +43,13 @@ class DispatchOfferItem {
     required this.id,
     this.groupId,
     required this.pickupLocationName,
-    required this.dropoffLocationName,
+    this.dropoffLocationName,
     required this.passengerCount,
     required this.estimatedEarnings,
     this.estimatedDistance,
     this.detourPercentage,
     this.status = DispatchOfferStatus.pending,
+    this.remainingSeconds,
   });
 
   /// Unique dispatch offer identifier passed to accept/reject actions.
@@ -60,8 +61,8 @@ class DispatchOfferItem {
   /// User-friendly name of the group pickup point (e.g. "PDEU High-Rise Gate").
   final String pickupLocationName;
 
-  /// User-friendly name of the group destination / drop-off corridor.
-  final String dropoffLocationName;
+  /// Optional user-friendly name of the group destination / drop-off corridor.
+  final String? dropoffLocationName;
 
   /// Total number of passengers grouped for this ride.
   final int passengerCount;
@@ -78,11 +79,42 @@ class DispatchOfferItem {
   /// Current presentation status of this offer.
   final DispatchOfferStatus status;
 
-  /// Whether this offer has expired based purely on status.
-  bool get isExpired => status == DispatchOfferStatus.expired;
+  /// Backend-provided remaining seconds countdown for presentation.
+  final int? remainingSeconds;
+
+  /// Whether this offer has expired based purely on status or remaining seconds.
+  bool get isExpired =>
+      status == DispatchOfferStatus.expired ||
+      (remainingSeconds != null && remainingSeconds! <= 0);
 
   /// Whether an accept or decline action is currently in flight for this offer.
   bool get isActionPending =>
       status == DispatchOfferStatus.accepting ||
       status == DispatchOfferStatus.declining;
+
+  DispatchOfferItem copyWith({
+    String? id,
+    String? groupId,
+    String? pickupLocationName,
+    String? dropoffLocationName,
+    int? passengerCount,
+    String? estimatedEarnings,
+    String? estimatedDistance,
+    int? detourPercentage,
+    DispatchOfferStatus? status,
+    int? remainingSeconds,
+  }) {
+    return DispatchOfferItem(
+      id: id ?? this.id,
+      groupId: groupId ?? this.groupId,
+      pickupLocationName: pickupLocationName ?? this.pickupLocationName,
+      dropoffLocationName: dropoffLocationName ?? this.dropoffLocationName,
+      passengerCount: passengerCount ?? this.passengerCount,
+      estimatedEarnings: estimatedEarnings ?? this.estimatedEarnings,
+      estimatedDistance: estimatedDistance ?? this.estimatedDistance,
+      detourPercentage: detourPercentage ?? this.detourPercentage,
+      status: status ?? this.status,
+      remainingSeconds: remainingSeconds ?? this.remainingSeconds,
+    );
+  }
 }

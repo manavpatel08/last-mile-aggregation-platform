@@ -334,5 +334,405 @@ void main() {
         ),
       );
     });
+
+    test('updateStatus sends PATCH request to /drivers/status with isOnline and returns DriverStatusResponse', () async {
+      final adapter = _FakeAdapter((options) async {
+        expect(options.method, 'PATCH');
+        expect(options.path, '/drivers/status');
+        expect(options.headers['Authorization'], 'Bearer driver-access-token');
+
+        final body = options.data as Map<String, dynamic>;
+        expect(body['isOnline'], true);
+
+        return _jsonResponse({
+          'success': true,
+          'message': 'Driver operational status updated successfully',
+          'data': {
+            'id': 'dp-123',
+            'verificationStatus': 'APPROVED',
+            'operationalStatus': 'AVAILABLE',
+            'isOnline': true,
+            'vehiclesCount': 1,
+          },
+        });
+      });
+
+      final apiClient = ApiClient(
+        config: testConfig,
+        tokenProvider: () async => 'driver-access-token',
+        httpClientAdapter: adapter,
+        enableDebugLogging: false,
+      );
+
+      final repository = ApiDriverRepository(apiClient: apiClient);
+      final response = await repository.updateStatus(isOnline: true);
+
+      expect(response.id, 'dp-123');
+      expect(response.verificationStatus, 'APPROVED');
+      expect(response.operationalStatus, 'AVAILABLE');
+      expect(response.isOnline, isTrue);
+    });
+
+    test('updateStatus maps 409 Conflict to ApiException', () async {
+      final adapter = _FakeAdapter((options) async {
+        return _jsonResponse({
+          'success': false,
+          'statusCode': 409,
+          'errorCode': 'CONFLICT',
+          'message': 'Cannot go offline while driver has an active or reserved assignment',
+        }, statusCode: 409);
+      });
+
+      final apiClient = ApiClient(
+        config: testConfig,
+        tokenProvider: () async => 'driver-access-token',
+        httpClientAdapter: adapter,
+        enableDebugLogging: false,
+      );
+
+      final repository = ApiDriverRepository(apiClient: apiClient);
+
+      await expectLater(
+        repository.updateStatus(isOnline: false),
+        throwsA(
+          isA<ApiException>()
+              .having((e) => e.statusCode, 'statusCode', 409)
+              .having((e) => e.message, 'message', contains('Cannot go offline')),
+        ),
+      );
+    });
+
+    test('reportLocation sends POST request to /drivers/location with coordinates and heading', () async {
+      final adapter = _FakeAdapter((options) async {
+        expect(options.method, 'POST');
+        expect(options.path, '/drivers/location');
+        expect(options.headers['Authorization'], 'Bearer driver-access-token');
+
+        final body = options.data as Map<String, dynamic>;
+        expect(body['latitude'], 23.1550);
+        expect(body['longitude'], 72.6668);
+        expect(body['heading'], 180.5);
+        expect(body['speed'], 25.0);
+
+        return _jsonResponse({
+          'success': true,
+          'message': 'Driver location recorded successfully',
+          'data': {
+            'driverId': 'dp-123',
+            'latitude': 23.1550,
+            'longitude': 72.6668,
+            'heading': 180.5,
+            'speed': 25.0,
+            'updatedAt': '2026-11-21T18:00:00.000Z',
+          },
+        });
+      });
+
+      final apiClient = ApiClient(
+        config: testConfig,
+        tokenProvider: () async => 'driver-access-token',
+        httpClientAdapter: adapter,
+        enableDebugLogging: false,
+      );
+
+      final repository = ApiDriverRepository(apiClient: apiClient);
+      await repository.reportLocation(
+        latitude: 23.1550,
+        longitude: 72.6668,
+        heading: 180.5,
+        speed: 25.0,
+      );
+
+      expect(adapter.lastRequest, isNotNull);
+    });
+
+    test('getPendingOffers sends GET request to /drivers/offers/pending and parses multiple offers', () async {
+      final adapter = _FakeAdapter((options) async {
+        expect(options.method, 'GET');
+        expect(options.path, '/drivers/offers/pending');
+        expect(options.headers['Authorization'], 'Bearer driver-access-token');
+
+        return _jsonResponse({
+          'success': true,
+          'data': [
+            {
+              'offerId': 'off-1',
+              'dispatchAttemptId': 'att-1',
+              'rideGroupId': 'grp-1',
+              'groupVersion': 1,
+              'pickupPoint': {
+                'id': 'pnt-1',
+                'name': 'PDEU Gate 1',
+              },
+              'passengerCount': 2,
+              'totalEstimatedFare': '32.00',
+              'totalDistanceMeters': 1800,
+              'totalDurationSec': 240,
+              'offeredAt': '2026-11-21T18:00:00.000Z',
+              'expiresAt': '2026-11-21T18:00:20.000Z',
+              'remainingSeconds': 18,
+            },
+            {
+              'offerId': 'off-2',
+              'dispatchAttemptId': 'att-2',
+              'rideGroupId': 'grp-2',
+              'groupVersion': 1,
+              'pickupPoint': {
+                'id': 'pnt-2',
+                'name': 'PDEU High-Rise Gate',
+              },
+              'passengerCount': 3,
+              'totalEstimatedFare': '48.00',
+              'totalDistanceMeters': 2400,
+              'totalDurationSec': 320,
+              'offeredAt': '2026-11-21T18:00:05.000Z',
+              'expiresAt': '2026-11-21T18:00:25.000Z',
+              'remainingSeconds': 20,
+            },
+          ],
+        });
+      });
+
+      final apiClient = ApiClient(
+        config: testConfig,
+        tokenProvider: () async => 'driver-access-token',
+        httpClientAdapter: adapter,
+        enableDebugLogging: false,
+      );
+
+      final repository = ApiDriverRepository(apiClient: apiClient);
+      final offers = await repository.getPendingOffers();
+
+      expect(offers.length, 2);
+      expect(offers[0].offerId, 'off-1');
+      expect(offers[0].pickupPoint.name, 'PDEU Gate 1');
+      expect(offers[0].passengerCount, 2);
+      expect(offers[0].totalEstimatedFare, '32.00');
+      expect(offers[1].offerId, 'off-2');
+      expect(offers[1].pickupPoint.name, 'PDEU High-Rise Gate');
+    });
+
+    test('getPendingOffers throws ApiException when item is malformed', () async {
+      final adapter = _FakeAdapter((options) async {
+        return _jsonResponse({
+          'success': true,
+          'data': [
+            {'malformed': 'offer'},
+          ],
+        });
+      });
+
+      final apiClient = ApiClient(
+        config: testConfig,
+        tokenProvider: () async => 'driver-access-token',
+        httpClientAdapter: adapter,
+        enableDebugLogging: false,
+      );
+
+      final repository = ApiDriverRepository(apiClient: apiClient);
+
+      await expectLater(
+        repository.getPendingOffers(),
+        throwsA(
+          isA<ApiException>()
+              .having((e) => e.errorCode, 'errorCode', 'INVALID_RESPONSE')
+              .having((e) => e.message, 'message', contains('Malformed offer item')),
+        ),
+      );
+    });
+
+    test('acceptOffer sends POST request with Idempotency-Key and returns AcceptOfferResponse', () async {
+      final adapter = _FakeAdapter((options) async {
+        expect(options.method, 'POST');
+        expect(options.path, '/drivers/offers/off-123/accept');
+        expect(options.headers['Authorization'], 'Bearer driver-access-token');
+        expect(options.headers['Idempotency-Key'], 'idemp-uuid-1234');
+
+        return _jsonResponse({
+          'success': true,
+          'data': {
+            'assignmentId': 'asgn-456',
+            'tripId': 'trip-789',
+            'rideGroupId': 'grp-123',
+            'passengerCount': 3,
+            'totalEstimatedFare': '48.00',
+            'navigationRoute': {
+              'geometry': {'type': 'LineString'},
+              'stops': [
+                {
+                  'stopOrder': 1,
+                  'stopType': 'PICKUP',
+                  'latitude': 23.1550,
+                  'longitude': 72.6668,
+                },
+                {
+                  'stopOrder': 2,
+                  'stopType': 'DROPOFF',
+                  'latitude': 23.1600,
+                  'longitude': 72.6700,
+                },
+              ],
+            },
+          },
+        });
+      });
+
+      final apiClient = ApiClient(
+        config: testConfig,
+        tokenProvider: () async => 'driver-access-token',
+        httpClientAdapter: adapter,
+        enableDebugLogging: false,
+      );
+
+      final repository = ApiDriverRepository(apiClient: apiClient);
+      final response = await repository.acceptOffer(
+        offerId: 'off-123',
+        idempotencyKey: 'idemp-uuid-1234',
+      );
+
+      expect(response.assignmentId, 'asgn-456');
+      expect(response.tripId, 'trip-789');
+      expect(response.rideGroupId, 'grp-123');
+      expect(response.passengerCount, 3);
+      expect(response.totalEstimatedFare, '48.00');
+      expect(response.navigationRoute.stops.length, 2);
+    });
+
+    test('acceptOffer maps 409 OFFER_EXPIRED error to ApiException', () async {
+      final adapter = _FakeAdapter((options) async {
+        return _jsonResponse({
+          'success': false,
+          'statusCode': 409,
+          'errorCode': 'OFFER_EXPIRED',
+          'message': 'Offer has expired',
+        }, statusCode: 409);
+      });
+
+      final apiClient = ApiClient(
+        config: testConfig,
+        tokenProvider: () async => 'driver-access-token',
+        httpClientAdapter: adapter,
+        enableDebugLogging: false,
+      );
+
+      final repository = ApiDriverRepository(apiClient: apiClient);
+
+      await expectLater(
+        repository.acceptOffer(
+          offerId: 'off-123',
+          idempotencyKey: 'idemp-uuid-1234',
+        ),
+        throwsA(
+          isA<ApiException>()
+              .having((e) => e.statusCode, 'statusCode', 409)
+              .having((e) => e.errorCode, 'errorCode', 'OFFER_EXPIRED'),
+        ),
+      );
+    });
+
+    test('acceptOffer throws ApiException INVALID_RESPONSE on missing navigationRoute geometry', () async {
+      final adapter = _FakeAdapter((options) async {
+        return _jsonResponse({
+          'success': true,
+          'data': {
+            'assignmentId': 'asgn-456',
+            'tripId': 'trip-789',
+            'rideGroupId': 'grp-123',
+            'passengerCount': 3,
+            'totalEstimatedFare': '48.00',
+            'navigationRoute': {
+              // Missing geometry!
+              'stops': [],
+            },
+          },
+        });
+      });
+
+      final apiClient = ApiClient(
+        config: testConfig,
+        tokenProvider: () async => 'driver-access-token',
+        httpClientAdapter: adapter,
+        enableDebugLogging: false,
+      );
+
+      final repository = ApiDriverRepository(apiClient: apiClient);
+
+      await expectLater(
+        repository.acceptOffer(
+          offerId: 'off-123',
+          idempotencyKey: 'idemp-uuid-1234',
+        ),
+        throwsA(
+          isA<ApiException>()
+              .having((e) => e.errorCode, 'errorCode', 'INVALID_RESPONSE')
+              .having((e) => e.message, 'message', contains('Malformed accept offer response')),
+        ),
+      );
+    });
+
+    test('rejectOffer sends POST request with Idempotency-Key and optional reason', () async {
+      final adapter = _FakeAdapter((options) async {
+        expect(options.method, 'POST');
+        expect(options.path, '/drivers/offers/off-123/reject');
+        expect(options.headers['Authorization'], 'Bearer driver-access-token');
+        expect(options.headers['Idempotency-Key'], 'idemp-uuid-5678');
+
+        final body = options.data as Map<String, dynamic>;
+        expect(body['reason'], 'Taking a lunch break');
+
+        return _jsonResponse({
+          'success': true,
+          'message': 'Offer rejected successfully',
+        });
+      });
+
+      final apiClient = ApiClient(
+        config: testConfig,
+        tokenProvider: () async => 'driver-access-token',
+        httpClientAdapter: adapter,
+        enableDebugLogging: false,
+      );
+
+      final repository = ApiDriverRepository(apiClient: apiClient);
+      await repository.rejectOffer(
+        offerId: 'off-123',
+        idempotencyKey: 'idemp-uuid-5678',
+        reason: 'Taking a lunch break',
+      );
+
+      expect(adapter.lastRequest, isNotNull);
+    });
+
+    test('rejectOffer maps 409 OFFER_NOT_PENDING error to ApiException', () async {
+      final adapter = _FakeAdapter((options) async {
+        return _jsonResponse({
+          'success': false,
+          'statusCode': 409,
+          'errorCode': 'OFFER_NOT_PENDING',
+          'message': 'Offer cannot be rejected in status WITHDRAWN',
+        }, statusCode: 409);
+      });
+
+      final apiClient = ApiClient(
+        config: testConfig,
+        tokenProvider: () async => 'driver-access-token',
+        httpClientAdapter: adapter,
+        enableDebugLogging: false,
+      );
+
+      final repository = ApiDriverRepository(apiClient: apiClient);
+
+      await expectLater(
+        repository.rejectOffer(
+          offerId: 'off-123',
+          idempotencyKey: 'idemp-uuid-5678',
+        ),
+        throwsA(
+          isA<ApiException>()
+              .having((e) => e.statusCode, 'statusCode', 409)
+              .having((e) => e.errorCode, 'errorCode', 'OFFER_NOT_PENDING'),
+        ),
+      );
+    });
   });
 }

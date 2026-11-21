@@ -19,6 +19,7 @@ import '../features/booking/state/booking_details_provider.dart';
 import '../features/booking/state/booking_flow_provider.dart';
 import '../features/driver/data/api_driver_repository.dart';
 import '../features/driver/data/driver_repository.dart';
+import '../features/driver/services/driver_location_tracker.dart';
 import '../features/driver/state/driver_home_provider.dart';
 import '../features/driver/state/driver_onboarding_provider.dart';
 import '../features/passenger/state/passenger_home_provider.dart';
@@ -39,6 +40,7 @@ class LastMileApp extends StatefulWidget {
     this.authRepository,
     this.googleSignInService,
     this.driverRepository,
+    this.driverLocationTracker,
     this.driverOnboardingProvider,
     this.driverHomeProvider,
     this.bookingRepository,
@@ -57,6 +59,7 @@ class LastMileApp extends StatefulWidget {
   final AuthRepository? authRepository;
   final GoogleSignInService? googleSignInService;
   final DriverRepository? driverRepository;
+  final DriverLocationTracker? driverLocationTracker;
   final DriverOnboardingProvider? driverOnboardingProvider;
   final DriverHomeProvider? driverHomeProvider;
   final BookingRepository? bookingRepository;
@@ -153,7 +156,10 @@ class _LastMileAppState extends State<LastMileApp> {
 
     _ownsDriverHomeProvider = widget.driverHomeProvider == null;
     _driverHomeProvider = widget.driverHomeProvider ??
-        DriverHomeProvider(driverRepository: _driverRepository);
+        DriverHomeProvider(
+          driverRepository: _driverRepository,
+          locationTracker: widget.driverLocationTracker,
+        );
 
     _bookingRepository = widget.bookingRepository ??
         ApiBookingRepository(apiClient: _apiClient);

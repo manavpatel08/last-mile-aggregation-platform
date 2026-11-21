@@ -2156,12 +2156,23 @@ export class TripsService {
     if (
       dto.incidentLocation &&
       typeof dto.incidentLocation.latitude === 'number' &&
-      typeof dto.incidentLocation.longitude === 'number'
+      typeof dto.incidentLocation.longitude === 'number' &&
+      !Number.isNaN(dto.incidentLocation.latitude) &&
+      !Number.isNaN(dto.incidentLocation.longitude) &&
+      dto.incidentLocation.latitude >= -90 &&
+      dto.incidentLocation.latitude <= 90 &&
+      dto.incidentLocation.longitude >= -180 &&
+      dto.incidentLocation.longitude <= 180
     ) {
       incidentLat = dto.incidentLocation.latitude;
       incidentLng = dto.incidentLocation.longitude;
     } else {
-      let gpsFix: { latitude: number; longitude: number } | null = null;
+      let gpsFix: {
+        latitude: number;
+        longitude: number;
+        updatedAt?: string;
+      } | null = null;
+
       if (this.redisService) {
         try {
           const client = this.redisService.getClient();
@@ -2175,16 +2186,37 @@ export class TripsService {
           );
         }
       }
+
       if (
         gpsFix &&
         typeof gpsFix.latitude === 'number' &&
-        typeof gpsFix.longitude === 'number'
+        typeof gpsFix.longitude === 'number' &&
+        !Number.isNaN(gpsFix.latitude) &&
+        !Number.isNaN(gpsFix.longitude) &&
+        gpsFix.latitude >= -90 &&
+        gpsFix.latitude <= 90 &&
+        gpsFix.longitude >= -180 &&
+        gpsFix.longitude <= 180
       ) {
+        // Enforce GPS freshness (<= 30s TTL)
+        if (gpsFix.updatedAt) {
+          const ageMs = Date.now() - new Date(gpsFix.updatedAt).getTime();
+          if (ageMs > 30000) {
+            throw new BadRequestException({
+              errorCode: 'INCIDENT_LOCATION_UNAVAILABLE',
+              message:
+                'Driver GPS telemetry in Redis is stale (> 30s). Valid incident location required.',
+            });
+          }
+        }
         incidentLat = gpsFix.latitude;
         incidentLng = gpsFix.longitude;
       } else {
-        incidentLat = 23.155;
-        incidentLng = 72.6668;
+        throw new BadRequestException({
+          errorCode: 'INCIDENT_LOCATION_UNAVAILABLE',
+          message:
+            'Incident location could not be determined. Request payload missing coordinates and driver GPS telemetry is unavailable.',
+        });
       }
     }
 
@@ -2396,66 +2428,85 @@ export class TripsService {
       return result.breakdownResult;
     }
 
-    // 5. Outside transaction: Search & rank eligible replacement drivers
-    let rankedCandidates: Array<{
-      driverId: string;
-      driverName: string;
-      vehicleCapacity: number;
-      location: { latitude: number; longitude: number };
-      etaSeconds: number;
-      distanceMeters: number;
-    }> = [];
-
+    // 5. Outside transaction: Search & rank eligible replacement drivers with failure recovery
     try {
-      rankedCandidates = await this.findEligibleReplacementDrivers(
-        tripId,
-        { latitude: incidentLat, longitude: incidentLng },
-        result.boardedCount,
-        driver.id,
-      );
-    } catch (err: any) {
+      let rankedCandidates: Array<{
+        driverId: string;
+        driverName: string;
+        vehicleCapacity: number;
+        location: { latitude: number; longitude: number };
+        etaSeconds: number;
+        distanceMeters: number;
+      }> = [];
+
+      try {
+        rankedCandidates = await this.findEligibleReplacementDrivers(
+          tripId,
+          { latitude: incidentLat, longitude: incidentLng },
+          result.boardedCount,
+          driver.id,
+        );
+      } catch (err: any) {
+        this.logger.error(
+          `OSRM road ETA ranking failed after retries for trip ${tripId}: ${err?.message}. Following documented abort behavior.`,
+        );
+        await this.abortInterruptedTrip(
+          tripId,
+          'OSRM_SERVICE_UNAVAILABLE_AFTER_RETRIES',
+        );
+        return {
+          ...result.breakdownResult,
+          status: 'ABORTED',
+          replacementCandidates: [],
+          reason: 'OSRM_SERVICE_UNAVAILABLE_AFTER_RETRIES',
+        };
+      }
+
+      if (rankedCandidates.length > 0) {
+        // Initiate sequential 1-to-1 dispatch to Candidate #1 with 20s timeout
+        const offer = await this.dispatchSingleReplacementOffer(
+          tripId,
+          result.breakdownResult.incidentId,
+          rankedCandidates[0],
+          1,
+        );
+
+        return {
+          ...result.breakdownResult,
+          replacementCandidates: rankedCandidates,
+          activeOffer: offer,
+        };
+      } else {
+        // 0 candidates found: Fail closed / immediately abort per ADR-024
+        this.logger.warn(
+          `No eligible replacement drivers found for interrupted trip ${tripId}. Aborting trip.`,
+        );
+        await this.abortInterruptedTrip(
+          tripId,
+          'NO_REPLACEMENT_DRIVERS_AVAILABLE',
+        );
+        return {
+          ...result.breakdownResult,
+          status: 'ABORTED',
+          replacementCandidates: [],
+        };
+      }
+    } catch (dispatchErr: any) {
       this.logger.error(
-        `OSRM road ETA ranking failed after retries for trip ${tripId}: ${err?.message}. Following documented abort behavior.`,
+        `Critical failure during initial replacement dispatch for trip ${tripId}: ${dispatchErr?.message}. Recovering via documented abort.`,
       );
       await this.abortInterruptedTrip(
         tripId,
-        'OSRM_SERVICE_UNAVAILABLE_AFTER_RETRIES',
-      );
+        `DISPATCH_INITIALIZATION_FAILED: ${dispatchErr?.message || 'UNKNOWN'}`,
+      ).catch((abortErr: any) => {
+        this.logger.error(`Secondary failure while aborting after dispatch error: ${abortErr?.message}`);
+      });
+
       return {
         ...result.breakdownResult,
         status: 'ABORTED',
         replacementCandidates: [],
-        reason: 'OSRM_SERVICE_UNAVAILABLE_AFTER_RETRIES',
-      };
-    }
-
-    if (rankedCandidates.length > 0) {
-      // Initiate sequential 1-to-1 dispatch to Candidate #1 with 20s timeout
-      const offer = await this.dispatchSingleReplacementOffer(
-        tripId,
-        result.breakdownResult.incidentId,
-        rankedCandidates[0],
-        1,
-      );
-
-      return {
-        ...result.breakdownResult,
-        replacementCandidates: rankedCandidates,
-        activeOffer: offer,
-      };
-    } else {
-      // 0 candidates found: Fail closed / immediately abort per ADR-024
-      this.logger.warn(
-        `No eligible replacement drivers found for interrupted trip ${tripId}. Aborting trip.`,
-      );
-      await this.abortInterruptedTrip(
-        tripId,
-        'NO_REPLACEMENT_DRIVERS_AVAILABLE',
-      );
-      return {
-        ...result.breakdownResult,
-        status: 'ABORTED',
-        replacementCandidates: [],
+        reason: 'DISPATCH_INITIALIZATION_FAILED',
       };
     }
   }
@@ -2578,26 +2629,66 @@ export class TripsService {
     }> = [];
 
     for (const cand of candidates) {
-      let candLoc = { latitude: 23.155, longitude: 72.6668 };
-      if (this.redisService) {
-        try {
-          const client = this.redisService.getClient();
-          const raw = await client.get(
-            `${CACHE_KEYS.DRIVER_GPS_PREFIX}${cand.id}`,
+      if (!this.redisService) {
+        this.logger.debug(
+          `Skipping candidate ${cand.id}: Redis service not available for GPS telemetry`,
+        );
+        continue;
+      }
+
+      let candLoc: { latitude: number; longitude: number } | null = null;
+      try {
+        const client = this.redisService.getClient();
+        const raw = await client.get(
+          `${CACHE_KEYS.DRIVER_GPS_PREFIX}${cand.id}`,
+        );
+        if (!raw) {
+          this.logger.debug(
+            `Driver ${cand.id} skipped: missing GPS fix in Redis`,
           );
-          if (raw) {
-            const parsed = JSON.parse(raw);
-            if (
-              typeof parsed.latitude === 'number' &&
-              typeof parsed.longitude === 'number'
-            ) {
-              candLoc = {
-                latitude: parsed.latitude,
-                longitude: parsed.longitude,
-              };
-            }
+          continue;
+        }
+
+        const parsed = JSON.parse(raw);
+        if (
+          typeof parsed.latitude !== 'number' ||
+          typeof parsed.longitude !== 'number' ||
+          Number.isNaN(parsed.latitude) ||
+          Number.isNaN(parsed.longitude) ||
+          parsed.latitude < -90 ||
+          parsed.latitude > 90 ||
+          parsed.longitude < -180 ||
+          parsed.longitude > 180
+        ) {
+          this.logger.warn(
+            `Driver ${cand.id} skipped: invalid coordinates in GPS fix`,
+          );
+          continue;
+        }
+
+        if (parsed.updatedAt) {
+          const ageMs = Date.now() - new Date(parsed.updatedAt).getTime();
+          if (ageMs > 30000) {
+            this.logger.warn(
+              `Driver ${cand.id} skipped: stale GPS fix (${ageMs}ms old)`,
+            );
+            continue;
           }
-        } catch {}
+        }
+
+        candLoc = {
+          latitude: parsed.latitude,
+          longitude: parsed.longitude,
+        };
+      } catch (err: any) {
+        this.logger.warn(
+          `Driver ${cand.id} skipped: failed to read GPS fix: ${err?.message}`,
+        );
+        continue;
+      }
+
+      if (!candLoc) {
+        continue;
       }
 
       const maxCap = Math.max(
@@ -2998,12 +3089,27 @@ export class TripsService {
       WHERE id = ${incidentId}::uuid
     `;
     const incidentLoc =
-      locRows.length > 0 && locRows[0].lat && locRows[0].lng
+      locRows.length > 0 && locRows[0].lat != null && locRows[0].lng != null
         ? {
             latitude: Number(locRows[0].lat),
             longitude: Number(locRows[0].lng),
           }
-        : { latitude: 23.16, longitude: 72.67 };
+        : null;
+
+    if (!incidentLoc) {
+      this.logger.error(
+        `Incident location unavailable for trip ${tripId} during replacement cascade. Aborting trip.`,
+      );
+      await this.abortInterruptedTrip(
+        tripId,
+        'INCIDENT_LOCATION_UNAVAILABLE',
+      );
+      return {
+        cascaded: false,
+        aborted: true,
+        reason: 'INCIDENT_LOCATION_UNAVAILABLE',
+      };
+    }
 
     let rankedCandidates: Array<{
       driverId: string;
@@ -3075,6 +3181,9 @@ export class TripsService {
 
   /**
    * Replacement driver accepts handover for an interrupted trip.
+   * - Validates caller owns the currently ACTIVE replacement dispatch attempt.
+   * - Validates attemptId when provided.
+   * - Verifies attempt, incident, expiry, and driver inside the transaction before reserving.
    * - Atomically reserves replacement driver (operationalStatus = RESERVED).
    * - Resumes trip to IN_PROGRESS.
    * - Records ReplacementDriverAssignment and marks incident RESOLVED.
@@ -3084,6 +3193,7 @@ export class TripsService {
   async acceptReplacementTrip(
     replacementDriverUserId: string,
     tripId: string,
+    attemptId?: string,
     claim?: IdempotencyClaimContext,
   ) {
     const replacementDriver = await this.getVerifiedDriverProfile(
@@ -3182,6 +3292,96 @@ export class TripsService {
         });
       }
 
+      // 3. Find and validate the replacement dispatch attempt inside transaction
+      let attempt: {
+        id: string;
+        tripIncidentId: string;
+        attemptNumber: number;
+        status: string;
+      } | null = null;
+
+      if (attemptId) {
+        attempt = await tx.replacementDispatchAttempt.findUnique({
+          where: { id: attemptId },
+        });
+
+        if (!attempt || attempt.tripIncidentId !== incident.id) {
+          throw new NotFoundException({
+            errorCode: 'ATTEMPT_NOT_FOUND',
+            message: `Replacement dispatch attempt with ID ${attemptId} not found for this incident.`,
+          });
+        }
+
+        if (attempt.status !== 'ACTIVE') {
+          throw new BadRequestException({
+            errorCode: 'ATTEMPT_NOT_ACTIVE',
+            message: `Replacement attempt ${attemptId} is not ACTIVE (current status: '${attempt.status}').`,
+          });
+        }
+      } else {
+        attempt = await tx.replacementDispatchAttempt.findFirst({
+          where: {
+            tripIncidentId: incident.id,
+            status: 'ACTIVE',
+          },
+          orderBy: { attemptNumber: 'desc' },
+        });
+
+        if (!attempt) {
+          throw new BadRequestException({
+            errorCode: 'NO_ACTIVE_REPLACEMENT_OFFER',
+            message: 'No active replacement offer found for this trip.',
+          });
+        }
+      }
+
+      // 4. Validate caller ownership and offer expiry inside transaction
+      const outboxEvents = await tx.outboxEvent.findMany({
+        where: {
+          aggregateId: incident.id,
+          eventType: 'REPLACEMENT_OFFER_DISPATCHED',
+        },
+        orderBy: { createdAt: 'desc' },
+      });
+
+      const matchingEvent = outboxEvents.find((evt) => {
+        const p =
+          typeof evt.payload === 'string'
+            ? JSON.parse(evt.payload)
+            : (evt.payload as any);
+        return p?.attemptId === attempt!.id;
+      });
+
+      if (!matchingEvent) {
+        throw new BadRequestException({
+          errorCode: 'INVALID_REPLACEMENT_OFFER',
+          message: 'Dispatch offer metadata could not be verified for this attempt.',
+        });
+      }
+
+      const dispatchPayload =
+        typeof matchingEvent.payload === 'string'
+          ? JSON.parse(matchingEvent.payload)
+          : (matchingEvent.payload as any);
+
+      if (dispatchPayload.driverId !== replacementDriver.id) {
+        throw new ForbiddenException({
+          errorCode: 'OFFER_NOT_ASSIGNED_TO_DRIVER',
+          message:
+            'Calling driver was not offered this replacement dispatch attempt.',
+        });
+      }
+
+      if (dispatchPayload.expiresAt) {
+        const expiresAt = new Date(dispatchPayload.expiresAt);
+        if (Date.now() > expiresAt.getTime()) {
+          throw new BadRequestException({
+            errorCode: 'REPLACEMENT_OFFER_EXPIRED',
+            message: 'Replacement offer has expired.',
+          });
+        }
+      }
+
       // Check capacity
       const snapshot =
         typeof incident.onboard_manifest_snapshot === 'string'
@@ -3204,7 +3404,7 @@ export class TripsService {
         });
       }
 
-      // 3. Atomically reserve replacement driver
+      // 5. Atomically reserve replacement driver
       const reserveResult = await tx.$executeRaw`
         UPDATE driver_profiles
         SET operational_status = 'RESERVED'
@@ -3221,7 +3421,7 @@ export class TripsService {
 
       const now = new Date();
 
-      // 4. Record replacement driver assignment
+      // 6. Record replacement driver assignment
       await tx.replacementDriverAssignment.create({
         data: {
           tripIncidentId: incident.id,
@@ -3232,22 +3432,19 @@ export class TripsService {
         },
       });
 
-      // Update active replacement attempt to ACCEPTED
-      await tx.replacementDispatchAttempt.updateMany({
-        where: {
-          tripIncidentId: incident.id,
-          status: 'ACTIVE',
-        },
+      // 7. Update active replacement attempt to ACCEPTED
+      await tx.replacementDispatchAttempt.update({
+        where: { id: attempt.id },
         data: { status: 'ACCEPTED' },
       });
 
-      // 5. Update incident status to RESOLVED
+      // 8. Update incident status to RESOLVED
       await tx.tripIncident.update({
         where: { id: incident.id },
         data: { status: 'RESOLVED' },
       });
 
-      // 6. Update trip activeDriverId and status to IN_PROGRESS
+      // 9. Update trip activeDriverId and status to IN_PROGRESS
       await tx.trip.update({
         where: { id: tripId },
         data: {
@@ -3256,14 +3453,14 @@ export class TripsService {
         },
       });
 
-      // 7. Release original driver profile
+      // 10. Release original driver profile
       await tx.$executeRaw`
         UPDATE driver_profiles
         SET operational_status = 'AVAILABLE'
         WHERE id = ${incident.original_driver_id}::uuid;
       `;
 
-      // 8. Apply 10% compensation discount (ADR-023) to remaining onboard passengers
+      // 11. Apply 10% compensation discount (ADR-023) to remaining onboard passengers
       const onboardPassengers = await tx.tripPassenger.findMany({
         where: {
           tripId,
@@ -3315,7 +3512,7 @@ export class TripsService {
         });
       }
 
-      // 9. Trip status history
+      // 12. Trip status history
       await tx.tripStatusHistory.create({
         data: {
           tripId,
@@ -3326,7 +3523,7 @@ export class TripsService {
         },
       });
 
-      // 10. Outbox event (trip.resumed domain event)
+      // 13. Outbox event (trip.resumed domain event)
       await tx.outboxEvent.create({
         data: {
           eventType: 'TRIP_RESUMED',
@@ -3374,6 +3571,7 @@ export class TripsService {
    * - Transitions trip to ABORTED.
    * - Sets all onboard passenger fares to ₹0.00 (ADR-024).
    * - Records full refund records in refund_records.
+   * - Closes any ACTIVE replacement dispatch attempts and releases reserved replacement drivers.
    * - Releases original driver and dissolves ride group.
    * - Emits TRIP_ABORTED outbox event.
    */
@@ -3414,6 +3612,8 @@ export class TripsService {
         const abortResult = {
           tripId,
           status: 'ABORTED',
+          affectedPassengersCount: 0,
+          refundedPassengers: [],
           message: 'Trip was already aborted',
         };
         const responsePayload = {
@@ -3449,6 +3649,34 @@ export class TripsService {
         where: { tripId, status: 'REPORTED' },
         data: { status: 'ABORTED' },
       });
+
+      // 3b. Expire any ACTIVE replacement dispatch attempts
+      await tx.replacementDispatchAttempt.updateMany({
+        where: {
+          incident: { tripId },
+          status: 'ACTIVE',
+        },
+        data: { status: 'EXPIRED' },
+      });
+
+      // 3c. Cancel any active replacement driver assignments and release reserved replacement drivers
+      const replacementAssignments =
+        await tx.replacementDriverAssignment.findMany({
+          where: { incident: { tripId }, status: 'ASSIGNED' },
+        });
+
+      for (const repAssign of replacementAssignments) {
+        await tx.replacementDriverAssignment.update({
+          where: { id: repAssign.id },
+          data: { status: 'CANCELLED' },
+        });
+
+        await tx.$executeRaw`
+          UPDATE driver_profiles
+          SET operational_status = 'AVAILABLE'
+          WHERE id = ${repAssign.replacementDriverId}::uuid AND operational_status = 'RESERVED';
+        `;
+      }
 
       // 4. Update trip_passengers who were BOARDED: set fare to 0 and record refund audit
       const onboardPassengers = await tx.tripPassenger.findMany({
@@ -3517,6 +3745,18 @@ export class TripsService {
         SET operational_status = 'AVAILABLE'
         WHERE id = ${trip.active_driver_id}::uuid;
       `;
+
+      const incidents = await tx.tripIncident.findMany({
+        where: { tripId },
+        select: { originalDriverId: true },
+      });
+      for (const inc of incidents) {
+        await tx.$executeRaw`
+          UPDATE driver_profiles
+          SET operational_status = 'AVAILABLE'
+          WHERE id = ${inc.originalDriverId}::uuid AND operational_status = 'RESERVED';
+        `;
+      }
 
       // 6. Dissolve ride group
       await tx.rideGroup.update({

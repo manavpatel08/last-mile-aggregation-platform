@@ -1,24 +1,37 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
 import { PrismaClient } from '@prisma/client';
-import { BadRequestException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { TripsService } from './trips.service.js';
 import { RoutingService } from '../routing/routing.service.js';
 import { PrismaService } from '../../infrastructure/prisma/prisma.service.js';
+import { RedisService } from '../../infrastructure/redis/redis.service.js';
+import { CACHE_KEYS } from '../../common/constants/index.js';
+import { DispatchProcessor } from '../dispatch/dispatch.processor.js';
 
 describe('Stage 9: Driver Breakdown & Replacement Dispatch', () => {
   const prisma = new PrismaClient();
   let tripsService: TripsService;
   let routingService: RoutingService;
+  let redisService: RedisService;
 
   const createdUserIds: string[] = [];
   const createdBookingIds: string[] = [];
   const createdGroupIds: string[] = [];
   const createdTripIds: string[] = [];
+  const createdDriverProfileIds: string[] = [];
   let testPickupPointId: string;
 
   beforeAll(async () => {
     const prismaService = new PrismaService();
     await prismaService.onModuleInit();
+
+    const redisConfig = new ConfigService({
+      REDIS_HOST: process.env.REDIS_HOST || '127.0.0.1',
+      REDIS_PORT: parseInt(process.env.REDIS_PORT || '6379', 10),
+    });
+    redisService = new RedisService(redisConfig);
+    redisService.onModuleInit();
 
     const configMock = {
       get: (key: string, def?: any) => {
@@ -29,7 +42,7 @@ describe('Stage 9: Driver Breakdown & Replacement Dispatch', () => {
     } as any;
 
     routingService = new RoutingService(configMock);
-    tripsService = new TripsService(prismaService, undefined, routingService);
+    tripsService = new TripsService(prismaService, redisService, routingService);
 
     // Fetch or create pickup point
     let pickup = await prisma.pickupPoint.findFirst({
@@ -52,7 +65,7 @@ describe('Stage 9: Driver Breakdown & Replacement Dispatch', () => {
     }
   });
 
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.restoreAllMocks();
     vi.spyOn(routingService, 'getRoute').mockImplementation(async () => {
       return {
@@ -61,6 +74,11 @@ describe('Stage 9: Driver Breakdown & Replacement Dispatch', () => {
         source: 'OSRM',
         isFallback: false,
       };
+    });
+
+    await prisma.driverProfile.updateMany({
+      where: { operationalStatus: 'AVAILABLE', isOnline: true },
+      data: { isOnline: false },
     });
   });
 
@@ -155,6 +173,14 @@ describe('Stage 9: Driver Breakdown & Replacement Dispatch', () => {
       await prisma.user.deleteMany({ where: { id: userId } }).catch(() => {});
     }
 
+    if (redisService) {
+      const client = redisService.getClient();
+      for (const profileId of createdDriverProfileIds) {
+        await client.del(`${CACHE_KEYS.DRIVER_GPS_PREFIX}${profileId}`).catch(() => {});
+      }
+      await redisService.onModuleDestroy();
+    }
+
     await prisma.$disconnect();
   });
 
@@ -183,6 +209,21 @@ describe('Stage 9: Driver Breakdown & Replacement Dispatch', () => {
         isOnline,
       },
     });
+    createdDriverProfileIds.push(profile.id);
+
+    if (redisService && isOnline) {
+      const client = redisService.getClient();
+      await client.set(
+        `${CACHE_KEYS.DRIVER_GPS_PREFIX}${profile.id}`,
+        JSON.stringify({
+          latitude: 23.1600,
+          longitude: 72.6700,
+          updatedAt: new Date().toISOString(),
+        }),
+        'EX',
+        300,
+      );
+    }
 
     await prisma.vehicle.create({
       data: {
@@ -423,6 +464,10 @@ describe('Stage 9: Driver Breakdown & Replacement Dispatch', () => {
   });
 
   it('3. Replacement driver accepts: resumes trip, updates activeDriverId, releases original driver, and applies 10% discount', async () => {
+    // Create replacement driver before breakdown so Candidate #1 is offered attempt 1
+    const { user: repDriverUser, profile: repDriverProfile } =
+      await createTestDriver('acceptor', 'AVAILABLE', true, 4);
+
     const p1 = await createTestPassengerAndBooking('CONFIRMED', 3000);
     const p2 = await createTestPassengerAndBooking('CONFIRMED', 2000);
 
@@ -438,10 +483,6 @@ describe('Stage 9: Driver Breakdown & Replacement Dispatch', () => {
         reason: 'Battery depleted',
       },
     );
-
-    // Create replacement driver
-    const { user: repDriverUser, profile: repDriverProfile } =
-      await createTestDriver('acceptor', 'AVAILABLE', true, 4);
 
     // Replacement driver accepts
     const acceptResult = await tripsService.acceptReplacementTrip(
@@ -510,6 +551,8 @@ describe('Stage 9: Driver Breakdown & Replacement Dispatch', () => {
   });
 
   it('4. Passenger already completed prior to breakdown receives NO discount', async () => {
+    const { user: repDriverUser } = await createTestDriver('rep-no-drop', 'AVAILABLE', true, 4);
+
     const p1 = await createTestPassengerAndBooking('CONFIRMED', 3000); // Disembarked early
     const p2 = await createTestPassengerAndBooking('CONFIRMED', 2000); // Still onboard
 
@@ -535,7 +578,6 @@ describe('Stage 9: Driver Breakdown & Replacement Dispatch', () => {
     );
 
     // Replacement driver accepts
-    const { user: repDriverUser } = await createTestDriver('rep-no-drop', 'AVAILABLE', true, 4);
     await tripsService.acceptReplacementTrip(repDriverUser.id, trip.id);
 
     // p1 was already COMPLETED: fare must remain 3000 (0% discount)
@@ -564,6 +606,8 @@ describe('Stage 9: Driver Breakdown & Replacement Dispatch', () => {
 
     const { trip, originalDriverUser, originalDriverProfile } =
       await createActiveTripWithPassengers([p1, p2], 'IN_PROGRESS');
+
+    await createTestDriver('rep-for-abort-test', 'AVAILABLE', true, 4);
 
     // Report breakdown
     await tripsService.reportBreakdown(
@@ -625,6 +669,8 @@ describe('Stage 9: Driver Breakdown & Replacement Dispatch', () => {
   });
 
   it('6. Original driver cannot accept their own replacement handover', async () => {
+    await createTestDriver('rep-for-orig-test', 'AVAILABLE', true, 4);
+
     const p1 = await createTestPassengerAndBooking('CONFIRMED', 3000);
     const { trip, originalDriverUser } = await createActiveTripWithPassengers(
       [p1],
@@ -634,7 +680,10 @@ describe('Stage 9: Driver Breakdown & Replacement Dispatch', () => {
     await tripsService.reportBreakdown(
       originalDriverUser.id,
       trip.id,
-      { reason: 'Tire puncture' },
+      {
+        incidentLocation: { latitude: 23.1600, longitude: 72.6700 },
+        reason: 'Tire puncture',
+      },
     );
 
     // Original driver attempts to accept replacement
@@ -652,12 +701,15 @@ describe('Stage 9: Driver Breakdown & Replacement Dispatch', () => {
 
     await expect(
       tripsService.reportBreakdown(originalDriverUser.id, trip.id, {
+        incidentLocation: { latitude: 23.1600, longitude: 72.6700 },
         reason: 'Broke down before departing pickup',
       }),
     ).rejects.toThrow(BadRequestException);
   });
 
   it('8. Idempotent breakdown reporting returns existing incident without creating duplicates', async () => {
+    await createTestDriver('rep-idemp', 'AVAILABLE', true, 4);
+
     const p1 = await createTestPassengerAndBooking('CONFIRMED', 3000);
     const { trip, originalDriverUser } = await createActiveTripWithPassengers(
       [p1],
@@ -667,13 +719,19 @@ describe('Stage 9: Driver Breakdown & Replacement Dispatch', () => {
     const first = await tripsService.reportBreakdown(
       originalDriverUser.id,
       trip.id,
-      { reason: 'Breakdown call 1' },
+      {
+        incidentLocation: { latitude: 23.1600, longitude: 72.6700 },
+        reason: 'Breakdown call 1',
+      },
     );
 
     const second = await tripsService.reportBreakdown(
       originalDriverUser.id,
       trip.id,
-      { reason: 'Breakdown call 2' },
+      {
+        incidentLocation: { latitude: 23.1600, longitude: 72.6700 },
+        reason: 'Breakdown call 2',
+      },
     );
 
     expect(first.incidentId).toBe(second.incidentId);
@@ -686,6 +744,9 @@ describe('Stage 9: Driver Breakdown & Replacement Dispatch', () => {
   });
 
   it('9. Concurrent replacement driver acceptances allow exactly one winner', async () => {
+    const { user: repD1 } = await createTestDriver('race1', 'AVAILABLE', true, 4);
+    const { user: repD2 } = await createTestDriver('race2', 'AVAILABLE', true, 4);
+
     const p1 = await createTestPassengerAndBooking('CONFIRMED', 3000);
     const { trip, originalDriverUser } = await createActiveTripWithPassengers(
       [p1],
@@ -695,11 +756,11 @@ describe('Stage 9: Driver Breakdown & Replacement Dispatch', () => {
     await tripsService.reportBreakdown(
       originalDriverUser.id,
       trip.id,
-      { reason: 'Mid-trip engine stop' },
+      {
+        incidentLocation: { latitude: 23.1600, longitude: 72.6700 },
+        reason: 'Mid-trip engine stop',
+      },
     );
-
-    const { user: repD1 } = await createTestDriver('race1', 'AVAILABLE', true, 4);
-    const { user: repD2 } = await createTestDriver('race2', 'AVAILABLE', true, 4);
 
     // Simultaneously attempt acceptances
     const results = await Promise.allSettled([
@@ -721,6 +782,8 @@ describe('Stage 9: Driver Breakdown & Replacement Dispatch', () => {
   });
 
   it('10. OSRM unavailable after 3 retries aborts interrupted trip immediately with ₹0 fare and refund audit (no geodesic fallback)', async () => {
+    await createTestDriver('rep-osrm-fail', 'AVAILABLE', true, 4);
+
     const p1 = await createTestPassengerAndBooking('CONFIRMED', 3500);
     const { trip, originalDriverUser } = await createActiveTripWithPassengers(
       [p1],
@@ -742,7 +805,10 @@ describe('Stage 9: Driver Breakdown & Replacement Dispatch', () => {
     const result = await tripsService.reportBreakdown(
       originalDriverUser.id,
       trip.id,
-      { reason: 'Overheating engine on highway' },
+      {
+        incidentLocation: { latitude: 23.1600, longitude: 72.6700 },
+        reason: 'Overheating engine on highway',
+      },
     );
 
     // Trip immediately aborted per documented behavior
@@ -763,17 +829,20 @@ describe('Stage 9: Driver Breakdown & Replacement Dispatch', () => {
   });
 
   it('11. Sequential dispatch offers to Candidate #1 first with 20-second timeout and creates active attempt', async () => {
+    const { profile: _rep1 } = await createTestDriver('seq1', 'AVAILABLE', true, 4);
+    const { profile: _rep2 } = await createTestDriver('seq2', 'AVAILABLE', true, 4);
+
     const p1 = await createTestPassengerAndBooking('CONFIRMED', 3000);
     const { trip, originalDriverUser } =
       await createActiveTripWithPassengers([p1], 'IN_PROGRESS');
 
-    const { profile: _rep1 } = await createTestDriver('seq1', 'AVAILABLE', true, 4);
-    const { profile: _rep2 } = await createTestDriver('seq2', 'AVAILABLE', true, 4);
-
     const result = await tripsService.reportBreakdown(
       originalDriverUser.id,
       trip.id,
-      { reason: 'Tire blown out' },
+      {
+        incidentLocation: { latitude: 23.1600, longitude: 72.6700 },
+        reason: 'Tire blown out',
+      },
     );
 
     expect(result.status).toBe('INTERRUPTED');
@@ -802,16 +871,16 @@ describe('Stage 9: Driver Breakdown & Replacement Dispatch', () => {
   });
 
   it('12. Rejection by Candidate #1 marks attempt REJECTED and cascades immediately to Candidate #2', async () => {
+    const { user: repUser1 } =
+      await createTestDriver('rej1', 'AVAILABLE', true, 4);
+    const { user: _repUser2 } =
+      await createTestDriver('rej2', 'AVAILABLE', true, 4);
+
     const p1 = await createTestPassengerAndBooking('CONFIRMED', 3000);
     const { trip, originalDriverUser } = await createActiveTripWithPassengers(
       [p1],
       'IN_PROGRESS',
     );
-
-    const { user: repUser1 } =
-      await createTestDriver('rej1', 'AVAILABLE', true, 4);
-    const { user: _repUser2 } =
-      await createTestDriver('rej2', 'AVAILABLE', true, 4);
 
     let count = 0;
     vi.spyOn(routingService, 'getRoute').mockImplementation(async () => {
@@ -827,7 +896,10 @@ describe('Stage 9: Driver Breakdown & Replacement Dispatch', () => {
     const breakdown = await tripsService.reportBreakdown(
       originalDriverUser.id,
       trip.id,
-      { reason: 'Engine stall' },
+      {
+        incidentLocation: { latitude: 23.1600, longitude: 72.6700 },
+        reason: 'Engine stall',
+      },
     );
 
     const firstAttempt = await prisma.replacementDispatchAttempt.findFirst({
@@ -871,19 +943,22 @@ describe('Stage 9: Driver Breakdown & Replacement Dispatch', () => {
   });
 
   it('13. 20-second timeout marks attempt EXPIRED and cascades to next driver', async () => {
+    const { profile: repProf1 } = await createTestDriver('to1', 'AVAILABLE', true, 4);
+    const { profile: _repProf2 } = await createTestDriver('to2', 'AVAILABLE', true, 4);
+
     const p1 = await createTestPassengerAndBooking('CONFIRMED', 3000);
     const { trip, originalDriverUser } = await createActiveTripWithPassengers(
       [p1],
       'IN_PROGRESS',
     );
 
-    const { profile: repProf1 } = await createTestDriver('to1', 'AVAILABLE', true, 4);
-    const { profile: _repProf2 } = await createTestDriver('to2', 'AVAILABLE', true, 4);
-
     const breakdown = await tripsService.reportBreakdown(
       originalDriverUser.id,
       trip.id,
-      { reason: 'Alternator failure' },
+      {
+        incidentLocation: { latitude: 23.1600, longitude: 72.6700 },
+        reason: 'Alternator failure',
+      },
     );
 
     const activeAttempt = await prisma.replacementDispatchAttempt.findFirst({
@@ -931,20 +1006,23 @@ describe('Stage 9: Driver Breakdown & Replacement Dispatch', () => {
       data: { isOnline: false },
     });
 
+    // Only 1 replacement driver exists online
+    const { user: repUser1 } =
+      await createTestDriver('only1', 'AVAILABLE', true, 4);
+
     const p1 = await createTestPassengerAndBooking('CONFIRMED', 4500);
     const { trip, originalDriverUser } = await createActiveTripWithPassengers(
       [p1],
       'IN_PROGRESS',
     );
 
-    // Only 1 replacement driver exists online
-    const { user: repUser1 } =
-      await createTestDriver('only1', 'AVAILABLE', true, 4);
-
     const breakdown = await tripsService.reportBreakdown(
       originalDriverUser.id,
       trip.id,
-      { reason: 'Blown head gasket' },
+      {
+        incidentLocation: { latitude: 23.1600, longitude: 72.6700 },
+        reason: 'Blown head gasket',
+      },
     );
 
     const attempt = await prisma.replacementDispatchAttempt.findFirst({
@@ -974,5 +1052,273 @@ describe('Stage 9: Driver Breakdown & Replacement Dispatch', () => {
     const refund = await prisma.refundRecord.findFirst({ where: { tripPassengerId: tp!.id } });
     expect(refund).not.toBeNull();
     expect(refund!.refundAmountPaise).toBe(4500);
+  });
+
+  it('15. Driver who was not offered replacement cannot accept it', async () => {
+    const { user: _driverAUser } = await createTestDriver('offered-a', 'AVAILABLE', true, 4);
+    const { user: driverBUser } = await createTestDriver('unoffered-b', 'AVAILABLE', true, 4);
+
+    const p1 = await createTestPassengerAndBooking('CONFIRMED', 3000);
+    const { trip, originalDriverUser } = await createActiveTripWithPassengers([p1], 'IN_PROGRESS');
+
+    const breakdown = await tripsService.reportBreakdown(
+      originalDriverUser.id,
+      trip.id,
+      {
+        incidentLocation: { latitude: 23.1600, longitude: 72.6700 },
+        reason: 'Alternator failure',
+      },
+    );
+
+    expect(breakdown.activeOffer?.driverId).toBeDefined();
+
+    // driverBUser attempts to accept the offer made to Candidate #1 (driverA)
+    await expect(
+      tripsService.acceptReplacementTrip(driverBUser.id, trip.id),
+    ).rejects.toThrow(ForbiddenException);
+  });
+
+  it('16. Stale or incorrect attempt ID cannot accept it', async () => {
+    const { user: repDriverUser } = await createTestDriver('attempt-val', 'AVAILABLE', true, 4);
+    const p1 = await createTestPassengerAndBooking('CONFIRMED', 3000);
+    const { trip, originalDriverUser } = await createActiveTripWithPassengers([p1], 'IN_PROGRESS');
+
+    const breakdown = await tripsService.reportBreakdown(
+      originalDriverUser.id,
+      trip.id,
+      {
+        incidentLocation: { latitude: 23.1600, longitude: 72.6700 },
+        reason: 'Transmission slip',
+      },
+    );
+
+    // 1) Non-existent attempt ID
+    const fakeAttemptId = '00000000-0000-0000-0000-000000000000';
+    await expect(
+      tripsService.acceptReplacementTrip(repDriverUser.id, trip.id, fakeAttemptId),
+    ).rejects.toThrow(NotFoundException);
+
+    // 2) Inactive attempt ID (e.g. marked REJECTED)
+    const activeAttempt = await prisma.replacementDispatchAttempt.findFirst({
+      where: { tripIncidentId: breakdown.incidentId, status: 'ACTIVE' },
+    });
+    await prisma.replacementDispatchAttempt.update({
+      where: { id: activeAttempt!.id },
+      data: { status: 'REJECTED' },
+    });
+
+    await expect(
+      tripsService.acceptReplacementTrip(repDriverUser.id, trip.id, activeAttempt!.id),
+    ).rejects.toThrow(BadRequestException);
+  });
+
+  it('17. Expired offer cannot be accepted', async () => {
+    const { user: repDriverUser, profile: repDriverProfile } =
+      await createTestDriver('expired-offer-drv', 'AVAILABLE', true, 4);
+    const p1 = await createTestPassengerAndBooking('CONFIRMED', 3000);
+    const { trip, originalDriverUser } = await createActiveTripWithPassengers([p1], 'IN_PROGRESS');
+
+    const breakdown = await tripsService.reportBreakdown(
+      originalDriverUser.id,
+      trip.id,
+      {
+        incidentLocation: { latitude: 23.1600, longitude: 72.6700 },
+        reason: 'Radiator leak',
+      },
+    );
+
+    const activeAttempt = await prisma.replacementDispatchAttempt.findFirst({
+      where: { tripIncidentId: breakdown.incidentId, status: 'ACTIVE' },
+    });
+
+    // Update outbox event to set expiresAt in the past
+    const outbox = await prisma.outboxEvent.findFirst({
+      where: { aggregateId: breakdown.incidentId, eventType: 'REPLACEMENT_OFFER_DISPATCHED' },
+    });
+    const payload = outbox!.payload as any;
+    payload.expiresAt = new Date(Date.now() - 30000).toISOString(); // expired 30s ago
+    payload.driverId = repDriverProfile.id;
+    await prisma.outboxEvent.update({
+      where: { id: outbox!.id },
+      data: { payload },
+    });
+
+    await expect(
+      tripsService.acceptReplacementTrip(repDriverUser.id, trip.id, activeAttempt!.id),
+    ).rejects.toThrow(BadRequestException);
+  });
+
+  it('18. Initial dispatch creation failure triggers recovery via documented abort', async () => {
+    await createTestDriver('dispatch-fail-drv', 'AVAILABLE', true, 4);
+    const p1 = await createTestPassengerAndBooking('CONFIRMED', 3500);
+    const { trip, originalDriverUser } = await createActiveTripWithPassengers([p1], 'IN_PROGRESS');
+
+    // Spy on dispatchSingleReplacementOffer to simulate failure during initial offer creation
+    vi.spyOn(tripsService, 'dispatchSingleReplacementOffer').mockRejectedValueOnce(
+      new Error('Simulated Redis / Outbox failure during dispatch offer creation'),
+    );
+
+    const result = await tripsService.reportBreakdown(
+      originalDriverUser.id,
+      trip.id,
+      {
+        incidentLocation: { latitude: 23.1600, longitude: 72.6700 },
+        reason: 'Electrical failure',
+      },
+    );
+
+    // Trip must NOT remain INTERRUPTED without an active offer; it must recover via abort
+    expect(result.status).toBe('ABORTED');
+
+    const updatedTrip = await prisma.trip.findUnique({ where: { id: trip.id } });
+    expect(updatedTrip!.status).toBe('ABORTED');
+
+    // Onboard fares set to 0 and refund recorded per ADR-024
+    const tp = await prisma.tripPassenger.findFirst({ where: { bookingId: p1.bookingId } });
+    expect(tp!.finalRideFarePaise).toBe(0);
+
+    const refund = await prisma.refundRecord.findFirst({ where: { tripPassengerId: tp!.id } });
+    expect(refund).not.toBeNull();
+    expect(refund!.refundAmountPaise).toBe(3500);
+  });
+
+  it('19. Missing/stale driver GPS does not produce a fabricated ETA', async () => {
+    const p1 = await createTestPassengerAndBooking('CONFIRMED', 3000);
+    const { trip, originalDriverProfile } = await createActiveTripWithPassengers([p1], 'IN_PROGRESS');
+
+    // Driver 1: Missing GPS in Redis
+    const { profile: dNoGps } = await createTestDriver('no-gps', 'AVAILABLE', true, 4);
+    if (redisService) {
+      await redisService.getClient().del(`${CACHE_KEYS.DRIVER_GPS_PREFIX}${dNoGps.id}`);
+    }
+
+    // Driver 2: Stale GPS in Redis (> 30s old)
+    const { profile: dStaleGps } = await createTestDriver('stale-gps', 'AVAILABLE', true, 4);
+    if (redisService) {
+      await redisService.getClient().set(
+        `${CACHE_KEYS.DRIVER_GPS_PREFIX}${dStaleGps.id}`,
+        JSON.stringify({
+          latitude: 23.1650,
+          longitude: 72.6750,
+          updatedAt: new Date(Date.now() - 45000).toISOString(), // 45s old
+        }),
+        'EX',
+        300,
+      );
+    }
+
+    // Driver 3: Fresh valid GPS (5s old)
+    const { profile: dFreshGps } = await createTestDriver('fresh-gps', 'AVAILABLE', true, 4);
+    if (redisService) {
+      await redisService.getClient().set(
+        `${CACHE_KEYS.DRIVER_GPS_PREFIX}${dFreshGps.id}`,
+        JSON.stringify({
+          latitude: 23.1610,
+          longitude: 72.6710,
+          updatedAt: new Date(Date.now() - 5000).toISOString(),
+        }),
+        'EX',
+        300,
+      );
+    }
+
+    const candidates = await tripsService.findEligibleReplacementDrivers(
+      trip.id,
+      { latitude: 23.1600, longitude: 72.6700 },
+      1,
+      originalDriverProfile.id,
+    );
+
+    // dNoGps and dStaleGps must be excluded
+    const candidateDriverIds = candidates.map((c) => c.driverId);
+    expect(candidateDriverIds).not.toContain(dNoGps.id);
+    expect(candidateDriverIds).not.toContain(dStaleGps.id);
+    expect(candidateDriverIds).toContain(dFreshGps.id);
+  });
+
+  it('20. Abort releases replacement resources and closes active attempts', async () => {
+    const { profile: repDriverProfile } =
+      await createTestDriver('rep-cleanup', 'AVAILABLE', true, 4);
+    const p1 = await createTestPassengerAndBooking('CONFIRMED', 3000);
+    const { trip, originalDriverUser, originalDriverProfile } =
+      await createActiveTripWithPassengers([p1], 'IN_PROGRESS');
+
+    const breakdown = await tripsService.reportBreakdown(
+      originalDriverUser.id,
+      trip.id,
+      {
+        incidentLocation: { latitude: 23.1600, longitude: 72.6700 },
+        reason: 'Transmission failure',
+      },
+    );
+
+    // Verify active attempt was created
+    const activeAttempt = await prisma.replacementDispatchAttempt.findFirst({
+      where: { tripIncidentId: breakdown.incidentId, status: 'ACTIVE' },
+    });
+    expect(activeAttempt).not.toBeNull();
+
+    // Create a mock replacement driver assignment and reserve driver
+    const repAssignment = await prisma.replacementDriverAssignment.create({
+      data: {
+        tripIncidentId: breakdown.incidentId,
+        replacementDriverId: repDriverProfile.id,
+        status: 'ASSIGNED',
+        assignedAt: new Date(),
+      },
+    });
+    await prisma.driverProfile.update({
+      where: { id: repDriverProfile.id },
+      data: { operationalStatus: 'RESERVED' },
+    });
+
+    // Abort the trip
+    await tripsService.abortInterruptedTrip(trip.id, 'Manual abort cleanup verification');
+
+    // Active attempt must be EXPIRED
+    const updatedAttempt = await prisma.replacementDispatchAttempt.findUnique({
+      where: { id: activeAttempt!.id },
+    });
+    expect(updatedAttempt!.status).toBe('EXPIRED');
+
+    // Replacement assignment must be CANCELLED
+    const updatedRepAssignment = await prisma.replacementDriverAssignment.findUnique({
+      where: { id: repAssignment.id },
+    });
+    expect(updatedRepAssignment!.status).toBe('CANCELLED');
+
+    // Replacement driver must be released back to AVAILABLE
+    const updatedRepProfile = await prisma.driverProfile.findUnique({
+      where: { id: repDriverProfile.id },
+    });
+    expect(updatedRepProfile!.operationalStatus).toBe('AVAILABLE');
+
+    // Original driver must be released back to AVAILABLE
+    const updatedOrigProfile = await prisma.driverProfile.findUnique({
+      where: { id: originalDriverProfile.id },
+    });
+    expect(updatedOrigProfile!.operationalStatus).toBe('AVAILABLE');
+  });
+
+  it('21. Timeout processing does not silently succeed without handling the job', async () => {
+    const processor = new DispatchProcessor(
+      {} as any, // mock dispatchService
+      undefined, // tripsService undefined!
+    );
+
+    const fakeJob = {
+      id: 'job-replacement-timeout-1',
+      name: 'replacement-offer-timeout',
+      data: {
+        tripId: 'a1b2c3d4-0000-0000-0000-000000000001',
+        incidentId: 'a1b2c3d4-0000-0000-0000-000000000002',
+        attemptId: 'a1b2c3d4-0000-0000-0000-000000000003',
+      },
+    };
+
+    // Must throw an error so BullMQ can fail visibly and retry
+    await expect(processor.process(fakeJob as any)).rejects.toThrow(
+      'TripsService unavailable; cannot process replacement timeout job job-replacement-timeout-1',
+    );
   });
 });

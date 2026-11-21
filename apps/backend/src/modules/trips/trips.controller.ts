@@ -219,6 +219,7 @@ export class TripsController {
     const result = await this.tripsService.acceptReplacementTrip(
       user.id,
       tripId,
+      undefined,
       claim,
     );
     return {
@@ -240,12 +241,13 @@ export class TripsController {
   async acceptReplacementOffer(
     @CurrentUser() user: { id: string },
     @Param('id', new ParseUUIDPipe()) tripId: string,
-    @Param('attemptId') _attemptId: string,
+    @Param('attemptId', new ParseUUIDPipe()) attemptId: string,
     @CurrentIdempotencyClaim() claim?: IdempotencyClaimContext,
   ) {
     const result = await this.tripsService.acceptReplacementTrip(
       user.id,
       tripId,
+      attemptId,
       claim,
     );
     return {
@@ -295,7 +297,7 @@ export class TripsController {
   async rejectReplacementOffer(
     @CurrentUser() user: { id: string },
     @Param('id', new ParseUUIDPipe()) tripId: string,
-    @Param('attemptId') attemptId: string,
+    @Param('attemptId', new ParseUUIDPipe()) attemptId: string,
     @CurrentIdempotencyClaim() claim?: IdempotencyClaimContext,
   ) {
     const result = await this.tripsService.rejectReplacementOffer(

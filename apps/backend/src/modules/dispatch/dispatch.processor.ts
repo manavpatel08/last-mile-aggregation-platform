@@ -32,10 +32,15 @@ export class DispatchProcessor extends WorkerHost {
       this.logger.log(
         `Processing replacement timeout job ID=${job.id} for trip ${job.data?.tripId} (attempt=${job.data?.attemptId})`,
       );
-      if (this.tripsService) {
-        return this.tripsService.handleReplacementTimeout(job.data);
+      if (!this.tripsService) {
+        this.logger.error(
+          `TripsService not available to process replacement timeout job ID=${job.id}`,
+        );
+        throw new Error(
+          `TripsService unavailable; cannot process replacement timeout job ${job.id}`,
+        );
       }
-      return null;
+      return this.tripsService.handleReplacementTimeout(job.data);
     }
 
     this.logger.warn(`Unrecognized job name on dispatch-queue: ${job.name}`);

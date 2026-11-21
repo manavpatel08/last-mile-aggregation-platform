@@ -357,5 +357,314 @@ void main() {
         ),
       );
     });
+
+    test('getBookingDetails fetches booking details and status history with auth', () async {
+      late _FakeAdapter adapter;
+      adapter = _FakeAdapter((options) async {
+        expect(options.method, 'GET');
+        expect(options.path, '/bookings/book-uuid-123');
+        expect(options.headers['Authorization'], 'Bearer test-token');
+        return _jsonResponse({
+          'success': true,
+          'data': {
+            'bookingId': 'book-uuid-123',
+            'passengerId': 'passenger-7',
+            'pickupPointId': 'hub-1',
+            'pickupPointName': 'PDEU Main Gate',
+            'requestedType': 'SHARED',
+            'minGroupPreference': 2,
+            'status': 'CONFIRMED',
+            'agreedFareCeilingPaise': 4500,
+            'finalAllocatedFarePaise': 4000,
+            'maxWaitDeadline': '2026-11-20T12:00:00.000Z',
+            'cancellationReason': null,
+            'cancelledAt': null,
+            'createdAt': '2026-11-20T11:45:00.000Z',
+            'passengerPickupLocation': {
+              'latitude': 23.1550,
+              'longitude': 72.6668,
+            },
+            'destinationLocation': {
+              'latitude': 23.1800,
+              'longitude': 72.6500,
+            },
+            'statusHistory': [
+              {
+                'previousStatus': 'REQUESTED',
+                'newStatus': 'CONFIRMED',
+                'reason': 'Assigned directly',
+                'transitionTime': '2026-11-20T11:46:00.000Z',
+              },
+            ],
+          },
+        });
+      });
+
+      final client = ApiClient(
+        config: config,
+        httpClientAdapter: adapter,
+        tokenProvider: () async => 'test-token',
+      );
+      final repo = ApiBookingRepository(apiClient: client);
+
+      final details = await repo.getBookingDetails('book-uuid-123');
+      expect(details.bookingId, 'book-uuid-123');
+      expect(details.status, 'CONFIRMED');
+      expect(details.finalAllocatedFareInRupees, '40.00');
+      expect(details.statusHistory.length, 1);
+      expect(details.statusHistory.first.newStatus, 'CONFIRMED');
+    });
+
+    test('cancelBooking submits idempotent cancellation with optional reason', () async {
+      late _FakeAdapter adapter;
+      adapter = _FakeAdapter((options) async {
+        expect(options.method, 'POST');
+        expect(options.path, '/bookings/book-uuid-123/cancel');
+        expect(options.headers['Authorization'], 'Bearer test-token');
+        expect(options.headers['Idempotency-Key'], 'idemp-key-999');
+        expect(options.data, {'reason': 'Emergency cancellation'});
+        return _jsonResponse({
+          'success': true,
+          'data': {
+            'bookingId': 'book-uuid-123',
+            'status': 'CANCELLED',
+            'cancellationFeeAssessedPaise': 3000,
+            'cancellationFeeStatus': 'OUTSTANDING',
+          },
+        });
+      });
+
+      final client = ApiClient(
+        config: config,
+        httpClientAdapter: adapter,
+        tokenProvider: () async => 'test-token',
+      );
+      final repo = ApiBookingRepository(apiClient: client);
+
+      final result = await repo.cancelBooking(
+        bookingId: 'book-uuid-123',
+        reason: 'Emergency cancellation',
+        idempotencyKey: 'idemp-key-999',
+      );
+
+      expect(result.bookingId, 'book-uuid-123');
+      expect(result.status, 'CANCELLED');
+      expect(result.cancellationFeeAssessedPaise, 3000);
+      expect(result.feeInRupees, 30.0);
+      expect(result.cancellationFeeStatus, 'OUTSTANDING');
+    });
+
+    test('cancelBooking with null or empty reason sends empty map', () async {
+      late _FakeAdapter adapter;
+      adapter = _FakeAdapter((options) async {
+        expect(options.data, isEmpty);
+        return _jsonResponse({
+          'success': true,
+          'data': {
+            'bookingId': 'book-uuid-123',
+            'status': 'CANCELLED',
+            'cancellationFeeAssessedPaise': 0,
+            'cancellationFeeStatus': 'NONE',
+          },
+        });
+      });
+
+      final client = ApiClient(
+        config: config,
+        httpClientAdapter: adapter,
+        tokenProvider: () async => 'test-token',
+      );
+      final repo = ApiBookingRepository(apiClient: client);
+
+      final result = await repo.cancelBooking(
+        bookingId: 'book-uuid-123',
+        reason: '   ',
+        idempotencyKey: 'idemp-key-none',
+      );
+
+      expect(result.cancellationFeeAssessedPaise, 0);
+      expect(result.cancellationFeeStatus, 'NONE');
+    });
+
+    test('getOutstandingCancellationFees retrieves passenger outstanding fees with auth', () async {
+      late _FakeAdapter adapter;
+      adapter = _FakeAdapter((options) async {
+        expect(options.method, 'GET');
+        expect(options.path, '/passengers/cancellation-fees/outstanding');
+        expect(options.headers['Authorization'], 'Bearer test-token');
+        return _jsonResponse({
+          'success': true,
+          'data': {
+            'totalOutstandingPaise': 3000,
+            'fees': [
+              {
+                'id': 'fee-1',
+                'originalBookingId': 'book-old-1',
+                'amountPaise': 3000,
+                'createdAt': '2026-11-20T10:00:00.000Z',
+              },
+            ],
+          },
+        });
+      });
+
+      final client = ApiClient(
+        config: config,
+        httpClientAdapter: adapter,
+        tokenProvider: () async => 'test-token',
+      );
+      final repo = ApiBookingRepository(apiClient: client);
+
+      final response = await repo.getOutstandingCancellationFees();
+      expect(response.totalOutstandingPaise, 3000);
+      expect(response.totalOutstandingInRupees, 30.0);
+      expect(response.fees.length, 1);
+      expect(response.fees.first.id, 'fee-1');
+    });
+
+    test('cancelBooking throws ApiException with INVALID_RESPONSE on malformed fee response', () async {
+      late _FakeAdapter adapter;
+      adapter = _FakeAdapter((options) async {
+        return _jsonResponse({
+          'success': true,
+          'data': {
+            'bookingId': 'book-uuid-123',
+            'status': 'CANCELLED',
+            // Missing cancellationFeeAssessedPaise
+            'cancellationFeeStatus': 'OUTSTANDING',
+          },
+        });
+      });
+
+      final client = ApiClient(config: config, httpClientAdapter: adapter);
+      final repo = ApiBookingRepository(apiClient: client);
+
+      expect(
+        () => repo.cancelBooking(
+          bookingId: 'book-uuid-123',
+          idempotencyKey: 'idemp-key-1',
+        ),
+        throwsA(
+          isA<ApiException>()
+              .having((e) => e.errorCode, 'errorCode', 'INVALID_RESPONSE'),
+        ),
+      );
+    });
+
+    test('cancelBooking throws ApiException with INVALID_RESPONSE when response bookingId does not match requested bookingId', () async {
+      late _FakeAdapter adapter;
+      adapter = _FakeAdapter((options) async {
+        return _jsonResponse({
+          'success': true,
+          'data': {
+            'bookingId': 'book-DIFFERENT-id',
+            'status': 'CANCELLED',
+            'cancellationFeeAssessedPaise': 3000,
+            'cancellationFeeStatus': 'OUTSTANDING',
+          },
+        });
+      });
+
+      final client = ApiClient(config: config, httpClientAdapter: adapter);
+      final repo = ApiBookingRepository(apiClient: client);
+
+      expect(
+        () => repo.cancelBooking(
+          bookingId: 'book-uuid-123',
+          idempotencyKey: 'idemp-key-1',
+        ),
+        throwsA(
+          isA<ApiException>()
+              .having((e) => e.errorCode, 'errorCode', 'INVALID_RESPONSE')
+              .having((e) => e.message, 'message', contains('does not match requested booking ID')),
+        ),
+      );
+    });
+
+    test('cancelBooking throws ApiException with INVALID_RESPONSE when response status is not CANCELLED', () async {
+      late _FakeAdapter adapter;
+      adapter = _FakeAdapter((options) async {
+        return _jsonResponse({
+          'success': true,
+          'data': {
+            'bookingId': 'book-uuid-123',
+            'status': 'CONFIRMED',
+            'cancellationFeeAssessedPaise': 0,
+            'cancellationFeeStatus': 'NONE',
+          },
+        });
+      });
+
+      final client = ApiClient(config: config, httpClientAdapter: adapter);
+      final repo = ApiBookingRepository(apiClient: client);
+
+      expect(
+        () => repo.cancelBooking(
+          bookingId: 'book-uuid-123',
+          idempotencyKey: 'idemp-key-1',
+        ),
+        throwsA(
+          isA<ApiException>()
+              .having((e) => e.errorCode, 'errorCode', 'INVALID_RESPONSE'),
+        ),
+      );
+    });
+
+    test('getOutstandingCancellationFees throws ApiException on malformed fee item date', () async {
+      late _FakeAdapter adapter;
+      adapter = _FakeAdapter((options) async {
+        return _jsonResponse({
+          'success': true,
+          'data': {
+            'totalOutstandingPaise': 3000,
+            'fees': [
+              {
+                'id': 'fee-1',
+                'originalBookingId': 'book-old-1',
+                'amountPaise': 3000,
+                'createdAt': 'not-a-valid-date',
+              },
+            ],
+          },
+        });
+      });
+
+      final client = ApiClient(config: config, httpClientAdapter: adapter);
+      final repo = ApiBookingRepository(apiClient: client);
+
+      expect(
+        () => repo.getOutstandingCancellationFees(),
+        throwsA(
+          isA<ApiException>()
+              .having((e) => e.errorCode, 'errorCode', 'INVALID_RESPONSE'),
+        ),
+      );
+    });
+
+    test('getBookingDetails throws ApiException with INVALID_RESPONSE on missing required createdAt or maxWaitDeadline', () async {
+      late _FakeAdapter adapter;
+      adapter = _FakeAdapter((options) async {
+        return _jsonResponse({
+          'success': true,
+          'data': {
+            'bookingId': 'book-uuid-123',
+            'status': 'CONFIRMED',
+            'agreedFareCeilingPaise': 4500,
+            // Missing maxWaitDeadline and createdAt
+          },
+        });
+      });
+
+      final client = ApiClient(config: config, httpClientAdapter: adapter);
+      final repo = ApiBookingRepository(apiClient: client);
+
+      expect(
+        () => repo.getBookingDetails('book-uuid-123'),
+        throwsA(
+          isA<ApiException>()
+              .having((e) => e.errorCode, 'errorCode', 'INVALID_RESPONSE'),
+        ),
+      );
+    });
   });
 }

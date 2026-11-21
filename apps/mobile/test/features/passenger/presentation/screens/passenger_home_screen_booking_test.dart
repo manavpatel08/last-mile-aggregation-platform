@@ -12,8 +12,11 @@ import 'package:lastmile_mobile/core/theme/app_theme.dart';
 import 'package:lastmile_mobile/features/auth/models/auth_user.dart';
 import 'package:lastmile_mobile/features/auth/state/auth_provider.dart';
 import 'package:lastmile_mobile/features/booking/data/booking_repository.dart';
+import 'package:lastmile_mobile/features/booking/models/booking_cancellation_response.dart';
+import 'package:lastmile_mobile/features/booking/models/booking_details.dart';
 import 'package:lastmile_mobile/features/booking/models/booking_request.dart';
 import 'package:lastmile_mobile/features/booking/models/booking_response.dart';
+import 'package:lastmile_mobile/features/booking/models/cancellation_fee.dart';
 import 'package:lastmile_mobile/features/booking/models/fare_quote.dart';
 import 'package:lastmile_mobile/features/booking/models/location_validation.dart';
 import 'package:lastmile_mobile/features/booking/models/pickup_point.dart';
@@ -64,6 +67,26 @@ class _FakeBookingRepository implements BookingRepository {
     required double longitude,
   }) =>
       throw UnimplementedError();
+
+  @override
+  Future<BookingDetails> getBookingDetails(String bookingId) =>
+      throw UnimplementedError();
+
+  @override
+  Future<BookingCancellationResponse> cancelBooking({
+    required String bookingId,
+    String? reason,
+    required String idempotencyKey,
+  }) =>
+      throw UnimplementedError();
+
+  @override
+  Future<OutstandingCancellationFeesResponse>
+      getOutstandingCancellationFees() async =>
+          const OutstandingCancellationFeesResponse(
+            totalOutstandingPaise: 0,
+            fees: [],
+          );
 }
 
 void main() {

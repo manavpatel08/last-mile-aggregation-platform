@@ -10,11 +10,13 @@ class ActiveBookingCard extends StatelessWidget {
     required this.booking,
     this.onRefresh,
     this.isRefreshing = false,
+    this.onViewDetails,
   });
 
   final BookingResponse booking;
   final VoidCallback? onRefresh;
   final bool isRefreshing;
+  final VoidCallback? onViewDetails;
 
   Color _statusColor(String status) {
     switch (status) {
@@ -196,6 +198,21 @@ class ActiveBookingCard extends StatelessWidget {
                 ],
               ),
             ),
+            if (onViewDetails != null) ...[
+              const SizedBox(height: 12),
+              OutlinedButton.icon(
+                key: const Key('active_booking_details_button'),
+                onPressed: onViewDetails,
+                icon: const Icon(Icons.info_outline, size: 16),
+                label: const Text('View Booking Details'),
+                style: OutlinedButton.styleFrom(
+                  visualDensity: VisualDensity.compact,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                ),
+              ),
+            ],
           ],
         ),
       ),

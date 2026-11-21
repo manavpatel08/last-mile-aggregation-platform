@@ -7,6 +7,7 @@ abstract final class AppRoutes {
   static const String roleSelection = '/role-selection';
   static const String passengerHome = '/passenger';
   static const String passengerBooking = '/passenger/book';
+  static const String passengerBookingDetails = '/passenger/bookings/:id';
   static const String driverHome = '/driver';
   static const String driverOnboarding = '/driver/onboard';
   static const String adminInfo = '/admin-info';
@@ -16,9 +17,13 @@ abstract final class AppRoutes {
   static const String roleSelectionName = 'role-selection';
   static const String passengerHomeName = 'passenger-home';
   static const String passengerBookingName = 'passenger-booking';
+  static const String passengerBookingDetailsName = 'passenger-booking-details';
   static const String driverHomeName = 'driver-home';
   static const String driverOnboardingName = 'driver-onboarding';
   static const String adminInfoName = 'admin-info';
+
+  static String passengerBookingDetailsPath(String id) =>
+      '/passenger/bookings/$id';
 
   static String initialLocationForMode(AppMode mode) {
     switch (mode) {

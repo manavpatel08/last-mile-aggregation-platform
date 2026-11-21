@@ -4,8 +4,11 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:lastmile_mobile/core/network/api_exception.dart';
 import 'package:lastmile_mobile/features/booking/data/booking_repository.dart';
+import 'package:lastmile_mobile/features/booking/models/booking_cancellation_response.dart';
+import 'package:lastmile_mobile/features/booking/models/booking_details.dart';
 import 'package:lastmile_mobile/features/booking/models/booking_request.dart';
 import 'package:lastmile_mobile/features/booking/models/booking_response.dart';
+import 'package:lastmile_mobile/features/booking/models/cancellation_fee.dart';
 import 'package:lastmile_mobile/features/booking/models/fare_quote.dart';
 import 'package:lastmile_mobile/features/booking/models/location_validation.dart';
 import 'package:lastmile_mobile/features/booking/models/pickup_point.dart';
@@ -146,6 +149,32 @@ class _MockBookingRepository implements BookingRepository {
     if (activeBookingErrorToThrow != null) throw activeBookingErrorToThrow!;
     if (errorToThrow != null) throw errorToThrow!;
     return mockActiveBooking;
+  }
+
+  @override
+  Future<BookingDetails> getBookingDetails(String bookingId) async {
+    if (errorToThrow != null) throw errorToThrow!;
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<BookingCancellationResponse> cancelBooking({
+    required String bookingId,
+    String? reason,
+    required String idempotencyKey,
+  }) async {
+    if (errorToThrow != null) throw errorToThrow!;
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<OutstandingCancellationFeesResponse>
+      getOutstandingCancellationFees() async {
+    if (errorToThrow != null) throw errorToThrow!;
+    return const OutstandingCancellationFeesResponse(
+      totalOutstandingPaise: 0,
+      fees: [],
+    );
   }
 }
 

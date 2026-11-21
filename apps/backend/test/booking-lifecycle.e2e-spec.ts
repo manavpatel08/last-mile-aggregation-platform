@@ -807,6 +807,12 @@ describe('Booking & Ride Lifecycle End-to-End Suite (e2e)', () => {
     });
 
     it('should allow driver to confirm arrival at pickup hub (POST /api/v1/trips/:id/arrive-pickup)', async () => {
+      await request(app.getHttpServer())
+        .post('/api/v1/drivers/location')
+        .set('Authorization', `Bearer ${driverToken}`)
+        .send({ latitude: 23.155, longitude: 72.6668 })
+        .expect(200);
+
       const arriveKey = crypto.randomUUID();
       const res = await request(app.getHttpServer())
         .post(`/api/v1/trips/${fullTripId}/arrive-pickup`)
@@ -932,7 +938,7 @@ describe('Booking & Ride Lifecycle End-to-End Suite (e2e)', () => {
       expect(res.body.errorCode).toBe('MISSING_IDEMPOTENCY_KEY');
     });
 
-    it('should complete individual passenger drop-off and surcharge outstanding ₹30 late fee', async () => {
+    it('should complete individual passenger drop-off with allocated fare, keeping outstanding cancellation fee uncollected in Stage 7', async () => {
       const completeKey = crypto.randomUUID();
       const res = await request(app.getHttpServer())
         .post(`/api/v1/trips/${fullTripId}/passengers/${passengerUserId}/complete`)
@@ -944,10 +950,8 @@ describe('Booking & Ride Lifecycle End-to-End Suite (e2e)', () => {
       expect(res.body.data.passengerId).toBe(passengerUserId);
       expect(res.body.data.rideFarePaise).toBe(3800); // ₹38.00 allocated ride fare
       expect(res.body.data.waitingChargePaise).toBe(0);
-      // Outstanding late fee from earlier post-assignment cancellation
-      expect(res.body.data.outstandingLateFeeSurchargePaise).toBe(3000); // ₹30.00
-      expect(res.body.data.totalCashToCollectPaise).toBe(6800); // ₹38 + ₹30 = ₹68.00!
-      expect(res.body.data.totalCashToCollect).toBe('68.00');
+      expect(res.body.data.totalCashToCollectPaise).toBe(3800);
+      expect(res.body.data.totalCashToCollect).toBe('38.00');
 
       // Verify idempotent replay
       const replayRes = await request(app.getHttpServer())
@@ -955,7 +959,7 @@ describe('Booking & Ride Lifecycle End-to-End Suite (e2e)', () => {
         .set('Authorization', `Bearer ${driverToken}`)
         .set('Idempotency-Key', completeKey)
         .expect(200);
-      expect(replayRes.body.data.totalCashToCollectPaise).toBe(6800);
+      expect(replayRes.body.data.totalCashToCollectPaise).toBe(3800);
 
       // Verify booking status is now COMPLETED
       const bRes = await request(app.getHttpServer())
@@ -963,6 +967,16 @@ describe('Booking & Ride Lifecycle End-to-End Suite (e2e)', () => {
         .set('Authorization', `Bearer ${passengerToken}`)
         .expect(200);
       expect(bRes.body.data.status).toBe('COMPLETED');
+
+      // Verify cancellation fee remains OUTSTANDING in Stage 7 (settlement deferred to Stage 8)
+      const outstandingFees = await prisma.cancellationFee.findMany({
+        where: { passengerId: passengerUserId },
+      });
+      for (const fee of outstandingFees) {
+        expect(fee.status).toBe('OUTSTANDING');
+        expect(fee.collectedBookingId).toBeNull();
+        expect(fee.collectedAt).toBeNull();
+      }
     });
 
     it('should reject trip completion if Idempotency-Key is missing', async () => {
@@ -1051,6 +1065,13 @@ describe('Booking & Ride Lifecycle End-to-End Suite (e2e)', () => {
         ],
       });
       createdTripIds.push(trip.id);
+
+      // Driver reports location at PDEU pickup hub
+      await request(app.getHttpServer())
+        .post('/api/v1/drivers/location')
+        .set('Authorization', `Bearer ${driverToken}`)
+        .send({ latitude: 23.155, longitude: 72.6668 })
+        .expect(200);
 
       // Driver arrives just NOW (0 seconds elapsed)
       await request(app.getHttpServer())
@@ -1649,7 +1670,13 @@ describe('Booking & Ride Lifecycle End-to-End Suite (e2e)', () => {
       });
       createdTripIds.push(trip.id);
 
-      // 5. Driver arrives at pickup
+      // 5. Driver reports location and arrives at pickup
+      await request(app.getHttpServer())
+        .post('/api/v1/drivers/location')
+        .set('Authorization', `Bearer ${dMulti.token}`)
+        .send({ latitude: 23.155, longitude: 72.6668 })
+        .expect(200);
+
       await request(app.getHttpServer())
         .post(`/api/v1/trips/${trip.id}/arrive-pickup`)
         .set('Authorization', `Bearer ${dMulti.token}`)
@@ -1674,7 +1701,7 @@ describe('Booking & Ride Lifecycle End-to-End Suite (e2e)', () => {
         .set('Idempotency-Key', crypto.randomUUID())
         .expect(200);
 
-      // 8. Driver completes passenger drop-off -> both fees must be collected!
+      // 8. Driver completes passenger drop-off -> fees remain OUTSTANDING in Stage 7
       const compRes = await request(app.getHttpServer())
         .post(`/api/v1/trips/${trip.id}/passengers/${pMulti.userId}/complete`)
         .set('Authorization', `Bearer ${dMulti.token}`)
@@ -1683,23 +1710,22 @@ describe('Booking & Ride Lifecycle End-to-End Suite (e2e)', () => {
 
       expect(compRes.body.success).toBe(true);
       expect(compRes.body.data.rideFarePaise).toBe(2500);
-      // Both fees (3000 + 3000) collected!
-      expect(compRes.body.data.outstandingLateFeeSurchargePaise).toBe(6000);
-      expect(compRes.body.data.totalCashToCollectPaise).toBe(8500); // 2500 + 6000
-      expect(compRes.body.data.totalCashToCollect).toBe('85.00');
+      expect(compRes.body.data.waitingChargePaise).toBe(0);
+      expect(compRes.body.data.totalCashToCollectPaise).toBe(2500);
+      expect(compRes.body.data.totalCashToCollect).toBe('25.00');
 
-      // 9. Verify database status of the cancellation fees
+      // 9. Verify database status of the cancellation fees: remain OUTSTANDING in Stage 7
       const updatedFees = await prisma.cancellationFee.findMany({
         where: { id: { in: [fee1.id, fee2.id] } },
       });
       expect(updatedFees.length).toBe(2);
       for (const fee of updatedFees) {
-        expect(fee.status).toBe('COLLECTED');
-        expect(fee.collectedBookingId).toBe(newBookingId);
-        expect(fee.collectedAt).not.toBeNull();
+        expect(fee.status).toBe('OUTSTANDING');
+        expect(fee.collectedBookingId).toBeNull();
+        expect(fee.collectedAt).toBeNull();
       }
 
-      // 10. Verify OutboxEvent recorded the collected fee IDs and surcharge
+      // 10. Verify OutboxEvent recorded the completion
       const outboxEvents = await prisma.outboxEvent.findMany({
         where: {
           eventType: 'PASSENGER_DROPPED_OFF',
@@ -1711,8 +1737,8 @@ describe('Booking & Ride Lifecycle End-to-End Suite (e2e)', () => {
       );
       expect(outboxEvent).toBeDefined();
       const payload = outboxEvent!.payload as any;
-      expect(payload.outstandingLateFeeSurchargePaise).toBe(6000);
-      expect(payload.collectedFeeIds).toEqual(expect.arrayContaining([fee1.id, fee2.id]));
+      expect(payload.rideFarePaise).toBe(2500);
+      expect(payload.totalCashToCollectPaise).toBe(2500);
 
       // 11. Complete vehicle trip to free the driver
       await request(app.getHttpServer())
@@ -1765,6 +1791,12 @@ describe('Booking & Ride Lifecycle End-to-End Suite (e2e)', () => {
       createdTripIds.push(trip2.id);
 
       await request(app.getHttpServer())
+        .post('/api/v1/drivers/location')
+        .set('Authorization', `Bearer ${dMulti.token}`)
+        .send({ latitude: 23.155, longitude: 72.6668 })
+        .expect(200);
+
+      await request(app.getHttpServer())
         .post(`/api/v1/trips/${trip2.id}/arrive-pickup`)
         .set('Authorization', `Bearer ${dMulti.token}`)
         .set('Idempotency-Key', crypto.randomUUID())
@@ -1790,7 +1822,7 @@ describe('Booking & Ride Lifecycle End-to-End Suite (e2e)', () => {
         .expect(200);
 
       expect(comp2Res.body.success).toBe(true);
-      expect(comp2Res.body.data.outstandingLateFeeSurchargePaise).toBe(0);
+      expect(comp2Res.body.data.rideFarePaise).toBe(2500);
       expect(comp2Res.body.data.totalCashToCollectPaise).toBe(2500);
 
       await request(app.getHttpServer())
@@ -2055,6 +2087,13 @@ describe('Booking & Ride Lifecycle End-to-End Suite (e2e)', () => {
       });
       createdTripIds.push(trip.id);
 
+      // Driver reports GPS location at PDEU pickup point
+      await request(app.getHttpServer())
+        .post('/api/v1/drivers/location')
+        .set('Authorization', `Bearer ${dOtp.token}`)
+        .send({ latitude: 23.155, longitude: 72.6668 })
+        .expect(200);
+
       // Driver arrives at pickup hub -> status becomes AT_PICKUP
       await request(app.getHttpServer())
         .post(`/api/v1/trips/${trip.id}/arrive-pickup`)
@@ -2223,6 +2262,13 @@ describe('Booking & Ride Lifecycle End-to-End Suite (e2e)', () => {
         ],
       });
       createdTripIds.push(trip.id);
+
+      // Driver reports GPS location at PDEU pickup point
+      await request(app.getHttpServer())
+        .post('/api/v1/drivers/location')
+        .set('Authorization', `Bearer ${dConc.token}`)
+        .send({ latitude: 23.155, longitude: 72.6668 })
+        .expect(200);
 
       // Driver arrives at pickup
       await request(app.getHttpServer())

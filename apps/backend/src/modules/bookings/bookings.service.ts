@@ -4,19 +4,41 @@ import {
   BadRequestException,
   ConflictException,
   ForbiddenException,
+  InternalServerErrorException,
   HttpStatus,
   Logger,
+  Optional,
 } from '@nestjs/common';
 import { PrismaService } from '../../infrastructure/prisma/prisma.service.js';
+import { RedisService } from '../../infrastructure/redis/redis.service.js';
 import { LocationsService } from '../locations/locations.service.js';
 import { CreateBookingDto } from './dto/create-booking.dto.js';
 import { CancelBookingDto } from './dto/cancel-booking.dto.js';
 import { CANONICAL_ACTIVE_BOOKING_STATUSES } from './bookings.constants.js';
+import { deriveBoardingOtp, hashBoardingOtp } from '../../common/utils/otp.util.js';
 import {
   IdempotencyClaimContext,
   verifyIdempotencyClaim,
   fenceAndCompleteIdempotentTransaction,
 } from '../../common/interceptors/idempotency.interceptor.js';
+
+export interface BoardingPassResponse {
+  bookingId: string;
+  passengerId: string;
+  tripId: string;
+  boardingOtp: string;
+  expiresAt: string;
+  bookingStatus: string;
+  driver: {
+    name: string;
+    phoneNumber?: string;
+    vehicle: {
+      registrationNumber: string;
+      makeModel: string;
+      vehicleType: string;
+    } | null;
+  };
+}
 
 export interface BookingResponse {
   bookingId: string;
@@ -49,6 +71,7 @@ export class BookingsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly locationsService: LocationsService,
+    @Optional() private readonly redisService?: RedisService,
   ) {}
 
   /**
@@ -761,6 +784,232 @@ export class BookingsService {
         amountPaise: f.amountPaise,
         createdAt: f.createdAt.toISOString(),
       })),
+    };
+  }
+
+  /**
+   * Retrieve secure passenger boarding pass and 4-digit OTP.
+   * Gated strictly to the authenticated owner passenger of an assigned booking.
+   * Employs fast Redis ephemeral cache with deterministic HMAC-SHA256 fallback recovery.
+   */
+  async getBoardingPass(
+    user: { id: string; role: string; roles?: string[] },
+    bookingId: string,
+  ): Promise<BoardingPassResponse> {
+    // 1. RBAC & ownership check
+    const userRoles = Array.isArray(user.roles) ? [...user.roles] : [];
+    if (user.role && !userRoles.includes(user.role)) {
+      userRoles.push(user.role);
+    }
+    if (!userRoles.includes('PASSENGER')) {
+      throw new ForbiddenException({
+        errorCode: 'FORBIDDEN',
+        message: 'Only passengers can access their boarding pass.',
+      });
+    }
+
+    const booking = await this.prisma.booking.findUnique({
+      where: { id: bookingId },
+    });
+
+    if (!booking) {
+      throw new NotFoundException({
+        errorCode: 'BOOKING_NOT_FOUND',
+        message: `Booking with ID ${bookingId} not found.`,
+      });
+    }
+
+    if (booking.passengerId !== user.id) {
+      throw new ForbiddenException({
+        errorCode: 'FORBIDDEN',
+        message: 'Passengers can only access their own boarding pass.',
+      });
+    }
+
+    // 2. Booking status lifecycle gating
+    const unassignedStatuses = [
+      'REQUESTED',
+      'MATCHING',
+      'MATCHED',
+      'DISPATCHING',
+      'CONFIRMED',
+    ];
+    if (unassignedStatuses.includes(booking.status)) {
+      throw new BadRequestException({
+        errorCode: 'BOOKING_NOT_ASSIGNED',
+        message: 'Booking has not been assigned to a driver yet.',
+      });
+    }
+
+    const consumedStatuses = ['BOARDED', 'IN_PROGRESS', 'COMPLETED'];
+    if (consumedStatuses.includes(booking.status)) {
+      throw new BadRequestException({
+        errorCode: 'OTP_ALREADY_CONSUMED',
+        message: 'Boarding OTP has already been used or trip is completed.',
+      });
+    }
+
+    const inactiveStatuses = ['CANCELLED', 'EXPIRED', 'NO_SHOW'];
+    if (inactiveStatuses.includes(booking.status)) {
+      throw new BadRequestException({
+        errorCode: 'BOOKING_NOT_ACTIVE',
+        message: `Booking is not active (current status: ${booking.status}).`,
+      });
+    }
+
+    if (
+      booking.status !== 'DRIVER_ASSIGNED' &&
+      booking.status !== 'DRIVER_ARRIVED'
+    ) {
+      throw new BadRequestException({
+        errorCode: 'INVALID_BOOKING_STATUS',
+        message: `Boarding pass is not available in status ${booking.status}.`,
+      });
+    }
+
+    // 3. Locate TripPassenger and BoardingVerification
+    const tripPassenger = await this.prisma.tripPassenger.findFirst({
+      where: { bookingId: booking.id },
+      orderBy: { createdAt: 'desc' },
+      include: {
+        trip: {
+          include: {
+            activeDriver: {
+              include: {
+                user: {
+                  select: {
+                    fullName: true,
+                    phoneNumber: true,
+                  },
+                },
+                vehicles: {
+                  where: { isActive: true },
+                  take: 1,
+                },
+              },
+            },
+            driverAssignment: true,
+          },
+        },
+        boardingVerification: true,
+      },
+    });
+
+    if (!tripPassenger || !tripPassenger.boardingVerification) {
+      throw new NotFoundException({
+        errorCode: 'BOARDING_PASS_NOT_FOUND',
+        message: 'Boarding verification details not found for this booking.',
+      });
+    }
+
+    const verification = tripPassenger.boardingVerification;
+    const expiresAt = new Date(verification.expiresAt);
+
+    // 4. Verification state checks
+    if (verification.isVerified) {
+      throw new BadRequestException({
+        errorCode: 'OTP_ALREADY_VERIFIED',
+        message: 'Boarding OTP has already been verified.',
+      });
+    }
+
+    if (verification.attemptsCount >= verification.maxAttempts) {
+      throw new BadRequestException({
+        errorCode: 'OTP_MAX_ATTEMPTS_EXCEEDED',
+        message: 'Maximum boarding verification attempts exceeded.',
+      });
+    }
+
+    if (expiresAt.getTime() <= Date.now()) {
+      throw new BadRequestException({
+        errorCode: 'OTP_EXPIRED',
+        message: 'Boarding OTP has expired.',
+      });
+    }
+
+    // 5. OTP Retrieval & Ephemeral Recovery Logic
+    const assignmentId =
+      tripPassenger.trip?.driverAssignmentId ??
+      tripPassenger.trip?.driverAssignment?.id;
+
+    let otp: string | null = null;
+    if (this.redisService) {
+      try {
+        otp = await this.redisService.getPassengerBoardingOtp(booking.id);
+      } catch (err) {
+        this.logger.warn(
+          `Redis getPassengerBoardingOtp error for booking ${booking.id}: ${(err as Error).message}`,
+        );
+      }
+    }
+
+    // Fallback derivation if Redis missed, was flushed, or returned mismatched hash
+    if (!otp || hashBoardingOtp(otp) !== verification.otpHash) {
+      if (!assignmentId) {
+        throw new InternalServerErrorException({
+          errorCode: 'BOARDING_PASS_GENERATION_FAILED',
+          message: 'Unable to derive boarding pass due to missing assignment data.',
+        });
+      }
+
+      otp = deriveBoardingOtp(booking.id, assignmentId);
+
+      if (hashBoardingOtp(otp) !== verification.otpHash) {
+        this.logger.error(
+          `Cryptographic integrity failure: derived OTP hash does not match stored hash for booking ${booking.id}`,
+        );
+        throw new InternalServerErrorException({
+          errorCode: 'BOARDING_PASS_INTEGRITY_ERROR',
+          message: 'Boarding pass verification hash mismatch.',
+        });
+      }
+
+      // Repopulate Redis cache safely (outside any DB transaction)
+      if (this.redisService) {
+        const remainingSeconds = Math.max(
+          0,
+          Math.floor((expiresAt.getTime() - Date.now()) / 1000),
+        );
+        const ttlSeconds = Math.min(1800, remainingSeconds);
+        if (ttlSeconds > 0) {
+          try {
+            await this.redisService.setPassengerBoardingOtp(
+              booking.id,
+              otp,
+              ttlSeconds,
+            );
+          } catch (err) {
+            this.logger.warn(
+              `Redis setPassengerBoardingOtp fallback recovery failed: ${(err as Error).message}`,
+            );
+          }
+        }
+      }
+    }
+
+    // 6. Format response envelope
+    const activeDriver = tripPassenger.trip?.activeDriver;
+    const driverUser = activeDriver?.user;
+    const vehicle = activeDriver?.vehicles?.[0];
+
+    return {
+      bookingId: booking.id,
+      passengerId: booking.passengerId,
+      tripId: tripPassenger.tripId,
+      boardingOtp: otp,
+      expiresAt: expiresAt.toISOString(),
+      bookingStatus: booking.status,
+      driver: {
+        name: driverUser?.fullName ?? 'Assigned Driver',
+        phoneNumber: driverUser?.phoneNumber ?? undefined,
+        vehicle: vehicle
+          ? {
+              registrationNumber: vehicle.registrationNumber,
+              makeModel: vehicle.makeModel,
+              vehicleType: vehicle.vehicleType,
+            }
+          : null,
+      },
     };
   }
 }

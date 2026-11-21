@@ -63,6 +63,22 @@ export class BookingsController {
     };
   }
 
+  @Roles('PASSENGER')
+  @Get('bookings/:id/boarding-pass')
+  async getBoardingPass(
+    @CurrentUser() user: { id: string; role: string },
+    @Param('id', new ParseUUIDPipe()) bookingId: string,
+  ) {
+    const boardingPass = await this.bookingsService.getBoardingPass(
+      user,
+      bookingId,
+    );
+    return {
+      success: true,
+      data: boardingPass,
+    };
+  }
+
   @Idempotent()
   @Post('bookings/:id/cancel')
   @HttpCode(HttpStatus.OK)

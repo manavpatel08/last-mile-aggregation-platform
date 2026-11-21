@@ -63,6 +63,10 @@ Idempotency-Key: <unique-uuid-or-client-nonce>
 | `BOOKING_ALREADY_ACTIVE` | 409 | Passenger already possesses an active booking (`REQUESTED`, `MATCHING`, `DISPATCHING`, `CONFIRMED`, `IN_PROGRESS`). |
 | `QUOTE_EXPIRED` | 400 | Fare quote exceeds its 2-minute validity window. |
 | `PICKUP_OUTSIDE_GEOFENCE` | 400 | Pickup coordinate is $> 150\text{m}$ from the PDEU zone center. |
+| `OUTSIDE_PICKUP_GEOFENCE` | 400 | Driver location exceeds authorized 150m geofence limit of PDEU pickup hub. |
+| `MISSING_GPS_FIX` | 400 | No recorded telemetry fix found for driver in Redis cache. |
+| `STALE_GPS_FIX` | 400 | Driver GPS fix exceeds 30-second freshness window. |
+| `INVALID_GPS_FIX` | 400 | Driver GPS fix contains missing or out-of-bounds coordinates. |
 | `DESTINATION_OUTSIDE_SERVICE_AREA`| 400 | Destination coordinate lies outside the Gandhinagar service polygon. |
 | `FARE_CEILING_EXCEEDED` | 422 | Calculated shared fare exceeds the passenger's agreed fare ceiling. |
 | `OFFER_EXPIRED` | 410 | Driver dispatch offer exceeded its 20-second timeout window. |
@@ -301,6 +305,45 @@ Idempotency-Key: <unique-uuid-or-client-nonce>
   - *If before driver assignment:* Status $\rightarrow$ `CANCELLED`. Fee assessed = ₹0. Group recalculated.
   - *If after driver assignment:* Status $\rightarrow$ `CANCELLED`. Late fee assessed = ₹30 (inserted into `cancellation_fees`). Driver notified.
 
+#### 8.4 Get Passenger Boarding Pass
+- **Method & Path:** `GET /api/v1/bookings/:id/boarding-pass`
+- **Auth:** Bearer Token (`PASSENGER`, must match booking owner `passenger_id`)
+- **Headers:** `Authorization: Bearer <jwt>`
+- **Response (200 OK):**
+  ```json
+  {
+    "success": true,
+    "data": {
+      "bookingId": "booking-uuid",
+      "passengerId": "passenger-uuid",
+      "tripId": "trip-uuid",
+      "boardingOtp": "4821",
+      "expiresAt": "2026-11-21T12:30:00.000Z",
+      "bookingStatus": "DRIVER_ASSIGNED",
+      "driver": {
+        "name": "Ramesh Patel",
+        "phoneNumber": "+919876543210",
+        "vehicle": {
+          "registrationNumber": "GJ01AB1234",
+          "makeModel": "Mahindra Treo",
+          "vehicleType": "E_RICKSHAW"
+        }
+      }
+    }
+  }
+  ```
+- **Lifecycle & Security Invariants:**
+  - Accessible strictly to the authenticated owner passenger (`user.id === booking.passenger_id`). Drivers and unrelated passengers receive `403 FORBIDDEN`.
+  - Accessible only while booking status is `DRIVER_ASSIGNED` or `DRIVER_ARRIVED`.
+  - Returns `400 BOOKING_NOT_ASSIGNED` if booking is in unassigned status (`REQUESTED`, `MATCHING`, `MATCHED`, `DISPATCHING`, `CONFIRMED`).
+  - Returns `400 OTP_ALREADY_CONSUMED` if booking is `BOARDED`, `IN_PROGRESS`, or `COMPLETED`.
+  - Returns `400 BOOKING_NOT_ACTIVE` if booking is `CANCELLED`, `EXPIRED`, or `NO_SHOW`.
+  - Returns `400 OTP_ALREADY_VERIFIED` if `boardingVerification.isVerified = true`.
+  - Returns `400 OTP_EXPIRED` if current time exceeds `expiresAt`.
+  - Returns `400 OTP_MAX_ATTEMPTS_EXCEEDED` if `attemptsCount >= maxAttempts`.
+  - Plaintext OTP is stored exclusively in ephemeral Redis cache with a 30-minute TTL (or remaining expiry); PostgreSQL stores strictly the SHA-256 hash `otp_hash`.
+  - In case of Redis cache miss, eviction, or server restart, the 4-digit OTP is deterministically re-derived using HMAC-SHA256(`bookingId`, `assignmentId`), verified against `otp_hash`, and repopulated into Redis.
+
 ---
 
 ### Area 9: Matching and Group Status
@@ -380,7 +423,30 @@ Idempotency-Key: <unique-uuid-or-client-nonce>
 #### 13.1 Driver Reports Arrival
 - **Method & Path:** `POST /api/v1/trips/:id/arrive-pickup`
 - **Auth:** Bearer Token (Assigned Driver)
-- **State Transition:** Sets trip status `'AT_PICKUP'`, records `driver_arrived_at = NOW()`. Starts individual 5-minute free waiting timer. Emits `trip.driver_arrived`.
+- **Request Body:** None. Frontend-supplied coordinates are strictly forbidden and ignored.
+- **Location Verification:** The platform server exclusively reads the driver's authoritative GPS telemetry from Redis (`driver:gps:<driverId>`). Telemetry must be fresh ($\le 30\text{s}$ old) and coordinates must lie within the PostGIS $150\text{m}$ PDEU pickup hub geofence (`ST_DWithin`).
+- **Response (200 OK):**
+  ```json
+  {
+    "success": true,
+    "message": "Driver arrival confirmed",
+    "data": {
+      "tripId": "uuid",
+      "status": "AT_PICKUP",
+      "driverArrivedAt": "2026-11-21T22:30:00.000Z"
+    }
+  }
+  ```
+- **Error Codes:**
+  - `400 MISSING_GPS_FIX`: No GPS telemetry recorded in Redis cache.
+  - `400 STALE_GPS_FIX`: GPS fix is older than 30 seconds.
+  - `400 INVALID_GPS_FIX`: GPS coordinates corrupted or invalid.
+  - `400 OUTSIDE_PICKUP_GEOFENCE`: Driver is further than 150m from PDEU pickup point.
+  - `400 INVALID_TRIP_STATUS_FOR_ARRIVAL`: Trip is not in `CREATED` or `DRIVER_EN_ROUTE` status.
+  - `403 DRIVER_NOT_ASSIGNED_TO_TRIP`: Authenticated driver is not assigned to this trip.
+  - `404 TRIP_NOT_FOUND`: Trip does not exist.
+- **State Transition:** Sets trip status `'AT_PICKUP'`, records `driver_arrived_at = NOW()`. Starts individual 5-minute free waiting timer. Transitions associated bookings to `'DRIVER_ARRIVED'`. Emits `TRIP_DRIVER_ARRIVED` outbox event.
+- **Idempotency:** Replaying arrival for an already `'AT_PICKUP'` trip returns the original `driver_arrived_at` timestamp without resetting the timer or re-evaluating GPS.
 
 ---
 
@@ -425,12 +491,11 @@ Idempotency-Key: <unique-uuid-or-client-nonce>
       "passengerId": "uuid",
       "rideFare": "38.00",
       "waitingCharge": "0.00",
-      "outstandingLateFeeSurcharge": "30.00",
-      "totalCashToCollect": "68.00"
+      "totalCashToCollect": "38.00"
     }
   }
   ```
-- **State Transition:** Marks `trip_passengers` status `'COMPLETED'`. Computes exact cash to collect including outstanding fee surcharge.
+- **State Transition:** Marks `trip_passengers` status `'COMPLETED'`. Computes allocated ride fare and waiting charges for passenger completion (cancellation fee recovery is processed during Stage 8 cash confirmation).
 
 ---
 

@@ -49,4 +49,23 @@ describe('RedisService (Redis Integration)', () => {
     // Clean up
     await client.del(`driver:gps:${testDriverId}`);
   });
+
+  it('should store, retrieve, and delete ephemeral passenger boarding OTP with TTL', async () => {
+    const testBookingId = `booking-test-${Date.now()}`;
+    const otp = '4821';
+
+    await redisService.setPassengerBoardingOtp(testBookingId, otp, 60);
+
+    const retrieved = await redisService.getPassengerBoardingOtp(testBookingId);
+    expect(retrieved).toBe(otp);
+
+    const client = redisService.getClient();
+    const ttl = await client.ttl(`passenger:otp:${testBookingId}`);
+    expect(ttl).toBeGreaterThan(0);
+    expect(ttl).toBeLessThanOrEqual(60);
+
+    await redisService.deletePassengerBoardingOtp(testBookingId);
+    const afterDelete = await redisService.getPassengerBoardingOtp(testBookingId);
+    expect(afterDelete).toBeNull();
+  });
 });

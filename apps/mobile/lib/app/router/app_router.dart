@@ -1,16 +1,21 @@
 import 'package:material_ui/material_ui.dart';
 import 'package:go_router/go_router.dart';
+import 'package:provider/provider.dart';
 
 import '../../features/auth/presentation/screens/admin_info_screen.dart';
 import '../../features/auth/presentation/screens/login_screen.dart';
 import '../../features/auth/presentation/screens/splash_screen.dart';
 import '../../features/auth/state/auth_provider.dart';
+import '../../features/booking/data/booking_repository.dart';
 import '../../features/booking/presentation/screens/booking_details_screen.dart';
 import '../../features/booking/presentation/screens/booking_flow_screen.dart';
 import '../../features/driver/presentation/screens/driver_home_screen.dart';
 import '../../features/driver/presentation/screens/driver_onboarding_screen.dart';
 import '../../features/passenger/presentation/screens/passenger_home_screen.dart';
 import '../../features/role_selection/presentation/screens/role_selection_screen.dart';
+import '../../features/trip/data/trip_repository.dart';
+import '../../features/trip/presentation/screens/driver_active_trip_screen.dart';
+import '../../features/trip/presentation/screens/passenger_active_trip_screen.dart';
 import '../state/app_mode_provider.dart';
 import '../../core/config/app_config.dart';
 import 'app_routes.dart';
@@ -77,8 +82,10 @@ abstract final class AppRouter {
           return AppRoutes.passengerHome;
         }
 
-        // Driver route guard: non-drivers cannot access driver home
-        if (matchedPath == AppRoutes.driverHome && !user.isDriver) {
+        // Driver route guard: non-drivers cannot access driver home or driver trips
+        if ((matchedPath == AppRoutes.driverHome ||
+                matchedPath.startsWith('/driver/trips')) &&
+            !user.isDriver) {
           return AppRoutes.passengerHome;
         }
 
@@ -134,9 +141,41 @@ abstract final class AppRouter {
           },
         ),
         GoRoute(
+          path: AppRoutes.passengerActiveTrip,
+          name: AppRoutes.passengerActiveTripName,
+          builder: (context, state) {
+            final id = state.pathParameters['id'] ?? '';
+            TripRepository? repo;
+            try {
+              repo = Provider.of<TripRepository>(context, listen: false);
+            } catch (_) {}
+            BookingRepository? bookingRepo;
+            try {
+              bookingRepo = Provider.of<BookingRepository>(context, listen: false);
+            } catch (_) {}
+            return PassengerActiveTripScreen(
+              bookingId: id,
+              repository: repo,
+              bookingRepository: bookingRepo,
+            );
+          },
+        ),
+        GoRoute(
           path: AppRoutes.driverHome,
           name: AppRoutes.driverHomeName,
           builder: (context, state) => const DriverHomeScreen(),
+        ),
+        GoRoute(
+          path: AppRoutes.driverActiveTrip,
+          name: AppRoutes.driverActiveTripName,
+          builder: (context, state) {
+            final id = state.pathParameters['id'] ?? '';
+            TripRepository? repo;
+            try {
+              repo = Provider.of<TripRepository>(context, listen: false);
+            } catch (_) {}
+            return DriverActiveTripScreen(tripId: id, repository: repo);
+          },
         ),
         GoRoute(
           path: AppRoutes.driverOnboarding,

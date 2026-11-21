@@ -249,5 +249,119 @@ void main() {
       expect(response.passengerStatus, 'BOARDED');
       expect(response.waitingChargePaise, 0);
     });
+
+    test('startTrip sends Idempotency-Key and parses response', () async {
+      late _FakeAdapter adapter;
+      adapter = _FakeAdapter((options) async {
+        expect(options.path, '/trips/trip-789/start');
+        expect(options.method, 'POST');
+        expect(options.headers['Idempotency-Key'], 'idem-start-key');
+        return _jsonResponse({
+          'success': true,
+          'message': 'Trip started',
+          'data': {
+            'tripId': 'trip-789',
+            'status': 'IN_PROGRESS',
+            'startedAt': '2026-11-22T10:10:00.000Z',
+          },
+        });
+      });
+
+      final apiClient = ApiClient(
+        config: config,
+        httpClientAdapter: adapter,
+        enableDebugLogging: false,
+      );
+      final repo = ApiTripRepository(apiClient: apiClient);
+
+      final response = await repo.startTrip(
+        tripId: 'trip-789',
+        idempotencyKey: 'idem-start-key',
+      );
+
+      expect(response.tripId, 'trip-789');
+      expect(response.status, 'IN_PROGRESS');
+      expect(response.startedAt, isNotNull);
+    });
+
+    test('completePassengerDropOff sends Idempotency-Key and parses fare breakdown',
+        () async {
+      late _FakeAdapter adapter;
+      adapter = _FakeAdapter((options) async {
+        expect(options.path, '/trips/trip-789/passengers/p-1/complete');
+        expect(options.method, 'POST');
+        expect(options.headers['Idempotency-Key'], 'idem-pass-key');
+        return _jsonResponse({
+          'success': true,
+          'message': 'Passenger drop-off recorded',
+          'data': {
+            'passengerId': 'p-1',
+            'status': 'COMPLETED',
+            'rideFarePaise': 3800,
+            'rideFare': '38.00',
+            'waitingChargePaise': 500,
+            'waitingCharge': '5.00',
+            'totalCashToCollectPaise': 4300,
+            'totalCashToCollect': '43.00',
+          },
+        });
+      });
+
+      final apiClient = ApiClient(
+        config: config,
+        httpClientAdapter: adapter,
+        enableDebugLogging: false,
+      );
+      final repo = ApiTripRepository(apiClient: apiClient);
+
+      final response = await repo.completePassengerDropOff(
+        tripId: 'trip-789',
+        passengerId: 'p-1',
+        idempotencyKey: 'idem-pass-key',
+      );
+
+      expect(response.passengerId, 'p-1');
+      expect(response.status, 'COMPLETED');
+      expect(response.rideFarePaise, 3800);
+      expect(response.rideFare, '38.00');
+      expect(response.waitingChargePaise, 500);
+      expect(response.waitingCharge, '5.00');
+      expect(response.totalCashToCollectPaise, 4300);
+      expect(response.totalCashToCollect, '43.00');
+    });
+
+    test('completeTrip sends Idempotency-Key and parses final completion', () async {
+      late _FakeAdapter adapter;
+      adapter = _FakeAdapter((options) async {
+        expect(options.path, '/trips/trip-789/complete');
+        expect(options.method, 'POST');
+        expect(options.headers['Idempotency-Key'], 'idem-complete-trip-key');
+        return _jsonResponse({
+          'success': true,
+          'message': 'Trip marked as completed',
+          'data': {
+            'tripId': 'trip-789',
+            'status': 'COMPLETED',
+            'completedAt': '2026-11-22T10:30:00.000Z',
+          },
+        });
+      });
+
+      final apiClient = ApiClient(
+        config: config,
+        httpClientAdapter: adapter,
+        enableDebugLogging: false,
+      );
+      final repo = ApiTripRepository(apiClient: apiClient);
+
+      final response = await repo.completeTrip(
+        tripId: 'trip-789',
+        idempotencyKey: 'idem-complete-trip-key',
+      );
+
+      expect(response.tripId, 'trip-789');
+      expect(response.status, 'COMPLETED');
+      expect(response.completedAt, isNotNull);
+    });
   });
 }

@@ -1,5 +1,7 @@
 import 'package:material_ui/material_ui.dart';
+import 'package:go_router/go_router.dart';
 
+import '../../../../app/router/app_routes.dart';
 import '../../../../core/theme/app_colors.dart';
 import '../../models/booking_response.dart';
 
@@ -198,6 +200,30 @@ class ActiveBookingCard extends StatelessWidget {
                 ],
               ),
             ),
+            if (const [
+              'DRIVER_ASSIGNED',
+              'DRIVER_ARRIVED',
+              'BOARDED',
+              'IN_PROGRESS',
+            ].contains(booking.status)) ...[
+              const SizedBox(height: 10),
+              FilledButton.icon(
+                key: const Key('active_booking_view_trip_button'),
+                onPressed: () {
+                  context.push(
+                    AppRoutes.passengerActiveTripPath(booking.bookingId),
+                  );
+                },
+                icon: const Icon(Icons.confirmation_number_outlined, size: 16),
+                label: const Text('View Boarding Pass & Trip'),
+                style: FilledButton.styleFrom(
+                  visualDensity: VisualDensity.compact,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                ),
+              ),
+            ],
             if (onViewDetails != null) ...[
               const SizedBox(height: 12),
               OutlinedButton.icon(

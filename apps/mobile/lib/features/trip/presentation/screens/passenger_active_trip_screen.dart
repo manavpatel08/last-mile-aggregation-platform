@@ -2,6 +2,7 @@ import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 
 import '../../../../core/theme/app_colors.dart';
+import '../../../booking/data/booking_repository.dart';
 import '../../data/trip_repository.dart';
 import '../../state/passenger_active_trip_provider.dart';
 
@@ -12,11 +13,13 @@ class PassengerActiveTripScreen extends StatefulWidget {
     super.key,
     required this.bookingId,
     this.repository,
+    this.bookingRepository,
     this.provider,
   });
 
   final String bookingId;
   final TripRepository? repository;
+  final BookingRepository? bookingRepository;
   final PassengerActiveTripProvider? provider;
 
   @override
@@ -35,15 +38,31 @@ class _PassengerActiveTripScreenState extends State<PassengerActiveTripScreen> {
       _provider = widget.provider!;
       _ownsProvider = false;
     } else {
-      _provider = PassengerActiveTripProvider(repository: widget.repository);
+      _provider = PassengerActiveTripProvider(
+        repository: widget.repository,
+        bookingRepository: widget.bookingRepository,
+      );
       _ownsProvider = true;
     }
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
+        BookingRepository? bookingRepo = widget.bookingRepository;
+        if (bookingRepo == null) {
+          try {
+            bookingRepo = Provider.of<BookingRepository>(context, listen: false);
+          } catch (_) {}
+        }
+        TripRepository? tripRepo = widget.repository;
+        if (tripRepo == null) {
+          try {
+            tripRepo = Provider.of<TripRepository>(context, listen: false);
+          } catch (_) {}
+        }
         _provider.loadBoardingPass(
           widget.bookingId,
-          repository: widget.repository,
+          repository: tripRepo,
+          bookingRepository: bookingRepo,
         );
       }
     });
@@ -79,13 +98,32 @@ class _PassengerActiveTripScreenState extends State<PassengerActiveTripScreen> {
       case 'DRIVER_ARRIVED':
         return 'Driver Arrived at Hub';
       case 'BOARDED':
-        return 'Boarded — Ride Starting';
+        return 'Boarded — Ride Starting Soon';
       case 'IN_PROGRESS':
-        return 'Trip In Progress';
+        return 'Trip In Progress — En Route';
       case 'COMPLETED':
-        return 'Trip Completed';
+        return 'Trip Completed — Arrived';
       default:
         return status;
+    }
+  }
+
+  String _statusSubtitle(String status, bool isDriverArrived) {
+    switch (status) {
+      case 'DRIVER_ASSIGNED':
+        return 'Driver is traveling to PDEU pickup hub.';
+      case 'DRIVER_ARRIVED':
+        return 'Your driver is waiting at the hub.';
+      case 'BOARDED':
+        return 'Boarding confirmed. Waiting for vehicle departure.';
+      case 'IN_PROGRESS':
+        return 'Vehicle is traveling to your Gandhinagar drop-off.';
+      case 'COMPLETED':
+        return 'You have arrived at your drop-off destination.';
+      default:
+        return isDriverArrived
+            ? 'Your driver is waiting at the hub.'
+            : 'Driver is traveling to PDEU pickup hub.';
     }
   }
 
@@ -105,7 +143,22 @@ class _PassengerActiveTripScreenState extends State<PassengerActiveTripScreen> {
                   tooltip: 'Refresh',
                   onPressed: provider.isLoading
                       ? null
-                      : () => provider.refresh(repository: widget.repository),
+                      : () {
+                          BookingRepository? bookingRepo =
+                              widget.bookingRepository;
+                          if (bookingRepo == null) {
+                            try {
+                              bookingRepo = Provider.of<BookingRepository>(
+                                context,
+                                listen: false,
+                              );
+                            } catch (_) {}
+                          }
+                          provider.refresh(
+                            repository: widget.repository,
+                            bookingRepository: bookingRepo,
+                          );
+                        },
                 ),
               ],
             ),
@@ -146,10 +199,23 @@ class _PassengerActiveTripScreenState extends State<PassengerActiveTripScreen> {
                             const SizedBox(height: 24),
                             ElevatedButton.icon(
                               key: const Key('retry_load_boarding_pass_button'),
-                              onPressed: () => provider.loadBoardingPass(
-                                widget.bookingId,
-                                repository: widget.repository,
-                              ),
+                              onPressed: () {
+                                BookingRepository? bookingRepo =
+                                    widget.bookingRepository;
+                                if (bookingRepo == null) {
+                                  try {
+                                    bookingRepo = Provider.of<BookingRepository>(
+                                      context,
+                                      listen: false,
+                                    );
+                                  } catch (_) {}
+                                }
+                                provider.loadBoardingPass(
+                                  widget.bookingId,
+                                  repository: widget.repository,
+                                  bookingRepository: bookingRepo,
+                                );
+                              },
                               icon: const Icon(Icons.refresh),
                               label: const Text('Retry'),
                             ),
@@ -208,9 +274,10 @@ class _PassengerActiveTripScreenState extends State<PassengerActiveTripScreen> {
                                   ),
                                   const SizedBox(height: 2),
                                   Text(
-                                    pass.isDriverArrived
-                                        ? 'Your driver is waiting at the hub.'
-                                        : 'Driver is traveling to PDEU pickup hub.',
+                                    _statusSubtitle(
+                                      pass.bookingStatus,
+                                      pass.isDriverArrived,
+                                    ),
                                     style: const TextStyle(
                                       fontSize: 12,
                                       color: AppColors.textSecondary,
@@ -224,80 +291,136 @@ class _PassengerActiveTripScreenState extends State<PassengerActiveTripScreen> {
                       ),
                       const SizedBox(height: 20),
 
-                      // Boarding Pass OTP Card
-                      Card(
-                        elevation: 3,
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(16),
-                          side: BorderSide(
-                            color: AppColors.primary.withValues(alpha: 0.3),
-                            width: 1.5,
+                      // Boarding Pass OTP / Verified Card
+                      if (pass.isBoarded) ...[
+                        Card(
+                          key: const Key('boarding_verified_card'),
+                          elevation: 3,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(16),
+                            side: BorderSide(
+                              color: AppColors.success.withValues(alpha: 0.3),
+                              width: 1.5,
+                            ),
+                          ),
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 24,
+                              vertical: 24,
+                            ),
+                            child: Column(
+                              children: [
+                                const Icon(
+                                  Icons.verified,
+                                  size: 48,
+                                  color: AppColors.success,
+                                ),
+                                const SizedBox(height: 12),
+                                Text(
+                                  pass.bookingStatus == 'COMPLETED'
+                                      ? 'Drop-Off Completed'
+                                      : pass.bookingStatus == 'IN_PROGRESS'
+                                          ? 'Trip In Progress'
+                                          : 'Boarding Verified',
+                                  key: const Key('boarding_verified_header'),
+                                  style: const TextStyle(
+                                    fontSize: 18,
+                                    fontWeight: FontWeight.bold,
+                                    color: AppColors.success,
+                                  ),
+                                ),
+                                const SizedBox(height: 8),
+                                Text(
+                                  pass.bookingStatus == 'COMPLETED'
+                                      ? 'You have safely reached your destination in Gandhinagar!'
+                                      : pass.bookingStatus == 'IN_PROGRESS'
+                                          ? 'En route to your destination. Relax and enjoy the ride!'
+                                          : 'Your boarding OTP has been confirmed by the driver. Ride starting shortly.',
+                                  textAlign: TextAlign.center,
+                                  style: const TextStyle(
+                                    fontSize: 13,
+                                    color: AppColors.textSecondary,
+                                  ),
+                                ),
+                              ],
+                            ),
                           ),
                         ),
-                        child: Padding(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 24,
-                            vertical: 24,
+                      ] else ...[
+                        Card(
+                          elevation: 3,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(16),
+                            side: BorderSide(
+                              color: AppColors.primary.withValues(alpha: 0.3),
+                              width: 1.5,
+                            ),
                           ),
-                          child: Column(
-                            children: [
-                              const Row(
-                                mainAxisAlignment: MainAxisAlignment.center,
-                                children: [
-                                  Icon(
-                                    Icons.pin,
-                                    size: 20,
-                                    color: AppColors.primary,
-                                  ),
-                                  SizedBox(width: 6),
-                                  Text(
-                                    'BOARDING PASS OTP',
-                                    style: TextStyle(
-                                      letterSpacing: 1.5,
-                                      fontSize: 13,
-                                      fontWeight: FontWeight.bold,
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 24,
+                              vertical: 24,
+                            ),
+                            child: Column(
+                              children: [
+                                const Row(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    Icon(
+                                      Icons.pin,
+                                      size: 20,
                                       color: AppColors.primary,
                                     ),
+                                    SizedBox(width: 6),
+                                    Text(
+                                      'BOARDING PASS OTP',
+                                      style: TextStyle(
+                                        letterSpacing: 1.5,
+                                        fontSize: 13,
+                                        fontWeight: FontWeight.bold,
+                                        color: AppColors.primary,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                const SizedBox(height: 16),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 28,
+                                    vertical: 14,
                                   ),
-                                ],
-                              ),
-                              const SizedBox(height: 16),
-                              Container(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 28,
-                                  vertical: 14,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: AppColors.surface,
-                                  borderRadius: BorderRadius.circular(12),
-                                  border: Border.all(
-                                    color: AppColors.border,
+                                  decoration: BoxDecoration(
+                                    color: AppColors.surface,
+                                    borderRadius: BorderRadius.circular(12),
+                                    border: Border.all(
+                                      color: AppColors.border,
+                                    ),
+                                  ),
+                                  child: Text(
+                                    provider.formattedOtp,
+                                    key: const Key('boarding_otp_display'),
+                                    style: const TextStyle(
+                                      fontSize: 34,
+                                      fontWeight: FontWeight.w900,
+                                      letterSpacing: 6,
+                                      color: AppColors.textPrimary,
+                                    ),
                                   ),
                                 ),
-                                child: Text(
-                                  provider.formattedOtp,
-                                  key: const Key('boarding_otp_display'),
-                                  style: const TextStyle(
-                                    fontSize: 34,
-                                    fontWeight: FontWeight.w900,
-                                    letterSpacing: 6,
-                                    color: AppColors.textPrimary,
+                                const SizedBox(height: 16),
+                                const Text(
+                                  'Share this 4-digit OTP with your driver before boarding.',
+                                  textAlign: TextAlign.center,
+                                  style: TextStyle(
+                                    fontSize: 13,
+                                    color: AppColors.textSecondary,
                                   ),
                                 ),
-                              ),
-                              const SizedBox(height: 16),
-                              const Text(
-                                'Share this 4-digit OTP with your driver before boarding.',
-                                textAlign: TextAlign.center,
-                                style: TextStyle(
-                                  fontSize: 13,
-                                  color: AppColors.textSecondary,
-                                ),
-                              ),
-                            ],
+                              ],
+                            ),
                           ),
                         ),
-                      ),
+                      ],
                       const SizedBox(height: 20),
 
                       // Driver & Vehicle Information Card

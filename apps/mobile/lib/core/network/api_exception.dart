@@ -22,7 +22,7 @@ class ApiException implements Exception {
 
     if (data is Map<String, dynamic>) {
       final rawStatusCode = data['statusCode'];
-      final rawErrorCode = data['errorCode'];
+      final rawErrorCode = data['errorCode'] ?? data['code'];
       final rawMessage = data['message'];
       final rawErrors = data['errors'];
       final rawPath = data['path'];

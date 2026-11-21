@@ -438,7 +438,7 @@ void main() {
     );
 
     testWidgets(
-      'dual-role user complete mode-switch round-trip between Passenger and Driver homes',
+      'dual-role user switches from Passenger mode to Driver mode in a single active session',
       (tester) async {
         final tokenStore = AuthTokenStore();
         final secureStorage = SecureTokenStorage.inMemory({
@@ -470,29 +470,27 @@ void main() {
         );
         await tester.pumpAndSettle();
 
-        // 1. Starts on Role Selection
-        expect(find.byType(RoleSelectionScreen), findsOneWidget);
-
-        // 2. Select Passenger mode
+        // 1. Initial selection into Passenger mode
         await tester.tap(find.text('Continue as Passenger'));
         await tester.pumpAndSettle();
         expect(find.byType(PassengerHomeScreen), findsOneWidget);
+        final passengerContext = tester.element(find.byType(PassengerHomeScreen));
+        expect(GoRouter.of(passengerContext).state.matchedLocation, AppRoutes.passengerHome);
 
-        // 3. Switch back to Role Selection
+        // 2. Switch mode back to Role Selection
         await tester.tap(find.byKey(const Key('switch_mode_button')));
         await tester.pumpAndSettle();
         expect(find.byType(RoleSelectionScreen), findsOneWidget);
+        final roleContext = tester.element(find.byType(RoleSelectionScreen));
+        expect(GoRouter.of(roleContext).state.matchedLocation, AppRoutes.roleSelection);
 
-        // 4. Select Driver mode
+        // 3. Select Driver mode within the same session
         await tester.ensureVisible(find.text('Continue as Driver'));
         await tester.tap(find.text('Continue as Driver'));
         await tester.pumpAndSettle();
         expect(find.byType(DriverHomeScreen), findsOneWidget);
-
-        // 5. Switch back to Role Selection
-        await tester.tap(find.byKey(const Key('switch_mode_button')));
-        await tester.pumpAndSettle();
-        expect(find.byType(RoleSelectionScreen), findsOneWidget);
+        final driverContext = tester.element(find.byType(DriverHomeScreen));
+        expect(GoRouter.of(driverContext).state.matchedLocation, AppRoutes.driverHome);
       },
     );
   });

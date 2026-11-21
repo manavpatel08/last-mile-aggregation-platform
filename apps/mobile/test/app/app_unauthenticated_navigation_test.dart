@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:go_router/go_router.dart';
 import 'package:material_ui/material_ui.dart';
@@ -94,10 +96,12 @@ void main() {
     testWidgets(
       'interactive Google Sign-In displays loading state during authentication and navigates to passenger home on success',
       (tester) async {
+        final authCompleter = Completer<void>();
         final tokenStore = AuthTokenStore();
         final secureStorage = SecureTokenStorage.inMemory();
         final repo = FakeAuthRepository(
           currentUser: passengerUser,
+          onAuthenticateWithGoogle: () => authCompleter.future,
           authSession: const AuthSession(
             user: passengerUser,
             accessToken: 'new-login-access-token',
@@ -131,9 +135,21 @@ void main() {
         await tester.pumpAndSettle();
 
         expect(find.byType(LoginScreen), findsOneWidget);
+        expect(find.byKey(const Key('google_sign_in_button')), findsOneWidget);
+        expect(find.byType(CircularProgressIndicator), findsNothing);
 
-        // Tap Google Sign-in button
+        // Tap Google Sign-in button to trigger authentication flow
         await tester.tap(find.byKey(const Key('google_sign_in_button')));
+
+        // Advance frame to allow GoogleSignInService.signIn() to return and trigger authenticating state
+        await tester.pump();
+
+        // Assert that loading UI is displayed while authentication is in progress
+        expect(find.byType(CircularProgressIndicator), findsOneWidget);
+        expect(find.byKey(const Key('google_sign_in_button')), findsNothing);
+
+        // Complete the authentication future
+        authCompleter.complete();
         await tester.pumpAndSettle();
 
         // Successful authentication routes to Passenger Home

@@ -165,6 +165,7 @@ class FakeAuthRepository implements AuthRepository {
     this.refreshException,
     this.userException,
     this.onRefreshSession,
+    this.onAuthenticateWithGoogle,
   });
 
   AuthUser? currentUser;
@@ -177,6 +178,7 @@ class FakeAuthRepository implements AuthRepository {
   Exception? refreshException;
   Exception? userException;
   Future<void> Function()? onRefreshSession;
+  Future<void> Function()? onAuthenticateWithGoogle;
   bool logoutCalled = false;
   int refreshCallCount = 0;
   int currentUserCallCount = 0;
@@ -186,6 +188,9 @@ class FakeAuthRepository implements AuthRepository {
     required String idToken,
     String? deviceFingerprint,
   }) async {
+    if (onAuthenticateWithGoogle != null) {
+      await onAuthenticateWithGoogle!();
+    }
     if (authException != null) {
       throw authException!;
     }

@@ -6,6 +6,7 @@ import { QueueModule } from '../../infrastructure/queues/queue.module.js';
 import { DriversModule } from '../drivers/drivers.module.js';
 import { RoutingModule } from '../routing/routing.module.js';
 import { OutboxModule } from '../../infrastructure/outbox/outbox.module.js';
+import { TripsModule } from '../trips/trips.module.js';
 import { QUEUES } from '../../common/constants/index.js';
 import { DispatchService } from './dispatch.service.js';
 import { DispatchProcessor } from './dispatch.processor.js';
@@ -22,6 +23,7 @@ import { DriverOffersController } from './driver-offers.controller.js';
     DriversModule,
     RoutingModule,
     forwardRef(() => OutboxModule),
+    forwardRef(() => TripsModule),
   ],
   controllers: [DriverOffersController],
   providers: [DispatchService, DispatchProcessor],

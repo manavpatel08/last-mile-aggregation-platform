@@ -16,6 +16,10 @@ export class DriverApprovalGuard implements CanActivate {
   ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
+    if (context.getType() !== 'http') {
+      return true;
+    }
+
     const requiresApproval = this.reflector.getAllAndOverride<boolean>(
       REQUIRE_DRIVER_APPROVAL_KEY,
       [context.getHandler(), context.getClass()],

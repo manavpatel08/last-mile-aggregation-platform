@@ -1247,4 +1247,436 @@ describe('OutboxService', () => {
       });
     });
   });
+
+  describe('Targeted Review: Realtime Outbox Delivery Acknowledgment in Dispatch Cascade', () => {
+    const validOfferId = '88888888-8888-4888-8888-888888888888';
+    const validGroupId = '99999999-9999-4999-8999-999999999999';
+    const validAttemptId = 'aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa';
+
+    let realtimeServiceMock: any;
+    let serviceWithRealtime: OutboxService;
+
+    beforeEach(() => {
+      realtimeServiceMock = {
+        broadcastOutboxEvent: vi.fn(),
+      };
+      serviceWithRealtime = new OutboxService(
+        prismaMock as unknown as PrismaService,
+        dispatchServiceMock as unknown as DispatchService,
+        realtimeServiceMock,
+      );
+
+      prismaMock.rideGroup.findUnique.mockResolvedValue({
+        id: validGroupId,
+        groupVersion: 1,
+        status: 'DISPATCHING',
+      });
+      prismaMock.dispatchAttempt.findUnique.mockResolvedValue({
+        id: validAttemptId,
+        status: 'ACTIVE',
+      });
+      prismaMock.driverDispatchOffer.findUnique.mockResolvedValue({
+        id: validOfferId,
+        status: 'REJECTED',
+        offeredAt: new Date(Date.now() - 5000),
+      });
+    });
+
+    it('awaits realtime broadcast and marks cascade event PUBLISHED only after successful delivery', async () => {
+      const mockEvent = {
+        id: 'event-cascade-success',
+        event_type: 'DISPATCH_OFFER_REJECTED',
+        aggregate_type: 'DRIVER_DISPATCH_OFFER',
+        aggregate_id: validOfferId,
+        payload: {
+          offerId: validOfferId,
+          rideGroupId: validGroupId,
+          driverId: 'driver-1',
+          groupVersion: 1,
+          dispatchAttemptId: validAttemptId,
+        },
+        retry_count: 0,
+      };
+
+      prismaMock.$transaction.mockImplementation(async (cb: any) => {
+        const txMock = {
+          $queryRaw: vi.fn().mockResolvedValue([mockEvent]),
+          $executeRaw: vi.fn().mockResolvedValue(1),
+        };
+        return cb(txMock);
+      });
+
+      prismaMock.driverAssignment.findFirst.mockResolvedValue(null);
+      prismaMock.driverDispatchOffer.findFirst.mockResolvedValue(null);
+      dispatchServiceMock.initiateDispatchForGroup.mockResolvedValueOnce({
+        success: true,
+        offerId: 'new-offer-1',
+      });
+      realtimeServiceMock.broadcastOutboxEvent.mockResolvedValueOnce(true);
+
+      const summary = await serviceWithRealtime.processPendingEvents();
+
+      expect(summary.publishedCount).toBe(1);
+      expect(realtimeServiceMock.broadcastOutboxEvent).toHaveBeenCalledWith(mockEvent);
+      expect(prismaMock.outboxEvent.update).toHaveBeenCalledWith({
+        where: { id: mockEvent.id },
+        data: {
+          status: 'PUBLISHED',
+          publishedAt: expect.any(Date),
+          lastError: null,
+        },
+      });
+    });
+
+    it('does not acknowledge cascade event as PUBLISHED when realtime broadcast rejects, leaving it retryable', async () => {
+      const mockEvent = {
+        id: 'event-cascade-broadcast-fail',
+        event_type: 'DISPATCH_OFFER_REJECTED',
+        aggregate_type: 'DRIVER_DISPATCH_OFFER',
+        aggregate_id: validOfferId,
+        payload: {
+          offerId: validOfferId,
+          rideGroupId: validGroupId,
+          driverId: 'driver-1',
+          groupVersion: 1,
+          dispatchAttemptId: validAttemptId,
+        },
+        retry_count: 1,
+      };
+
+      prismaMock.$transaction.mockImplementation(async (cb: any) => {
+        const txMock = {
+          $queryRaw: vi.fn().mockResolvedValue([mockEvent]),
+          $executeRaw: vi.fn().mockResolvedValue(1),
+        };
+        return cb(txMock);
+      });
+
+      prismaMock.driverAssignment.findFirst.mockResolvedValue(null);
+      prismaMock.driverDispatchOffer.findFirst.mockResolvedValue(null);
+      dispatchServiceMock.initiateDispatchForGroup.mockResolvedValueOnce({
+        success: true,
+        offerId: 'new-offer-1',
+      });
+      realtimeServiceMock.broadcastOutboxEvent.mockRejectedValueOnce(
+        new Error('Socket transport network timeout'),
+      );
+
+      const summary = await serviceWithRealtime.processPendingEvents();
+
+      // Must NOT be marked as published
+      expect(summary.publishedCount).toBe(0);
+      expect(summary.retriedCount).toBe(1);
+      expect(realtimeServiceMock.broadcastOutboxEvent).toHaveBeenCalledWith(mockEvent);
+      expect(prismaMock.outboxEvent.update).toHaveBeenCalledWith({
+        where: { id: mockEvent.id },
+        data: {
+          status: 'PENDING',
+          retryCount: 2,
+          lastError: 'Socket transport network timeout',
+          publishedAt: expect.any(Date),
+        },
+      });
+    });
+
+    it('on retry when subsequent dispatch outcome already exists, awaits broadcast and safely marks PUBLISHED', async () => {
+      const mockEvent = {
+        id: 'event-cascade-subsequent-exists',
+        event_type: 'DISPATCH_OFFER_REJECTED',
+        aggregate_type: 'DRIVER_DISPATCH_OFFER',
+        aggregate_id: validOfferId,
+        payload: {
+          offerId: validOfferId,
+          rideGroupId: validGroupId,
+          driverId: 'driver-1',
+          groupVersion: 1,
+          dispatchAttemptId: validAttemptId,
+        },
+        retry_count: 2,
+      };
+
+      prismaMock.$transaction.mockImplementation(async (cb: any) => {
+        const txMock = {
+          $queryRaw: vi.fn().mockResolvedValue([mockEvent]),
+          $executeRaw: vi.fn().mockResolvedValue(1),
+        };
+        return cb(txMock);
+      });
+
+      // Subsequent offer already exists in DB from previous run
+      prismaMock.driverAssignment.findFirst.mockResolvedValue(null);
+      prismaMock.driverDispatchOffer.findFirst.mockResolvedValue({
+        id: 'subsequent-offer-1',
+        rideGroupId: validGroupId,
+        status: 'PENDING',
+      });
+      realtimeServiceMock.broadcastOutboxEvent.mockResolvedValueOnce(true);
+
+      const summary = await serviceWithRealtime.processPendingEvents();
+
+      expect(summary.publishedCount).toBe(1);
+      expect(dispatchServiceMock.initiateDispatchForGroup).not.toHaveBeenCalled();
+      expect(realtimeServiceMock.broadcastOutboxEvent).toHaveBeenCalledWith(mockEvent);
+      expect(prismaMock.outboxEvent.update).toHaveBeenCalledWith({
+        where: { id: mockEvent.id },
+        data: {
+          status: 'PUBLISHED',
+          publishedAt: expect.any(Date),
+          lastError: null,
+        },
+      });
+    });
+
+    it('GROUP_FORMED: does not acknowledge event as PUBLISHED when realtime broadcast rejects in initial dispatch path, leaving it retryable', async () => {
+      const mockEvent = {
+        id: 'event-group-formed-fail',
+        event_type: 'GROUP_FORMED',
+        aggregate_type: 'RIDE_GROUP',
+        aggregate_id: validGroupId,
+        payload: {
+          rideGroupId: validGroupId,
+          pickupPointId: '22222222-2222-4222-a222-222222222222',
+          groupVersion: 1,
+        },
+        retry_count: 0,
+      };
+
+      prismaMock.$transaction.mockImplementation(async (cb: any) => {
+        const txMock = {
+          $queryRaw: vi.fn().mockResolvedValue([mockEvent]),
+          $executeRaw: vi.fn().mockResolvedValue(1),
+        };
+        return cb(txMock);
+      });
+
+      prismaMock.driverAssignment.findFirst.mockResolvedValue(null);
+      prismaMock.driverDispatchOffer.findFirst.mockResolvedValue(null);
+      prismaMock.driverDispatchOffer.findUnique.mockResolvedValue({
+        id: 'new-offer-id',
+        status: 'PENDING',
+      });
+      dispatchServiceMock.initiateDispatchForGroup.mockResolvedValueOnce({
+        success: true,
+        offerId: 'new-offer-id',
+      });
+      realtimeServiceMock.broadcastOutboxEvent.mockRejectedValueOnce(
+        new Error('Socket transport disconnected during group.updated emission'),
+      );
+
+      const summary = await serviceWithRealtime.processPendingEvents();
+
+      expect(summary.publishedCount).toBe(0);
+      expect(summary.retriedCount).toBe(1);
+      expect(dispatchServiceMock.initiateDispatchForGroup).toHaveBeenCalledWith(validGroupId);
+      expect(realtimeServiceMock.broadcastOutboxEvent).toHaveBeenCalledWith(mockEvent);
+      expect(prismaMock.outboxEvent.update).toHaveBeenCalledWith({
+        where: { id: mockEvent.id },
+        data: {
+          status: 'PENDING',
+          retryCount: 1,
+          lastError: 'Socket transport disconnected during group.updated emission',
+          publishedAt: expect.any(Date),
+        },
+      });
+    });
+
+    it('GROUP_FORMED: on retry when durable dispatch outcome already exists, does not mark PUBLISHED if broadcast rejects, avoiding duplicate dispatch', async () => {
+      const mockEvent = {
+        id: 'event-group-formed-retry-broadcast-fail',
+        event_type: 'GROUP_FORMED',
+        aggregate_type: 'RIDE_GROUP',
+        aggregate_id: validGroupId,
+        payload: {
+          rideGroupId: validGroupId,
+          pickupPointId: '22222222-2222-4222-a222-222222222222',
+          groupVersion: 1,
+        },
+        retry_count: 1,
+      };
+
+      prismaMock.$transaction.mockImplementation(async (cb: any) => {
+        const txMock = {
+          $queryRaw: vi.fn().mockResolvedValue([mockEvent]),
+          $executeRaw: vi.fn().mockResolvedValue(1),
+        };
+        return cb(txMock);
+      });
+
+      // Durable offer already exists from previous dispatch attempt
+      prismaMock.driverAssignment.findFirst.mockResolvedValue(null);
+      prismaMock.driverDispatchOffer.findFirst.mockResolvedValue({
+        id: 'existing-offer-uuid',
+        rideGroupId: validGroupId,
+        groupVersion: 1,
+        status: 'PENDING',
+      });
+      realtimeServiceMock.broadcastOutboxEvent.mockRejectedValueOnce(
+        new Error('Redis adapter unavailable for socket room emission'),
+      );
+
+      const summary = await serviceWithRealtime.processPendingEvents();
+
+      expect(summary.publishedCount).toBe(0);
+      expect(summary.retriedCount).toBe(1);
+      // Dispatch engine is NEVER re-triggered (idempotency preserved)
+      expect(dispatchServiceMock.initiateDispatchForGroup).not.toHaveBeenCalled();
+      expect(realtimeServiceMock.broadcastOutboxEvent).toHaveBeenCalledWith(mockEvent);
+      expect(prismaMock.outboxEvent.update).toHaveBeenCalledWith({
+        where: { id: mockEvent.id },
+        data: {
+          status: 'PENDING',
+          retryCount: 2,
+          lastError: 'Redis adapter unavailable for socket room emission',
+          publishedAt: expect.any(Date),
+        },
+      });
+    });
+
+    it('GROUP_FORMED: marks event FAILED and never PUBLISHED when broadcast rejects and retry count reaches terminal limit', async () => {
+      const mockEvent = {
+        id: 'event-group-formed-terminal',
+        event_type: 'GROUP_FORMED',
+        aggregate_type: 'RIDE_GROUP',
+        aggregate_id: validGroupId,
+        payload: {
+          rideGroupId: validGroupId,
+          pickupPointId: '22222222-2222-4222-a222-222222222222',
+          groupVersion: 1,
+        },
+        retry_count: 4, // 4 + 1 = 5 (MAX_OUTBOX_RETRIES)
+      };
+
+      prismaMock.$transaction.mockImplementation(async (cb: any) => {
+        const txMock = {
+          $queryRaw: vi.fn().mockResolvedValue([mockEvent]),
+          $executeRaw: vi.fn().mockResolvedValue(1),
+        };
+        return cb(txMock);
+      });
+
+      prismaMock.driverAssignment.findFirst.mockResolvedValue(null);
+      prismaMock.driverDispatchOffer.findFirst.mockResolvedValue({
+        id: 'existing-offer-uuid',
+        rideGroupId: validGroupId,
+        groupVersion: 1,
+        status: 'PENDING',
+      });
+      realtimeServiceMock.broadcastOutboxEvent.mockRejectedValueOnce(
+        new Error('Fatal gateway serialization error'),
+      );
+
+      const summary = await serviceWithRealtime.processPendingEvents();
+
+      expect(summary.publishedCount).toBe(0);
+      expect(summary.failedCount).toBe(1);
+      expect(prismaMock.outboxEvent.update).toHaveBeenCalledWith({
+        where: { id: mockEvent.id },
+        data: {
+          status: 'FAILED',
+          retryCount: 5,
+          lastError: 'Fatal gateway serialization error',
+          publishedAt: expect.any(Date),
+        },
+      });
+    });
+
+    it('DISPATCH_OFFER_CREATED: does not acknowledge event as PUBLISHED when realtime broadcast rejects, leaving it retryable', async () => {
+      const mockEvent = {
+        id: 'event-offer-created-broadcast-fail',
+        event_type: 'DISPATCH_OFFER_CREATED',
+        aggregate_type: 'DRIVER_DISPATCH_OFFER',
+        aggregate_id: validOfferId,
+        payload: {
+          offerId: validOfferId,
+          rideGroupId: validGroupId,
+          driverId: 'driver-1',
+          groupVersion: 1,
+          dispatchAttemptId: validAttemptId,
+        },
+        retry_count: 0,
+      };
+
+      prismaMock.$transaction.mockImplementation(async (cb: any) => {
+        const txMock = {
+          $queryRaw: vi.fn().mockResolvedValue([mockEvent]),
+          $executeRaw: vi.fn().mockResolvedValue(1),
+        };
+        return cb(txMock);
+      });
+
+      dispatchServiceMock.scheduleOfferTimeout.mockResolvedValueOnce({
+        scheduled: true,
+        jobId: `dispatch-timeout-${validOfferId}`,
+      });
+      realtimeServiceMock.broadcastOutboxEvent.mockRejectedValueOnce(
+        new Error('Socket transport connection reset'),
+      );
+
+      const summary = await serviceWithRealtime.processPendingEvents();
+
+      expect(summary.publishedCount).toBe(0);
+      expect(summary.retriedCount).toBe(1);
+      expect(dispatchServiceMock.scheduleOfferTimeout).toHaveBeenCalledWith(validOfferId);
+      expect(realtimeServiceMock.broadcastOutboxEvent).toHaveBeenCalledWith(mockEvent);
+      expect(prismaMock.outboxEvent.update).toHaveBeenCalledWith({
+        where: { id: mockEvent.id },
+        data: {
+          status: 'PENDING',
+          retryCount: 1,
+          lastError: 'Socket transport connection reset',
+          publishedAt: expect.any(Date),
+        },
+      });
+    });
+
+    it('DISPATCH_OFFER_REJECTED: on retry when subsequent outcome exists, does not mark PUBLISHED if broadcast rejects', async () => {
+      const mockEvent = {
+        id: 'event-rejected-retry-fail',
+        event_type: 'DISPATCH_OFFER_REJECTED',
+        aggregate_type: 'DRIVER_DISPATCH_OFFER',
+        aggregate_id: validOfferId,
+        payload: {
+          offerId: validOfferId,
+          rideGroupId: validGroupId,
+          driverId: 'driver-1',
+          groupVersion: 1,
+          dispatchAttemptId: validAttemptId,
+        },
+        retry_count: 2,
+      };
+
+      prismaMock.$transaction.mockImplementation(async (cb: any) => {
+        const txMock = {
+          $queryRaw: vi.fn().mockResolvedValue([mockEvent]),
+          $executeRaw: vi.fn().mockResolvedValue(1),
+        };
+        return cb(txMock);
+      });
+
+      prismaMock.driverAssignment.findFirst.mockResolvedValue(null);
+      prismaMock.driverDispatchOffer.findFirst.mockResolvedValue({
+        id: 'subsequent-offer-1',
+        rideGroupId: validGroupId,
+        status: 'PENDING',
+      });
+      realtimeServiceMock.broadcastOutboxEvent.mockRejectedValueOnce(
+        new Error('Socket transport failure on retry'),
+      );
+
+      const summary = await serviceWithRealtime.processPendingEvents();
+
+      expect(summary.publishedCount).toBe(0);
+      expect(summary.retriedCount).toBe(1);
+      expect(dispatchServiceMock.initiateDispatchForGroup).not.toHaveBeenCalled();
+      expect(prismaMock.outboxEvent.update).toHaveBeenCalledWith({
+        where: { id: mockEvent.id },
+        data: {
+          status: 'PENDING',
+          retryCount: 3,
+          lastError: 'Socket transport failure on retry',
+          publishedAt: expect.any(Date),
+        },
+      });
+    });
+  });
 });

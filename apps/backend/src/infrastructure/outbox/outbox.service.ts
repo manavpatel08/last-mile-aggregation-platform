@@ -3,11 +3,13 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  Optional,
   forwardRef,
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { DispatchService } from '../../modules/dispatch/dispatch.service.js';
+import { RealtimeService } from '../../modules/realtime/realtime.service.js';
 import {
   GroupFormedPayload,
   DispatchOfferCreatedPayload,
@@ -32,6 +34,9 @@ export class OutboxService {
     private readonly prisma: PrismaService,
     @Inject(forwardRef(() => DispatchService))
     private readonly dispatchService: DispatchService,
+    @Optional()
+    @Inject(forwardRef(() => RealtimeService))
+    private readonly realtimeService?: RealtimeService,
   ) {}
 
   /**
@@ -334,7 +339,7 @@ export class OutboxService {
             OR
             (status = 'PROCESSING' AND published_at < NOW() - INTERVAL '30 seconds')
           )
-            ${filter?.eventType ? Prisma.sql`AND event_type = ${filter.eventType}` : Prisma.sql`AND event_type IN ('GROUP_FORMED', 'DISPATCH_OFFER_CREATED')`}
+            ${filter?.eventType ? Prisma.sql`AND event_type = ${filter.eventType}` : Prisma.empty}
             ${filter?.aggregateId ? Prisma.sql`AND aggregate_id = ${filter.aggregateId}::uuid` : Prisma.empty}
           ORDER BY
             CASE
@@ -430,6 +435,35 @@ export class OutboxService {
               `Durable dispatch outcome already exists for group ${rideGroupId} (v${groupVersion}): assignment=${existingAssignment?.id ?? 'none'}, offer=${existingOffer?.id ?? 'none'} (status=${existingOffer?.status ?? 'none'}); acknowledging GROUP_FORMED outbox event ${row.id}`,
             );
 
+            if (this.realtimeService) {
+              try {
+                await this.realtimeService.broadcastOutboxEvent(row);
+              } catch (broadcastErr: any) {
+                this.logger.warn(
+                  `Realtime broadcast failed for already-dispatched GROUP_FORMED outbox event ${row.id}: ${broadcastErr?.message}; leaving retryable`,
+                );
+                const nextRetry = row.retry_count + 1;
+                const isTerminal = nextRetry >= MAX_OUTBOX_RETRIES;
+
+                await this.prisma.outboxEvent.update({
+                  where: { id: row.id },
+                  data: {
+                    status: isTerminal ? 'FAILED' : 'PENDING',
+                    retryCount: nextRetry,
+                    lastError: broadcastErr?.message || 'REALTIME_BROADCAST_FAILED',
+                    publishedAt: new Date(),
+                  },
+                });
+
+                if (isTerminal) {
+                  summary.failedCount++;
+                } else {
+                  summary.retriedCount++;
+                }
+                continue;
+              }
+            }
+
             await this.prisma.outboxEvent.update({
               where: { id: row.id },
               data: {
@@ -522,6 +556,35 @@ export class OutboxService {
           this.logger.log(
             `Automated dispatch initiated for group ${rideGroupId} via outbox event ${row.id}: success=true, offerId=${dispatchResult.offerId ?? 'none'}`,
           );
+
+          if (this.realtimeService) {
+            try {
+              await this.realtimeService.broadcastOutboxEvent(row);
+            } catch (broadcastErr: any) {
+              this.logger.warn(
+                `Failed to broadcast GROUP_FORMED for outbox event ${row.id}: ${broadcastErr?.message}; leaving retryable`,
+              );
+              const nextRetry = row.retry_count + 1;
+              const isTerminal = nextRetry >= MAX_OUTBOX_RETRIES;
+
+              await this.prisma.outboxEvent.update({
+                where: { id: row.id },
+                data: {
+                  status: isTerminal ? 'FAILED' : 'PENDING',
+                  retryCount: nextRetry,
+                  lastError: broadcastErr?.message || 'REALTIME_BROADCAST_FAILED',
+                  publishedAt: new Date(),
+                },
+              });
+
+              if (isTerminal) {
+                summary.failedCount++;
+              } else {
+                summary.retriedCount++;
+              }
+              continue;
+            }
+          }
 
           // Mark outbox event durably PUBLISHED
           await this.prisma.outboxEvent.update({
@@ -626,6 +689,35 @@ export class OutboxService {
           this.logger.log(
             `Durable timeout scheduling for offer ${validation.data!.offerId} via outbox event ${row.id}: scheduled=${scheduleResult.scheduled}, reason=${scheduleResult.reason ?? 'ENQUEUED'}`,
           );
+
+          if (this.realtimeService) {
+            try {
+              await this.realtimeService.broadcastOutboxEvent(row);
+            } catch (broadcastErr: any) {
+              this.logger.warn(
+                `Failed to broadcast DISPATCH_OFFER_CREATED for outbox event ${row.id}: ${broadcastErr?.message}; leaving retryable`,
+              );
+              const nextRetry = row.retry_count + 1;
+              const isTerminal = nextRetry >= MAX_OUTBOX_RETRIES;
+
+              await this.prisma.outboxEvent.update({
+                where: { id: row.id },
+                data: {
+                  status: isTerminal ? 'FAILED' : 'PENDING',
+                  retryCount: nextRetry,
+                  lastError: broadcastErr?.message || 'REALTIME_BROADCAST_FAILED',
+                  publishedAt: new Date(),
+                },
+              });
+
+              if (isTerminal) {
+                summary.failedCount++;
+              } else {
+                summary.retriedCount++;
+              }
+              continue;
+            }
+          }
 
           // Mark outbox event durably PUBLISHED
           await this.prisma.outboxEvent.update({
@@ -807,6 +899,36 @@ export class OutboxService {
             this.logger.log(
               `Subsequent dispatch outcome already exists for group ${rideGroupId} (v${groupVersion}): assignment=${activeAssignment?.id ?? 'none'}, pendingOffer=${pendingOffer?.id ?? 'none'}, subsequentOffer=${subsequentOfferInAttempt?.id ?? 'none'}, attemptStatus=${attempt?.status ?? 'none'}; acknowledging cascade event ${row.id}`,
             );
+
+            if (this.realtimeService) {
+              try {
+                await this.realtimeService.broadcastOutboxEvent(row);
+              } catch (broadcastErr: any) {
+                this.logger.warn(
+                  `Realtime broadcast failed for already-cascaded outbox ${row.id} (${row.event_type}): ${broadcastErr?.message}; leaving retryable`,
+                );
+                const nextRetry = row.retry_count + 1;
+                const isTerminal = nextRetry >= MAX_OUTBOX_RETRIES;
+
+                await this.prisma.outboxEvent.update({
+                  where: { id: row.id },
+                  data: {
+                    status: isTerminal ? 'FAILED' : 'PENDING',
+                    retryCount: nextRetry,
+                    lastError: broadcastErr?.message || 'REALTIME_BROADCAST_FAILED',
+                    publishedAt: new Date(),
+                  },
+                });
+
+                if (isTerminal) {
+                  summary.failedCount++;
+                } else {
+                  summary.retriedCount++;
+                }
+                continue;
+              }
+            }
+
             await this.prisma.outboxEvent.update({
               where: { id: row.id },
               data: {
@@ -900,7 +1022,37 @@ export class OutboxService {
             continue;
           }
 
-          // Cascade succeeded: mark outbox event PUBLISHED
+          // Deliver realtime notification and await result before marking PUBLISHED
+          if (this.realtimeService) {
+            try {
+              await this.realtimeService.broadcastOutboxEvent(row);
+            } catch (broadcastErr: any) {
+              this.logger.warn(
+                `Failed to broadcast realtime event for cascade outbox ${row.id} (${row.event_type}): ${broadcastErr?.message}; leaving retryable`,
+              );
+              const nextRetry = row.retry_count + 1;
+              const isTerminal = nextRetry >= MAX_OUTBOX_RETRIES;
+
+              await this.prisma.outboxEvent.update({
+                where: { id: row.id },
+                data: {
+                  status: isTerminal ? 'FAILED' : 'PENDING',
+                  retryCount: nextRetry,
+                  lastError: broadcastErr?.message || 'REALTIME_BROADCAST_FAILED',
+                  publishedAt: new Date(),
+                },
+              });
+
+              if (isTerminal) {
+                summary.failedCount++;
+              } else {
+                summary.retriedCount++;
+              }
+              continue;
+            }
+          }
+
+          // Realtime broadcast delivered: mark outbox event PUBLISHED
           await this.prisma.outboxEvent.update({
             where: { id: row.id },
             data: {
@@ -919,20 +1071,63 @@ export class OutboxService {
               (summary.dispatchOfferExpiredHandledCount ?? 0) + 1;
           }
         } else {
-          // Unsupported or unhandled event type: DO NOT mark PUBLISHED!
-          this.logger.debug(
-            `Outbox event ${row.id} has unhandled event type '${row.event_type}'; unclaiming to PENDING without acknowledgment`,
-          );
-          try {
+          // If RealtimeService can broadcast this domain event, broadcast and mark PUBLISHED
+          let broadcastSucceeded = false;
+          if (this.realtimeService) {
+            try {
+              broadcastSucceeded = await this.realtimeService.broadcastOutboxEvent(row);
+            } catch (broadcastErr: any) {
+              this.logger.warn(
+                `Failed to broadcast outbox event ${row.id} (${row.event_type}): ${broadcastErr?.message}; leaving retryable`,
+              );
+              const nextRetry = row.retry_count + 1;
+              const isTerminal = nextRetry >= MAX_OUTBOX_RETRIES;
+
+              await this.prisma.outboxEvent.update({
+                where: { id: row.id },
+                data: {
+                  status: isTerminal ? 'FAILED' : 'PENDING',
+                  retryCount: nextRetry,
+                  lastError: broadcastErr?.message || 'REALTIME_BROADCAST_FAILED',
+                  publishedAt: new Date(),
+                },
+              });
+
+              if (isTerminal) {
+                summary.failedCount++;
+              } else {
+                summary.retriedCount++;
+              }
+              continue;
+            }
+          }
+
+          if (broadcastSucceeded) {
             await this.prisma.outboxEvent.update({
               where: { id: row.id },
               data: {
-                status: 'PENDING',
-                publishedAt: null,
+                status: 'PUBLISHED',
+                publishedAt: new Date(),
+                lastError: null,
               },
             });
-          } catch {
-            // Engine may be disconnecting during shutdown
+            summary.publishedCount++;
+          } else {
+            // Unsupported or unhandled event type: DO NOT mark PUBLISHED!
+            this.logger.debug(
+              `Outbox event ${row.id} has unhandled event type '${row.event_type}'; unclaiming to PENDING without acknowledgment`,
+            );
+            try {
+              await this.prisma.outboxEvent.update({
+                where: { id: row.id },
+                data: {
+                  status: 'PENDING',
+                  publishedAt: null,
+                },
+              });
+            } catch {
+              // Engine may be disconnecting during shutdown
+            }
           }
         }
       } catch (err: any) {

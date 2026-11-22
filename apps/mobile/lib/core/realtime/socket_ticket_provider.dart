@@ -28,9 +28,15 @@ class ApiSocketTicketProvider implements SocketTicketProvider {
       throw const FormatException('Empty response received from /auth/socket-ticket');
     }
 
-    final data = rawData['data'];
-    if (data is Map<String, dynamic>) {
-      return SocketTicketModel.fromJson(data);
+    if (rawData.containsKey('data')) {
+      final data = rawData['data'];
+      if (data == null) {
+        throw const FormatException('Malformed response envelope: "data" field cannot be null');
+      }
+      if (data is! Map) {
+        throw const FormatException('Malformed response envelope: "data" field must be a JSON object');
+      }
+      return SocketTicketModel.fromJson(Map<String, dynamic>.from(data));
     }
 
     return SocketTicketModel.fromJson(rawData);

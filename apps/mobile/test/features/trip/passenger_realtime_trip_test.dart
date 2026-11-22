@@ -246,7 +246,7 @@ void main() {
   }
 
   group('PassengerActiveTripScreen Realtime Integration', () {
-    testWidgets('subscribes to booking room on mount and unsubscribes on unmount',
+    testWidgets('subscribes to booking and trip rooms on mount and unsubscribes on unmount',
         (tester) async {
       await tester.pumpWidget(
         buildTestWidget(bookingId: 'book-1234'),
@@ -254,6 +254,7 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(fakeSocket.subscribedBookings, contains('book-1234'));
+      expect(fakeSocket.subscribedTrips, contains('trip-100'));
 
       // Unmount the screen
       await tester.pumpWidget(
@@ -262,6 +263,7 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(fakeSocket.unsubscribedBookings, contains('book-1234'));
+      expect(fakeSocket.unsubscribedTrips, contains('trip-100'));
     });
 
     testWidgets('driver.location.updated event updates live location card',
@@ -283,7 +285,7 @@ void main() {
             'longitude': 72.6650,
             'heading': 180.0,
             'speed': 35.0,
-            'recordedAt': DateTime.now().toIso8601String(),
+            'updatedAt': DateTime.now().toIso8601String(),
           },
         ),
       );
@@ -342,10 +344,14 @@ void main() {
       expect(find.text('Boarded — Ride Starting Soon'), findsOneWidget);
     });
 
-    testWidgets('payment.confirmed event displays payment confirmation banner',
+    testWidgets('payment.confirmed event displays payment confirmation banner and keeps lastPaymentReceipt null',
         (tester) async {
+      final provider = PassengerActiveTripProvider();
       await tester.pumpWidget(
-        buildTestWidget(bookingId: 'book-1234'),
+        buildTestWidget(
+          bookingId: 'book-1234',
+          provider: provider,
+        ),
       );
       await tester.pumpAndSettle();
 
@@ -353,14 +359,22 @@ void main() {
         find.byKey(const Key('payment_confirmed_banner')),
         findsNothing,
       );
+      expect(provider.isPaymentConfirmed, isFalse);
+      expect(provider.lastPaymentReceipt, isNull);
 
       fakeSocket.emitEvent(
         _testEvent<Map<String, dynamic>>(
           event: 'payment.confirmed',
           data: {
+            'cashCollectionId': 'cc-123',
             'tripId': 'trip-100',
+            'driverId': 'driver-1',
+            'tripPassengerId': 'tp-1',
             'bookingId': 'book-1234',
-            'totalCashCollected': '45.00',
+            'totalCashCollectedPaise': 4500,
+            'rideFarePaise': 4500,
+            'waitingChargePaise': 0,
+            'feeSurchargePaise': 0,
             'paymentStatus': 'PAID',
           },
         ),
@@ -372,6 +386,9 @@ void main() {
         findsOneWidget,
       );
       expect(find.text('Cash Payment Confirmed by Driver'), findsOneWidget);
+      // Socket event records status confirmation only without synthesizing a full receipt model
+      expect(provider.isPaymentConfirmed, isTrue);
+      expect(provider.lastPaymentReceipt, isNull);
     });
   });
 }

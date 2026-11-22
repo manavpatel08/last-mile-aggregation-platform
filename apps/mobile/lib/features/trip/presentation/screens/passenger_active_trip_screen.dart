@@ -46,12 +46,20 @@ class _PassengerActiveTripScreenState extends State<PassengerActiveTripScreen> {
         _setupRealtime();
       } catch (_) {}
     }
+    final tripId = _provider.boardingPass?.tripId;
+    if (tripId != null && tripId.isNotEmpty) {
+      _checkTripSubscription(tripId);
+    }
   }
 
   void _setupRealtime() {
     final socket = _socketService;
     if (socket == null) return;
     socket.subscribeBooking(widget.bookingId);
+    final tripId = _provider.boardingPass?.tripId;
+    if (tripId != null && tripId.isNotEmpty) {
+      _checkTripSubscription(tripId);
+    }
     _eventSubscription?.cancel();
     _eventSubscription = socket.eventStream.listen((event) {
       if (!mounted) return;
@@ -88,6 +96,13 @@ class _PassengerActiveTripScreenState extends State<PassengerActiveTripScreen> {
     }
   }
 
+  void _onProviderStateChanged() {
+    final tripId = _provider.boardingPass?.tripId;
+    if (tripId != null && tripId.isNotEmpty) {
+      _checkTripSubscription(tripId);
+    }
+  }
+
   @override
   void initState() {
     super.initState();
@@ -101,6 +116,8 @@ class _PassengerActiveTripScreenState extends State<PassengerActiveTripScreen> {
       );
       _ownsProvider = true;
     }
+
+    _provider.addListener(_onProviderStateChanged);
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
@@ -127,6 +144,7 @@ class _PassengerActiveTripScreenState extends State<PassengerActiveTripScreen> {
 
   @override
   void dispose() {
+    _provider.removeListener(_onProviderStateChanged);
     _eventSubscription?.cancel();
     if (_subscribedTripId != null) {
       _socketService?.unsubscribeTrip(_subscribedTripId!);

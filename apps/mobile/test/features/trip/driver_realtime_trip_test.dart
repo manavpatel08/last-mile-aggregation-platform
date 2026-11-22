@@ -199,8 +199,18 @@ class _FakeTripRepository implements TripRepository {
     required String tripId,
     required String passengerId,
     required String idempotencyKey,
-  }) =>
-      throw UnimplementedError();
+  }) async {
+    return CompletePassengerResponse(
+      passengerId: passengerId,
+      status: 'COMPLETED',
+      rideFarePaise: 3800,
+      rideFare: '38.00',
+      waitingChargePaise: 0,
+      waitingCharge: '0.00',
+      totalCashToCollectPaise: 3800,
+      totalCashToCollect: '38.00',
+    );
+  }
 
   @override
   Future<CompleteTripResponse> completeTrip({
@@ -359,6 +369,127 @@ void main() {
 
       expect(find.byKey(const Key('trip_completed_status_indicator')), findsOneWidget);
       expect(fakeTracker.currentActiveTripId, isNull);
+    });
+
+    testWidgets(
+        'payment.confirmed socket event marks payment confirmed without synthesizing full receipt',
+        (tester) async {
+      final provider = DriverActiveTripProvider();
+      await tester.pumpWidget(
+        buildTestWidget(tripId: 'trip-42', provider: provider),
+      );
+      await tester.pumpAndSettle();
+
+      // Complete passenger drop-off via provider to populate authoritative drop-off breakdown
+      final dropOffSuccess = await provider.completePassengerDropOff(
+        passengerId: 'p-1',
+        repository: fakeTripRepo,
+      );
+      expect(dropOffSuccess, isTrue);
+      await tester.pumpAndSettle();
+
+      // Button is initially visible, status banner is not
+      expect(find.byKey(const Key('confirm_cash_button_p-1')), findsOneWidget);
+      expect(find.byKey(const Key('payment_status_confirmed_p-1')), findsNothing);
+      expect(provider.isCashCollected('p-1'), isFalse);
+      expect(provider.confirmedCashReceipts['p-1'], isNull);
+
+      // Emit Stage 10A payment.confirmed event
+      fakeSocket.emitEvent(
+        _testEvent<Map<String, dynamic>>(
+          event: 'payment.confirmed',
+          data: {
+            'cashCollectionId': 'cc-999',
+            'tripId': 'trip-42',
+            'driverId': 'driver-1',
+            'tripPassengerId': 'tp-1',
+            'bookingId': 'book-1111',
+            'passengerId': 'p-1',
+            'totalCashCollectedPaise': 3800,
+            'rideFarePaise': 3800,
+            'waitingChargePaise': 0,
+            'feeSurchargePaise': 0,
+            'paymentStatus': 'PAID',
+          },
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Confirm button is hidden, confirmed card is rendered
+      expect(find.byKey(const Key('confirm_cash_button_p-1')), findsNothing);
+      expect(find.byKey(const Key('payment_status_confirmed_p-1')), findsOneWidget);
+      expect(provider.isCashCollected('p-1'), isTrue);
+      // Confirmed cash receipts map contains ONLY full receipts, NOT partial socket models
+      expect(provider.confirmedCashReceipts['p-1'], isNull);
+    });
+
+    test('CashConfirmationModel.fromJson throws FormatException when passed partial Stage 10A socket payload', () {
+      final partialSocketPayload = {
+        'cashCollectionId': 'cc-999',
+        'tripId': 'trip-42',
+        'driverId': 'driver-1',
+        'tripPassengerId': 'tp-1',
+        'bookingId': 'book-1111',
+        'totalCashCollectedPaise': 3800,
+        'rideFarePaise': 3800,
+        'waitingChargePaise': 0,
+        'feeSurchargePaise': 0,
+        'paymentStatus': 'PAID',
+      };
+
+      expect(
+        () => CashConfirmationModel.fromJson(partialSocketPayload),
+        throwsFormatException,
+      );
+    });
+
+    test('full receipt from REST confirmCash is preserved when payment.confirmed event arrives', () {
+      final provider = DriverActiveTripProvider();
+
+      // Populate full receipt as returned by REST confirmCash endpoint
+      final fullReceipt = CashConfirmationModel(
+        collectionId: 'cc-999',
+        tripId: 'trip-42',
+        tripPassengerId: 'tp-1',
+        driverId: 'driver-1',
+        totalCashCollectedPaise: 3800,
+        totalCashCollected: '₹38.00',
+        rideFarePaise: 3800,
+        rideFare: '₹38.00',
+        waitingChargePaise: 0,
+        waitingCharge: '₹0.00',
+        surchargeFeesPaise: 0,
+        surchargeFees: '₹0.00',
+        collectedFeeIds: const [],
+        paymentStatus: 'PAID',
+        confirmedAt: DateTime.parse('2026-11-22T10:00:00.000Z'),
+        paymentAllocations: const [
+          PaymentAllocationModel(
+            id: 'alloc-1',
+            obligationType: 'RIDE_FARE',
+            obligationEntityId: 'tp-1',
+            allocatedAmountPaise: 3800,
+            allocatedAmount: '₹38.00',
+          ),
+        ],
+      );
+
+      provider.recordCashReceipt('p-1', fullReceipt);
+      expect(provider.isCashCollected('p-1'), isTrue);
+      expect(provider.confirmedCashReceipts['p-1'], equals(fullReceipt));
+
+      // Now incoming socket event arrives
+      provider.onPaymentConfirmed({
+        'cashCollectionId': 'cc-999',
+        'tripId': 'trip-42',
+        'passengerId': 'p-1',
+      });
+
+      // Full receipt is still intact and not overwritten with null or partial data
+      expect(provider.isCashCollected('p-1'), isTrue);
+      expect(provider.confirmedCashReceipts['p-1'], equals(fullReceipt));
+      expect(provider.confirmedCashReceipts['p-1']!.totalCashCollected, '₹38.00');
+      expect(provider.confirmedCashReceipts['p-1']!.paymentAllocations.length, 1);
     });
   });
 }

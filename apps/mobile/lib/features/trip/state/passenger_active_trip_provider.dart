@@ -174,9 +174,11 @@ class PassengerActiveTripProvider extends ChangeNotifier {
   }
 
   /// Handles `payment.confirmed` event.
+  /// Records payment-status confirmation. Full itemized receipt details must be
+  /// retrieved via authoritative REST calls (e.g. `bookingRepository.getBookingDetails`).
   void onPaymentConfirmed(Map<String, dynamic> data) {
     _isPaymentConfirmed = true;
-    _lastPaymentReceipt = data;
+    _lastPaymentReceipt = null;
     notifyListeners();
   }
 

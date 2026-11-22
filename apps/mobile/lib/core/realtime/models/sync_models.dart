@@ -1,6 +1,58 @@
 import 'package:flutter/foundation.dart';
 import 'realtime_event.dart';
 
+String _requireString(
+  dynamic val,
+  String fieldName, {
+  bool allowEmpty = false,
+}) {
+  if (val is! String || (!allowEmpty && val.trim().isEmpty)) {
+    throw FormatException(
+      'Sync parsing error: "$fieldName" must be a non-empty string',
+    );
+  }
+  return val.trim();
+}
+
+int _requireInt(dynamic val, String fieldName, {int? min}) {
+  if (val is! num || val != val.toInt()) {
+    throw FormatException(
+      'Sync parsing error: "$fieldName" must be an integer, got: $val',
+    );
+  }
+  final i = val.toInt();
+  if (min != null && i < min) {
+    throw FormatException(
+      'Sync parsing error: "$fieldName" must be >= $min, got: $i',
+    );
+  }
+  return i;
+}
+
+DateTime _requireTimestamp(dynamic val, String fieldName) {
+  if (val is! String || val.trim().isEmpty) {
+    throw FormatException(
+      'Sync parsing error: "$fieldName" must be a non-empty timestamp string',
+    );
+  }
+  final dt = DateTime.tryParse(val);
+  if (dt == null) {
+    throw FormatException(
+      'Sync parsing error: "$fieldName" has invalid timestamp: $val',
+    );
+  }
+  return dt;
+}
+
+bool _requireBool(dynamic val, String fieldName) {
+  if (val is! bool) {
+    throw FormatException(
+      'Sync parsing error: "$fieldName" must be a boolean',
+    );
+  }
+  return val;
+}
+
 /// Request body for `POST /api/v1/sync`.
 @immutable
 class SyncRequestDto {
@@ -48,18 +100,21 @@ class SyncActiveBooking {
   final int entityVersion;
 
   factory SyncActiveBooking.fromJson(Map<String, dynamic> json) {
+    final rawDropoff = json['dropoffAddress'];
+    final String? dropoff = (rawDropoff is String && rawDropoff.trim().isNotEmpty)
+        ? rawDropoff.trim()
+        : null;
+
     return SyncActiveBooking(
-      id: json['id'] as String? ?? '',
-      status: json['status'] as String? ?? '',
-      passengerId: json['passengerId'] as String? ?? '',
-      pickupPointId: json['pickupPointId'] as String? ?? '',
-      dropoffAddress: json['dropoffAddress'] as String?,
-      fareQuotePaise: (json['fareQuotePaise'] as num?)?.toInt() ?? 0,
-      createdAt: DateTime.tryParse(json['createdAt'] as String? ?? '') ??
-          DateTime.now(),
-      updatedAt: DateTime.tryParse(json['updatedAt'] as String? ?? '') ??
-          DateTime.now(),
-      entityVersion: (json['entityVersion'] as num?)?.toInt() ?? 1,
+      id: _requireString(json['id'], 'activeBooking.id'),
+      status: _requireString(json['status'], 'activeBooking.status'),
+      passengerId: _requireString(json['passengerId'], 'activeBooking.passengerId'),
+      pickupPointId: _requireString(json['pickupPointId'], 'activeBooking.pickupPointId'),
+      dropoffAddress: dropoff,
+      fareQuotePaise: _requireInt(json['fareQuotePaise'], 'activeBooking.fareQuotePaise', min: 0),
+      createdAt: _requireTimestamp(json['createdAt'], 'activeBooking.createdAt'),
+      updatedAt: _requireTimestamp(json['updatedAt'], 'activeBooking.updatedAt'),
+      entityVersion: _requireInt(json['entityVersion'], 'activeBooking.entityVersion', min: 1),
     );
   }
 }
@@ -83,11 +138,11 @@ class SyncActiveGroup {
 
   factory SyncActiveGroup.fromJson(Map<String, dynamic> json) {
     return SyncActiveGroup(
-      id: json['id'] as String? ?? '',
-      status: json['status'] as String? ?? '',
-      groupVersion: (json['groupVersion'] as num?)?.toInt() ?? 1,
-      pickupPointId: json['pickupPointId'] as String? ?? '',
-      memberCount: (json['memberCount'] as num?)?.toInt() ?? 0,
+      id: _requireString(json['id'], 'activeGroup.id'),
+      status: _requireString(json['status'], 'activeGroup.status'),
+      groupVersion: _requireInt(json['groupVersion'], 'activeGroup.groupVersion', min: 1),
+      pickupPointId: _requireString(json['pickupPointId'], 'activeGroup.pickupPointId'),
+      memberCount: _requireInt(json['memberCount'], 'activeGroup.memberCount', min: 0),
     );
   }
 }
@@ -120,29 +175,49 @@ class SyncPassengerActiveTrip {
   final int farePaise;
 
   factory SyncPassengerActiveTrip.fromJson(Map<String, dynamic> json) {
+    final driverId = _requireString(json['activeDriverId'], 'activeTrip.activeDriverId');
+
     final rawLoc = json['driverLocation'];
     DriverLocationBroadcastData? location;
     if (rawLoc is Map<String, dynamic>) {
+      final rawLat = rawLoc['latitude'];
+      final rawLng = rawLoc['longitude'];
+      if (rawLat is! num || rawLng is! num) {
+        throw const FormatException('Sync passenger activeTrip: driverLocation latitude/longitude must be numbers');
+      }
+      final double lat = rawLat.toDouble();
+      final double lng = rawLng.toDouble();
+      if (lat < -90.0 || lat > 90.0 || lng < -180.0 || lng > 180.0) {
+        throw const FormatException('Sync passenger activeTrip: driverLocation coordinates out of bounds');
+      }
+      final updatedAt = _requireTimestamp(rawLoc['updatedAt'], 'activeTrip.driverLocation.updatedAt');
       location = DriverLocationBroadcastData(
-        driverId: json['activeDriverId'] as String? ?? '',
-        latitude: (rawLoc['latitude'] as num?)?.toDouble() ?? 0.0,
-        longitude: (rawLoc['longitude'] as num?)?.toDouble() ?? 0.0,
-        updatedAt: DateTime.tryParse(rawLoc['updatedAt'] as String? ?? '') ??
-            DateTime.now(),
+        driverId: driverId,
+        latitude: lat,
+        longitude: lng,
+        updatedAt: updatedAt,
       );
     }
 
+    final rawEta = json['etaSeconds'];
+    final int? eta = rawEta != null ? _requireInt(rawEta, 'activeTrip.etaSeconds', min: 0) : null;
+
+    final rawStopOrder = json['currentStopOrder'];
+    final int? stopOrder = rawStopOrder != null
+        ? _requireInt(rawStopOrder, 'activeTrip.currentStopOrder', min: 0)
+        : null;
+
     return SyncPassengerActiveTrip(
-      id: json['id'] as String? ?? '',
-      status: json['status'] as String? ?? '',
-      tripVersion: (json['tripVersion'] as num?)?.toInt() ?? 1,
-      activeDriverId: json['activeDriverId'] as String? ?? '',
+      id: _requireString(json['id'], 'activeTrip.id'),
+      status: _requireString(json['status'], 'activeTrip.status'),
+      tripVersion: _requireInt(json['tripVersion'], 'activeTrip.tripVersion', min: 1),
+      activeDriverId: driverId,
       driverName: json['driverName'] as String?,
       vehicleNumber: json['vehicleNumber'] as String?,
       driverLocation: location,
-      etaSeconds: (json['etaSeconds'] as num?)?.toInt(),
-      currentStopOrder: (json['currentStopOrder'] as num?)?.toInt(),
-      farePaise: (json['farePaise'] as num?)?.toInt() ?? 0,
+      etaSeconds: eta,
+      currentStopOrder: stopOrder,
+      farePaise: _requireInt(json['farePaise'], 'activeTrip.farePaise', min: 0),
     );
   }
 }
@@ -164,11 +239,10 @@ class SyncOutstandingFee {
 
   factory SyncOutstandingFee.fromJson(Map<String, dynamic> json) {
     return SyncOutstandingFee(
-      id: json['id'] as String? ?? '',
-      feeAmountPaise: (json['feeAmountPaise'] as num?)?.toInt() ?? 0,
-      reason: json['reason'] as String? ?? '',
-      assessedAt: DateTime.tryParse(json['assessedAt'] as String? ?? '') ??
-          DateTime.now(),
+      id: _requireString(json['id'], 'outstandingCancellationFee.id'),
+      feeAmountPaise: _requireInt(json['feeAmountPaise'], 'outstandingCancellationFee.feeAmountPaise', min: 0),
+      reason: _requireString(json['reason'], 'outstandingCancellationFee.reason'),
+      assessedAt: _requireTimestamp(json['assessedAt'], 'outstandingCancellationFee.assessedAt'),
     );
   }
 }
@@ -192,7 +266,12 @@ class SyncPassengerState {
     final rawBooking = json['activeBooking'];
     final rawGroup = json['activeGroup'];
     final rawTrip = json['activeTrip'];
-    final rawFees = json['outstandingCancellationFees'] as List? ?? [];
+    final rawFees = json['outstandingCancellationFees'];
+
+    if (rawFees != null && rawFees is! List) {
+      throw const FormatException('SyncPassengerState: "outstandingCancellationFees" must be a list');
+    }
+    final feeList = rawFees as List? ?? [];
 
     return SyncPassengerState(
       activeBooking: rawBooking is Map<String, dynamic>
@@ -204,9 +283,8 @@ class SyncPassengerState {
       activeTrip: rawTrip is Map<String, dynamic>
           ? SyncPassengerActiveTrip.fromJson(rawTrip)
           : null,
-      outstandingCancellationFees: rawFees
-          .whereType<Map<String, dynamic>>()
-          .map(SyncOutstandingFee.fromJson)
+      outstandingCancellationFees: feeList
+          .map((f) => SyncOutstandingFee.fromJson(Map<String, dynamic>.from(f as Map)))
           .toList(),
     );
   }
@@ -229,10 +307,10 @@ class SyncDriverProfile {
 
   factory SyncDriverProfile.fromJson(Map<String, dynamic> json) {
     return SyncDriverProfile(
-      id: json['id'] as String? ?? '',
-      verificationStatus: json['verificationStatus'] as String? ?? '',
-      operationalStatus: json['operationalStatus'] as String? ?? '',
-      isOnline: json['isOnline'] as bool? ?? false,
+      id: _requireString(json['id'], 'driverProfile.id', allowEmpty: true),
+      verificationStatus: _requireString(json['verificationStatus'], 'driverProfile.verificationStatus'),
+      operationalStatus: _requireString(json['operationalStatus'], 'driverProfile.operationalStatus'),
+      isOnline: _requireBool(json['isOnline'], 'driverProfile.isOnline'),
     );
   }
 }
@@ -256,12 +334,11 @@ class SyncActiveOffer {
 
   factory SyncActiveOffer.fromJson(Map<String, dynamic> json) {
     return SyncActiveOffer(
-      id: json['id'] as String? ?? '',
-      rideGroupId: json['rideGroupId'] as String? ?? '',
-      groupVersion: (json['groupVersion'] as num?)?.toInt() ?? 1,
-      expiresAt: DateTime.tryParse(json['expiresAt'] as String? ?? '') ??
-          DateTime.now(),
-      status: json['status'] as String? ?? '',
+      id: _requireString(json['id'], 'activeOffer.id'),
+      rideGroupId: _requireString(json['rideGroupId'], 'activeOffer.rideGroupId'),
+      groupVersion: _requireInt(json['groupVersion'], 'activeOffer.groupVersion', min: 1),
+      expiresAt: _requireTimestamp(json['expiresAt'], 'activeOffer.expiresAt'),
+      status: _requireString(json['status'], 'activeOffer.status'),
     );
   }
 }
@@ -282,9 +359,9 @@ class SyncPassengerManifestItem {
 
   factory SyncPassengerManifestItem.fromJson(Map<String, dynamic> json) {
     return SyncPassengerManifestItem(
-      passengerId: json['passengerId'] as String? ?? '',
-      bookingId: json['bookingId'] as String? ?? '',
-      status: json['status'] as String? ?? '',
+      passengerId: _requireString(json['passengerId'], 'passengerManifest.passengerId'),
+      bookingId: _requireString(json['bookingId'], 'passengerManifest.bookingId'),
+      status: _requireString(json['status'], 'passengerManifest.status'),
     );
   }
 }
@@ -309,16 +386,25 @@ class SyncDriverActiveTrip {
   final List<SyncPassengerManifestItem> passengerManifest;
 
   factory SyncDriverActiveTrip.fromJson(Map<String, dynamic> json) {
-    final rawManifest = json['passengerManifest'] as List? ?? [];
+    final rawManifest = json['passengerManifest'];
+    if (rawManifest != null && rawManifest is! List) {
+      throw const FormatException('SyncDriverActiveTrip: "passengerManifest" must be a list');
+    }
+    final manifestList = rawManifest as List? ?? [];
+
+    final rawStopOrder = json['currentStopOrder'];
+    final int? stopOrder = rawStopOrder != null
+        ? _requireInt(rawStopOrder, 'driverActiveTrip.currentStopOrder', min: 0)
+        : null;
+
     return SyncDriverActiveTrip(
-      id: json['id'] as String? ?? '',
-      status: json['status'] as String? ?? '',
-      tripVersion: (json['tripVersion'] as num?)?.toInt() ?? 1,
-      rideGroupId: json['rideGroupId'] as String? ?? '',
-      currentStopOrder: (json['currentStopOrder'] as num?)?.toInt(),
-      passengerManifest: rawManifest
-          .whereType<Map<String, dynamic>>()
-          .map(SyncPassengerManifestItem.fromJson)
+      id: _requireString(json['id'], 'driverActiveTrip.id'),
+      status: _requireString(json['status'], 'driverActiveTrip.status'),
+      tripVersion: _requireInt(json['tripVersion'], 'driverActiveTrip.tripVersion', min: 1),
+      rideGroupId: _requireString(json['rideGroupId'], 'driverActiveTrip.rideGroupId'),
+      currentStopOrder: stopOrder,
+      passengerManifest: manifestList
+          .map((p) => SyncPassengerManifestItem.fromJson(Map<String, dynamic>.from(p as Map)))
           .toList(),
     );
   }
@@ -339,23 +425,20 @@ class SyncDriverState {
 
   factory SyncDriverState.fromJson(Map<String, dynamic> json) {
     final rawProfile = json['driverProfile'];
+    if (rawProfile is! Map<String, dynamic> && rawProfile is! Map) {
+      throw const FormatException('SyncDriverState: missing or invalid "driverProfile"');
+    }
+
     final rawOffer = json['activeOffer'];
     final rawTrip = json['activeTrip'];
 
     return SyncDriverState(
-      driverProfile: rawProfile is Map<String, dynamic>
-          ? SyncDriverProfile.fromJson(rawProfile)
-          : const SyncDriverProfile(
-              id: '',
-              verificationStatus: 'NOT_REGISTERED',
-              operationalStatus: 'INACTIVE',
-              isOnline: false,
-            ),
-      activeOffer: rawOffer is Map<String, dynamic>
-          ? SyncActiveOffer.fromJson(rawOffer)
+      driverProfile: SyncDriverProfile.fromJson(Map<String, dynamic>.from(rawProfile as Map)),
+      activeOffer: rawOffer is Map<String, dynamic> || rawOffer is Map
+          ? SyncActiveOffer.fromJson(Map<String, dynamic>.from(rawOffer as Map))
           : null,
-      activeTrip: rawTrip is Map<String, dynamic>
-          ? SyncDriverActiveTrip.fromJson(rawTrip)
+      activeTrip: rawTrip is Map<String, dynamic> || rawTrip is Map
+          ? SyncDriverActiveTrip.fromJson(Map<String, dynamic>.from(rawTrip as Map))
           : null,
     );
   }
@@ -385,17 +468,15 @@ class SyncResponseDto {
     final rawDriver = json['driverState'];
 
     return SyncResponseDto(
-      success: json['success'] as bool? ?? false,
-      serverTimestamp:
-          DateTime.tryParse(json['serverTimestamp'] as String? ?? '') ??
-              DateTime.now(),
-      role: json['role'] as String? ?? '',
-      reconciled: json['reconciled'] as bool? ?? false,
-      passengerState: rawPass is Map<String, dynamic>
-          ? SyncPassengerState.fromJson(rawPass)
+      success: _requireBool(json['success'], 'SyncResponseDto.success'),
+      serverTimestamp: _requireTimestamp(json['serverTimestamp'], 'SyncResponseDto.serverTimestamp'),
+      role: _requireString(json['role'], 'SyncResponseDto.role'),
+      reconciled: _requireBool(json['reconciled'], 'SyncResponseDto.reconciled'),
+      passengerState: rawPass is Map<String, dynamic> || rawPass is Map
+          ? SyncPassengerState.fromJson(Map<String, dynamic>.from(rawPass as Map))
           : null,
-      driverState: rawDriver is Map<String, dynamic>
-          ? SyncDriverState.fromJson(rawDriver)
+      driverState: rawDriver is Map<String, dynamic> || rawDriver is Map
+          ? SyncDriverState.fromJson(Map<String, dynamic>.from(rawDriver as Map))
           : null,
     );
   }

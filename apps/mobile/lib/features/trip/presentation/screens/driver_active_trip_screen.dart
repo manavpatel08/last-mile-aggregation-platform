@@ -885,6 +885,38 @@ class _DriverActiveTripScreenState extends State<DriverActiveTripScreen> {
                                         );
                                       },
                                     ),
+                                  ] else if (provider.isPaymentConfirmed(
+                                          passenger.passengerId)) ...[
+                                    const SizedBox(height: 8),
+                                    Container(
+                                      key: Key(
+                                        'payment_status_confirmed_${passenger.passengerId}',
+                                      ),
+                                      padding: const EdgeInsets.all(10),
+                                      decoration: BoxDecoration(
+                                        color: AppColors.success
+                                            .withValues(alpha: 0.12),
+                                        borderRadius: BorderRadius.circular(8),
+                                      ),
+                                      child: const Row(
+                                        children: [
+                                          Icon(
+                                            Icons.check_circle,
+                                            color: AppColors.success,
+                                            size: 16,
+                                          ),
+                                          SizedBox(width: 8),
+                                          Text(
+                                            'Payment Confirmed (Status: PAID)',
+                                            style: TextStyle(
+                                              color: AppColors.success,
+                                              fontWeight: FontWeight.bold,
+                                              fontSize: 12,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
                                   ] else if (provider.dropOffResult(
                                           passenger.passengerId) !=
                                       null) ...[

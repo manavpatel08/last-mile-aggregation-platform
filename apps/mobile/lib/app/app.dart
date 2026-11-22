@@ -259,7 +259,10 @@ class _LastMileAppState extends State<LastMileApp> with WidgetsBindingObserver {
         widget.tripRepository ?? ApiTripRepository(apiClient: _apiClient);
 
     _syncSubscription = _syncService.syncStream.listen((response) {
-      _passengerHomeProvider.handleSyncResponse(response.passengerState);
+      _passengerHomeProvider.handleSyncResponse(
+        response.passengerState,
+        repository: _bookingRepository,
+      );
       _driverHomeProvider.handleSyncResponse(response.driverState);
     });
 

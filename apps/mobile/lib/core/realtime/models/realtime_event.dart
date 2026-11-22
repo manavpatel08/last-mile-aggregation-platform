@@ -26,14 +26,41 @@ class StandardRealtimeEvent<T> {
     Map<String, dynamic> json, [
     T Function(dynamic dataJson)? fromDataJson,
   ]) {
-    final rawOccurredAt = json['occurredAt'];
-    DateTime parsedOccurredAt;
-    if (rawOccurredAt is String) {
-      parsedOccurredAt = DateTime.tryParse(rawOccurredAt) ?? DateTime.now();
-    } else {
-      parsedOccurredAt = DateTime.now();
+    final rawEventId = json['eventId'];
+    if (rawEventId is! String || rawEventId.trim().isEmpty) {
+      throw const FormatException('StandardRealtimeEvent: missing or empty "eventId"');
+    }
+    final rawEvent = json['event'];
+    if (rawEvent is! String || rawEvent.trim().isEmpty) {
+      throw const FormatException('StandardRealtimeEvent: missing or empty "event"');
+    }
+    final rawEntityType = json['entityType'];
+    if (rawEntityType is! String || rawEntityType.trim().isEmpty) {
+      throw const FormatException('StandardRealtimeEvent: missing or empty "entityType"');
+    }
+    final rawEntityId = json['entityId'];
+    if (rawEntityId is! String || rawEntityId.trim().isEmpty) {
+      throw const FormatException('StandardRealtimeEvent: missing or empty "entityId"');
     }
 
+    final rawVersion = json['entityVersion'];
+    if (rawVersion is! num || rawVersion != rawVersion.toInt() || rawVersion < 1) {
+      throw const FormatException('StandardRealtimeEvent: "entityVersion" must be a positive integer >= 1');
+    }
+    final int parsedVersion = rawVersion.toInt();
+
+    final rawOccurredAt = json['occurredAt'];
+    if (rawOccurredAt is! String || rawOccurredAt.trim().isEmpty) {
+      throw const FormatException('StandardRealtimeEvent: missing or empty "occurredAt"');
+    }
+    final parsedOccurredAt = DateTime.tryParse(rawOccurredAt);
+    if (parsedOccurredAt == null) {
+      throw FormatException('StandardRealtimeEvent: invalid "occurredAt" timestamp: $rawOccurredAt');
+    }
+
+    if (!json.containsKey('data')) {
+      throw const FormatException('StandardRealtimeEvent: missing "data" payload');
+    }
     final rawData = json['data'];
     final T parsedData;
     if (fromDataJson != null) {
@@ -43,11 +70,11 @@ class StandardRealtimeEvent<T> {
     }
 
     return StandardRealtimeEvent<T>(
-      eventId: json['eventId'] as String? ?? '',
-      event: json['event'] as String? ?? '',
-      entityType: json['entityType'] as String? ?? '',
-      entityId: json['entityId'] as String? ?? '',
-      entityVersion: (json['entityVersion'] as num?)?.toInt() ?? 1,
+      eventId: rawEventId.trim(),
+      event: rawEvent.trim(),
+      entityType: rawEntityType.trim(),
+      entityId: rawEntityId.trim(),
+      entityVersion: parsedVersion,
       occurredAt: parsedOccurredAt,
       data: parsedData,
     );
@@ -99,21 +126,57 @@ class DriverLocationBroadcastData {
   final DateTime updatedAt;
 
   factory DriverLocationBroadcastData.fromJson(Map<String, dynamic> json) {
-    final rawUpdatedAt = json['updatedAt'];
-    DateTime parsedTime;
-    if (rawUpdatedAt is String) {
-      parsedTime = DateTime.tryParse(rawUpdatedAt) ?? DateTime.now();
-    } else {
-      parsedTime = DateTime.now();
+    final rawDriverId = json['driverId'];
+    if (rawDriverId is! String || rawDriverId.trim().isEmpty) {
+      throw const FormatException('DriverLocationBroadcastData: missing or empty "driverId"');
     }
 
+    final rawLat = json['latitude'];
+    if (rawLat is! num) {
+      throw const FormatException('DriverLocationBroadcastData: "latitude" must be a number');
+    }
+    final double latitude = rawLat.toDouble();
+    if (latitude < -90.0 || latitude > 90.0) {
+      throw FormatException('DriverLocationBroadcastData: latitude must be between -90 and 90, got: $latitude');
+    }
+
+    final rawLng = json['longitude'];
+    if (rawLng is! num) {
+      throw const FormatException('DriverLocationBroadcastData: "longitude" must be a number');
+    }
+    final double longitude = rawLng.toDouble();
+    if (longitude < -180.0 || longitude > 180.0) {
+      throw FormatException('DriverLocationBroadcastData: longitude must be between -180 and 180, got: $longitude');
+    }
+
+    final rawUpdatedAt = json['updatedAt'];
+    if (rawUpdatedAt is! String || rawUpdatedAt.trim().isEmpty) {
+      throw const FormatException('DriverLocationBroadcastData: missing or empty "updatedAt"');
+    }
+    final parsedTime = DateTime.tryParse(rawUpdatedAt);
+    if (parsedTime == null) {
+      throw FormatException('DriverLocationBroadcastData: invalid "updatedAt" timestamp: $rawUpdatedAt');
+    }
+
+    final rawTripId = json['tripId'];
+    final String? tripId = (rawTripId is String && rawTripId.trim().isNotEmpty)
+        ? rawTripId.trim()
+        : null;
+
+    final rawHeading = json['heading'];
+    final double? heading = rawHeading is num ? rawHeading.toDouble() : null;
+
+    final rawSpeed = json['speed'];
+    final double? speed =
+        (rawSpeed is num && rawSpeed >= 0) ? rawSpeed.toDouble() : null;
+
     return DriverLocationBroadcastData(
-      driverId: json['driverId'] as String? ?? '',
-      tripId: json['tripId'] as String?,
-      latitude: (json['latitude'] as num?)?.toDouble() ?? 0.0,
-      longitude: (json['longitude'] as num?)?.toDouble() ?? 0.0,
-      heading: (json['heading'] as num?)?.toDouble(),
-      speed: (json['speed'] as num?)?.toDouble(),
+      driverId: rawDriverId.trim(),
+      tripId: tripId,
+      latitude: latitude,
+      longitude: longitude,
+      heading: heading,
+      speed: speed,
       updatedAt: parsedTime,
     );
   }
@@ -171,8 +234,12 @@ class RoomSubscriptionAck {
   final String? message;
 
   factory RoomSubscriptionAck.fromJson(Map<String, dynamic> json) {
+    final rawSuccess = json['success'];
+    if (rawSuccess is! bool) {
+      throw const FormatException('RoomSubscriptionAck: missing or invalid "success" boolean');
+    }
     return RoomSubscriptionAck(
-      success: json['success'] as bool? ?? false,
+      success: rawSuccess,
       room: json['room'] as String?,
       error: json['error'] as String?,
       message: json['message'] as String?,

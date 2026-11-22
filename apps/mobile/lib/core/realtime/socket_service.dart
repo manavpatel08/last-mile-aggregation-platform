@@ -287,10 +287,13 @@ class RealtimeSocketService implements SocketService {
     );
 
     if (client.isConnected) {
+      final wasConnected = _state == SocketConnectionState.connected;
       _reconnectAttempts = 0;
       _backoffPolicy.reset();
       _updateState(SocketConnectionState.connected);
-      _resubscribeActiveRooms();
+      if (!wasConnected) {
+        _resubscribeActiveRooms();
+      }
     }
   }
 
@@ -299,10 +302,13 @@ class RealtimeSocketService implements SocketService {
 
     switch (clientState) {
       case SocketConnectionState.connected:
+        final wasConnected = _state == SocketConnectionState.connected;
         _reconnectAttempts = 0;
         _backoffPolicy.reset();
         _updateState(SocketConnectionState.connected);
-        _resubscribeActiveRooms();
+        if (!wasConnected) {
+          _resubscribeActiveRooms();
+        }
         break;
 
       case SocketConnectionState.disconnected:
@@ -324,31 +330,50 @@ class RealtimeSocketService implements SocketService {
 
     final rooms = Set<String>.from(_activeSubscribedRooms);
     for (final room in rooms) {
+      final RoomSubscriptionAck ack;
       if (room.startsWith('trip:')) {
         final id = room.substring(5);
-        await _emitSubscribeAck('subscribe:trip', {'tripId': id});
+        ack = await _emitSubscribeAck('subscribe:trip', {'tripId': id});
       } else if (room.startsWith('booking:')) {
         final id = room.substring(8);
-        await _emitSubscribeAck('subscribe:booking', {'bookingId': id});
+        ack = await _emitSubscribeAck('subscribe:booking', {'bookingId': id});
       } else if (room.startsWith('group:')) {
         final id = room.substring(6);
-        await _emitSubscribeAck('subscribe:group', {'groupId': id});
+        ack = await _emitSubscribeAck('subscribe:group', {'groupId': id});
+      } else {
+        continue;
+      }
+      if (!ack.success && (ack.error == 'FORBIDDEN' || ack.error == 'UNAUTHORIZED')) {
+        _activeSubscribedRooms.remove(room);
       }
     }
   }
 
-  Future<bool> _emitSubscribeAck(String event, Map<String, dynamic> payload) async {
+  Future<RoomSubscriptionAck> _emitSubscribeAck(
+    String event,
+    Map<String, dynamic> payload,
+  ) async {
     try {
-      final ack = await client.emitWithAck(event, payload);
-      if (ack is Map && ack['success'] == true) {
-        return true;
+      final ack = await client.emitWithAck(event, Map<String, dynamic>.from(payload));
+      if (ack is Map<String, dynamic>) {
+        return RoomSubscriptionAck.fromJson(ack);
+      } else if (ack is Map) {
+        return RoomSubscriptionAck.fromJson(Map<String, dynamic>.from(ack));
       }
-      return false;
+      return const RoomSubscriptionAck(
+        success: false,
+        error: 'INVALID_ACK',
+        message: 'Non-map ack returned',
+      );
     } catch (e) {
       if (kDebugMode) {
         debugPrint('[RealtimeSocketService] Room subscribe "$event" failed: $e');
       }
-      return false;
+      return RoomSubscriptionAck(
+        success: false,
+        error: 'ACK_ERROR',
+        message: e.toString(),
+      );
     }
   }
 
@@ -357,7 +382,14 @@ class RealtimeSocketService implements SocketService {
     final room = 'trip:$tripId';
     _activeSubscribedRooms.add(room);
     if (!isConnected) return false;
-    return _emitSubscribeAck('subscribe:trip', {'tripId': tripId});
+    final ack = await _emitSubscribeAck('subscribe:trip', {'tripId': tripId});
+    if (!ack.success) {
+      if (ack.error == 'FORBIDDEN' || ack.error == 'UNAUTHORIZED') {
+        _activeSubscribedRooms.remove(room);
+      }
+      return false;
+    }
+    return true;
   }
 
   @override
@@ -378,7 +410,14 @@ class RealtimeSocketService implements SocketService {
     final room = 'booking:$bookingId';
     _activeSubscribedRooms.add(room);
     if (!isConnected) return false;
-    return _emitSubscribeAck('subscribe:booking', {'bookingId': bookingId});
+    final ack = await _emitSubscribeAck('subscribe:booking', {'bookingId': bookingId});
+    if (!ack.success) {
+      if (ack.error == 'FORBIDDEN' || ack.error == 'UNAUTHORIZED') {
+        _activeSubscribedRooms.remove(room);
+      }
+      return false;
+    }
+    return true;
   }
 
   @override
@@ -399,7 +438,14 @@ class RealtimeSocketService implements SocketService {
     final room = 'group:$groupId';
     _activeSubscribedRooms.add(room);
     if (!isConnected) return false;
-    return _emitSubscribeAck('subscribe:group', {'groupId': groupId});
+    final ack = await _emitSubscribeAck('subscribe:group', {'groupId': groupId});
+    if (!ack.success) {
+      if (ack.error == 'FORBIDDEN' || ack.error == 'UNAUTHORIZED') {
+        _activeSubscribedRooms.remove(room);
+      }
+      return false;
+    }
+    return true;
   }
 
   @override

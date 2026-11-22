@@ -88,6 +88,114 @@ export class PaymentsService {
   }
 
   /**
+   * Retrieves an already-recorded cash collection receipt for a completed passenger journey.
+   * Strictly read-only: does not create, update, confirm, allocate, or mutate any payment,
+   * collection, or fee records.
+   */
+  async getCashReceipt(
+    driverUserId: string,
+    tripPassengerId: string,
+  ): Promise<CashConfirmationResult> {
+    const driver = await this.getVerifiedDriverProfile(driverUserId);
+
+    const passenger = await this.prisma.tripPassenger.findUnique({
+      where: { id: tripPassengerId },
+      include: {
+        trip: {
+          select: {
+            id: true,
+            activeDriverId: true,
+          },
+        },
+        cashCollection: {
+          include: {
+            paymentAllocations: {
+              orderBy: { allocatedAt: 'asc' },
+            },
+          },
+        },
+      },
+    });
+
+    if (!passenger) {
+      throw new NotFoundException({
+        errorCode: 'TRIP_PASSENGER_NOT_FOUND',
+        message: `Trip passenger with ID ${tripPassengerId} not found.`,
+      });
+    }
+
+    const isAssignedDriver = passenger.trip.activeDriverId === driver.id;
+    const isCollectingDriver = passenger.cashCollection?.driverId === driver.id;
+
+    if (!isAssignedDriver && !isCollectingDriver) {
+      throw new ForbiddenException({
+        errorCode: 'DRIVER_NOT_ASSIGNED_TO_TRIP',
+        message: 'Calling driver is not authorized to access receipts for this trip.',
+      });
+    }
+
+    if (!passenger.cashCollection) {
+      throw new NotFoundException({
+        errorCode: 'CASH_NOT_YET_COLLECTED',
+        message: `Cash collection has not yet been recorded for trip passenger ${tripPassengerId}.`,
+      });
+    }
+
+    const collection = passenger.cashCollection;
+
+    const rideFareAlloc = collection.paymentAllocations.find(
+      (a) => a.obligationType === 'RIDE_FARE',
+    );
+    const rideFarePaise = rideFareAlloc
+      ? rideFareAlloc.allocatedAmountPaise
+      : passenger.finalRideFarePaise;
+
+    const waitingChargeAlloc = collection.paymentAllocations.find(
+      (a) => a.obligationType === 'WAITING_CHARGE',
+    );
+    const waitingChargePaise = waitingChargeAlloc
+      ? waitingChargeAlloc.allocatedAmountPaise
+      : passenger.waitingChargePaise;
+
+    const surchargeAllocs = collection.paymentAllocations.filter(
+      (a) => a.obligationType === 'CANCELLATION_FEE_SURCHARGE',
+    );
+    const surchargeFeesPaise = surchargeAllocs.reduce(
+      (sum, a) => sum + a.allocatedAmountPaise,
+      0,
+    );
+    const collectedFeeIds = surchargeAllocs.map((a) => a.obligationEntityId);
+
+    const paymentAllocations: PaymentAllocationItem[] =
+      collection.paymentAllocations.map((alloc) => ({
+        id: alloc.id,
+        obligationType: alloc.obligationType,
+        obligationEntityId: alloc.obligationEntityId,
+        allocatedAmountPaise: alloc.allocatedAmountPaise,
+        allocatedAmount: (alloc.allocatedAmountPaise / 100).toFixed(2),
+      }));
+
+    return {
+      collectionId: collection.id,
+      tripId: collection.tripId,
+      tripPassengerId: collection.tripPassengerId,
+      driverId: collection.driverId,
+      totalCashCollectedPaise: collection.totalCashCollectedPaise,
+      totalCashCollected: (collection.totalCashCollectedPaise / 100).toFixed(2),
+      rideFarePaise,
+      rideFare: (rideFarePaise / 100).toFixed(2),
+      waitingChargePaise,
+      waitingCharge: (waitingChargePaise / 100).toFixed(2),
+      surchargeFeesPaise,
+      surchargeFees: (surchargeFeesPaise / 100).toFixed(2),
+      collectedFeeIds,
+      paymentStatus: collection.paymentStatus,
+      confirmedAt: collection.confirmedAt.toISOString(),
+      paymentAllocations,
+    };
+  }
+
+  /**
    * Driver confirms physical cash collection upon passenger drop-off.
    * Atomically records cash collection, creates payment allocations,
    * marks outstanding cancellation fees as COLLECTED, and verifies amount exactness.

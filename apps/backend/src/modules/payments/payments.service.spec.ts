@@ -964,4 +964,308 @@ describe('Stage 8 — Phase 4: Cash Confirmation & Payment Allocation Ledger', (
     });
     expect(dbFee?.waiverReason).toBe('Original reason A');
   });
+
+  // =========================================================================
+  // Issue #46: Cash Collection Receipt Retrieval (getCashReceipt)
+  // =========================================================================
+  describe('Issue #46: Cash Collection Receipt Retrieval (getCashReceipt)', () => {
+    it('18. Authorized driver retrieves an existing persisted receipt matching backend record', async () => {
+      const passenger = await createTestPassenger('r18');
+      const { trip, tripPassenger, driverUserId, driverProfileId } =
+        await createTripWithPassenger({
+          passengerId: passenger.id,
+          finalRideFarePaise: 3500,
+          waitingChargePaise: 500,
+        });
+
+      // Confirm cash first
+      const confirmDto = {
+        tripId: trip.id,
+        tripPassengerId: tripPassenger.id,
+        amountCollectedPaise: 4000,
+      };
+      const confirmed = await paymentsService.confirmCash(driverUserId, confirmDto);
+      expect(confirmed.collectionId).toBeDefined();
+
+      // Retrieve receipt
+      const receipt = await paymentsService.getCashReceipt(
+        driverUserId,
+        tripPassenger.id,
+      );
+
+      expect(receipt.collectionId).toBe(confirmed.collectionId);
+      expect(receipt.tripId).toBe(trip.id);
+      expect(receipt.tripPassengerId).toBe(tripPassenger.id);
+      expect(receipt.driverId).toBe(driverProfileId);
+      expect(receipt.totalCashCollectedPaise).toBe(4000);
+      expect(receipt.totalCashCollected).toBe('40.00');
+      expect(receipt.rideFarePaise).toBe(3500);
+      expect(receipt.rideFare).toBe('35.00');
+      expect(receipt.waitingChargePaise).toBe(500);
+      expect(receipt.waitingCharge).toBe('5.00');
+      expect(receipt.surchargeFeesPaise).toBe(0);
+      expect(receipt.surchargeFees).toBe('0.00');
+      expect(receipt.collectedFeeIds).toEqual([]);
+      expect(receipt.paymentStatus).toBe('PAID');
+      expect(receipt.confirmedAt).toBe(confirmed.confirmedAt);
+      expect(receipt.paymentAllocations).toHaveLength(2);
+      expect(receipt.paymentAllocations[0].obligationType).toBe('RIDE_FARE');
+      expect(receipt.paymentAllocations[0].allocatedAmountPaise).toBe(3500);
+      expect(receipt.paymentAllocations[1].obligationType).toBe('WAITING_CHARGE');
+      expect(receipt.paymentAllocations[1].allocatedAmountPaise).toBe(500);
+    });
+
+    it('19. Accurately retrieves receipt including cancellation fee surcharge allocations', async () => {
+      const passenger = await createTestPassenger('r19');
+
+      // Create an outstanding fee for passenger
+      const prevBooking = await createTestBooking(passenger.id, 'CANCELLED');
+      const fee = await prisma.cancellationFee.create({
+        data: {
+          passengerId: passenger.id,
+          originalBookingId: prevBooking,
+          amountPaise: 3000,
+          status: 'OUTSTANDING',
+        },
+      });
+
+      const { trip, tripPassenger, driverUserId } =
+        await createTripWithPassenger({
+          passengerId: passenger.id,
+          finalRideFarePaise: 2500,
+          waitingChargePaise: 0,
+        });
+
+      // Confirm cash (₹25 + ₹30 = ₹55)
+      const confirmed = await paymentsService.confirmCash(driverUserId, {
+        tripId: trip.id,
+        tripPassengerId: tripPassenger.id,
+        amountCollectedPaise: 5500,
+      });
+
+      // Retrieve receipt
+      const receipt = await paymentsService.getCashReceipt(
+        driverUserId,
+        tripPassenger.id,
+      );
+
+      expect(receipt.collectionId).toBe(confirmed.collectionId);
+      expect(receipt.totalCashCollectedPaise).toBe(5500);
+      expect(receipt.totalCashCollected).toBe('55.00');
+      expect(receipt.rideFarePaise).toBe(2500);
+      expect(receipt.surchargeFeesPaise).toBe(3000);
+      expect(receipt.surchargeFees).toBe('30.00');
+      expect(receipt.collectedFeeIds).toContain(fee.id);
+      expect(receipt.paymentAllocations).toHaveLength(2);
+      const surchargeAlloc = receipt.paymentAllocations.find(
+        (a) => a.obligationType === 'CANCELLATION_FEE_SURCHARGE',
+      );
+      expect(surchargeAlloc?.allocatedAmountPaise).toBe(3000);
+      expect(surchargeAlloc?.obligationEntityId).toBe(fee.id);
+    });
+
+    it('20. Rejects access by another driver with 403 Forbidden', async () => {
+      const passenger = await createTestPassenger('r20');
+      const driverA = await createTestDriver('drva');
+      const driverB = await createTestDriver('drvb');
+
+      const { trip, tripPassenger } = await createTripWithPassenger({
+        driverProfileId: driverA.profile.id,
+        driverUserId: driverA.user.id,
+        passengerId: passenger.id,
+        finalRideFarePaise: 2500,
+      });
+
+      // Driver A confirms cash
+      await paymentsService.confirmCash(driverA.user.id, {
+        tripId: trip.id,
+        tripPassengerId: tripPassenger.id,
+        amountCollectedPaise: 2500,
+      });
+
+      // Driver B tries to retrieve Driver A's receipt
+      await expect(
+        paymentsService.getCashReceipt(driverB.user.id, tripPassenger.id),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'DRIVER_NOT_ASSIGNED_TO_TRIP' },
+        status: 403,
+      });
+    });
+
+    it('21. Rejects unapproved driver with 403 Forbidden', async () => {
+      const passenger = await createTestPassenger('r21');
+      const unapprovedDriver = await createTestDriver('unapp', 'PENDING');
+
+      const { tripPassenger } = await createTripWithPassenger({
+        passengerId: passenger.id,
+      });
+
+      await expect(
+        paymentsService.getCashReceipt(
+          unapprovedDriver.user.id,
+          tripPassenger.id,
+        ),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'DRIVER_NOT_APPROVED' },
+        status: 403,
+      });
+    });
+
+    it('22. Rejects nonexistent trip-passenger ID with 404 Not Found', async () => {
+      const driver = await createTestDriver('drvx');
+      const nonexistentId = crypto.randomUUID();
+
+      await expect(
+        paymentsService.getCashReceipt(driver.user.id, nonexistentId),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'TRIP_PASSENGER_NOT_FOUND' },
+        status: 404,
+      });
+    });
+
+    it('23. Returns 404 Not Found with CASH_NOT_YET_COLLECTED when collection not recorded', async () => {
+      const passenger = await createTestPassenger('r23');
+      const { tripPassenger, driverUserId } = await createTripWithPassenger({
+        passengerId: passenger.id,
+        finalRideFarePaise: 2500,
+        passengerStatus: 'COMPLETED',
+      });
+
+      // Cash has NOT been collected yet
+      await expect(
+        paymentsService.getCashReceipt(driverUserId, tripPassenger.id),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'CASH_NOT_YET_COLLECTED' },
+        status: 404,
+      });
+    });
+
+    it('24. Repeated retrieval returns the exact same receipt without creating duplicates or mutating state', async () => {
+      const passenger = await createTestPassenger('r24');
+      const { trip, tripPassenger, driverUserId } =
+        await createTripWithPassenger({
+          passengerId: passenger.id,
+          finalRideFarePaise: 3000,
+        });
+
+      await paymentsService.confirmCash(driverUserId, {
+        tripId: trip.id,
+        tripPassengerId: tripPassenger.id,
+        amountCollectedPaise: 3000,
+      });
+
+      const initialCollectionCount = await prisma.cashCollection.count({
+        where: { tripPassengerId: tripPassenger.id },
+      });
+      const initialAllocationCount = await prisma.paymentAllocation.count({
+        where: { cashCollection: { tripPassengerId: tripPassenger.id } },
+      });
+      expect(initialCollectionCount).toBe(1);
+
+      // Call 1
+      const receipt1 = await paymentsService.getCashReceipt(
+        driverUserId,
+        tripPassenger.id,
+      );
+      // Call 2
+      const receipt2 = await paymentsService.getCashReceipt(
+        driverUserId,
+        tripPassenger.id,
+      );
+
+      // Deeply identical
+      expect(receipt1).toEqual(receipt2);
+
+      // Zero mutations or duplicates in DB
+      const afterCollectionCount = await prisma.cashCollection.count({
+        where: { tripPassengerId: tripPassenger.id },
+      });
+      const afterAllocationCount = await prisma.paymentAllocation.count({
+        where: { cashCollection: { tripPassengerId: tripPassenger.id } },
+      });
+      expect(afterCollectionCount).toBe(initialCollectionCount);
+      expect(afterAllocationCount).toBe(initialAllocationCount);
+    });
+
+    it('25. Allows historical collecting driver to retrieve receipt even if activeDriverId subsequently changes', async () => {
+      const passenger = await createTestPassenger('r25');
+      const driverOriginal = await createTestDriver('drvo');
+      const driverReplacement = await createTestDriver('drvr');
+      const driverUnrelated = await createTestDriver('drvu');
+
+      const { trip, tripPassenger } = await createTripWithPassenger({
+        driverProfileId: driverOriginal.profile.id,
+        driverUserId: driverOriginal.user.id,
+        passengerId: passenger.id,
+        finalRideFarePaise: 2500,
+      });
+
+      // Original driver confirms cash collection
+      await paymentsService.confirmCash(driverOriginal.user.id, {
+        tripId: trip.id,
+        tripPassengerId: tripPassenger.id,
+        amountCollectedPaise: 2500,
+      });
+
+      // Active driver changes on the trip (e.g. Stage 9 replacement scenario)
+      await prisma.trip.update({
+        where: { id: trip.id },
+        data: { activeDriverId: driverReplacement.profile.id },
+      });
+
+      // 1. Original collecting driver CAN still retrieve the receipt
+      const originalDriverReceipt = await paymentsService.getCashReceipt(
+        driverOriginal.user.id,
+        tripPassenger.id,
+      );
+      expect(originalDriverReceipt.collectionId).toBeDefined();
+      expect(originalDriverReceipt.driverId).toBe(driverOriginal.profile.id);
+
+      // 2. The new active driver CAN also access the trip passenger receipt
+      const replacementDriverReceipt = await paymentsService.getCashReceipt(
+        driverReplacement.user.id,
+        tripPassenger.id,
+      );
+      expect(replacementDriverReceipt.collectionId).toBe(originalDriverReceipt.collectionId);
+
+      // 3. Completely unrelated driver is strictly rejected (403)
+      await expect(
+        paymentsService.getCashReceipt(driverUnrelated.user.id, tripPassenger.id),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'DRIVER_NOT_ASSIGNED_TO_TRIP' },
+        status: 403,
+      });
+    });
+
+    it('26. Rejects unrelated driver with 403 Forbidden even when cash is not yet collected (prevents info leakage)', async () => {
+      const passenger = await createTestPassenger('r26');
+      const driverAssigned = await createTestDriver('dasg');
+      const driverUnrelated = await createTestDriver('dunr');
+
+      const { tripPassenger } = await createTripWithPassenger({
+        driverProfileId: driverAssigned.profile.id,
+        driverUserId: driverAssigned.user.id,
+        passengerId: passenger.id,
+        finalRideFarePaise: 2500,
+        passengerStatus: 'COMPLETED',
+      });
+
+      // Cash NOT yet collected
+      // Assigned driver gets 404 CASH_NOT_YET_COLLECTED
+      await expect(
+        paymentsService.getCashReceipt(driverAssigned.user.id, tripPassenger.id),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'CASH_NOT_YET_COLLECTED' },
+        status: 404,
+      });
+
+      // Unrelated driver gets 403 DRIVER_NOT_ASSIGNED_TO_TRIP (cannot inspect another driver's trip status)
+      await expect(
+        paymentsService.getCashReceipt(driverUnrelated.user.id, tripPassenger.id),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'DRIVER_NOT_ASSIGNED_TO_TRIP' },
+        status: 403,
+      });
+    });
+  });
 });

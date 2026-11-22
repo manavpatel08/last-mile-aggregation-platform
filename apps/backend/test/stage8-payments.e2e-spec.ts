@@ -391,6 +391,15 @@ describe('Stage 8 Payments, Cancellations & Surcharge Ledger (e2e)', () => {
       expect(dbPassenger?.status).toBe('COMPLETED');
     });
 
+    it('Step 4b: Driver attempts to retrieve receipt before cash is collected -> 404 CASH_NOT_YET_COLLECTED', async () => {
+      const res = await request(app.getHttpServer())
+        .get(`/api/v1/payments/receipts/${tripPassengerId}`)
+        .set('Authorization', `Bearer ${driverToken}`)
+        .expect(404);
+
+      expect(res.body.errorCode).toBe('CASH_NOT_YET_COLLECTED');
+    });
+
     it('Step 5: Driver attempts invalid cash collection amount -> rejected 400', async () => {
       // Underpayment attempt: ₹25.00 instead of ₹55.00 (ignoring surcharge)
       const res = await request(app.getHttpServer())
@@ -484,6 +493,105 @@ describe('Stage 8 Payments, Cancellations & Surcharge Ledger (e2e)', () => {
         .expect(409);
 
       expect(secondRes.body.errorCode).toBe('CASH_ALREADY_COLLECTED');
+    });
+
+    it('Step 9: Authorized driver retrieves existing cash collection receipt via GET /api/v1/payments/receipts/:tripPassengerId -> 200 OK', async () => {
+      const res = await request(app.getHttpServer())
+        .get(`/api/v1/payments/receipts/${tripPassengerId}`)
+        .set('Authorization', `Bearer ${driverToken}`)
+        .expect(200);
+
+      expect(res.body.success).toBe(true);
+      expect(res.body.message).toBe('Cash collection receipt retrieved successfully');
+      const data = res.body.data;
+      expect(data.tripId).toBe(tripId);
+      expect(data.tripPassengerId).toBe(tripPassengerId);
+      expect(data.driverId).toBe(driverProfileId);
+      expect(data.totalCashCollectedPaise).toBe(5500);
+      expect(data.totalCashCollected).toBe('55.00');
+      expect(data.rideFarePaise).toBe(2500);
+      expect(data.rideFare).toBe('25.00');
+      expect(data.waitingChargePaise).toBe(0);
+      expect(data.waitingCharge).toBe('0.00');
+      expect(data.surchargeFeesPaise).toBe(3000);
+      expect(data.surchargeFees).toBe('30.00');
+      expect(data.collectedFeeIds).toContain(outstandingFeeId);
+      expect(data.paymentStatus).toBe('PAID');
+      expect(data.confirmedAt).toBeDefined();
+      expect(data.paymentAllocations).toHaveLength(2);
+    });
+
+    it('Step 10: Also accessible via GET /api/v1/payments/cash-receipts/:tripPassengerId alias -> 200 OK', async () => {
+      const res = await request(app.getHttpServer())
+        .get(`/api/v1/payments/cash-receipts/${tripPassengerId}`)
+        .set('Authorization', `Bearer ${driverToken}`)
+        .expect(200);
+
+      expect(res.body.success).toBe(true);
+      expect(res.body.data.tripPassengerId).toBe(tripPassengerId);
+    });
+
+    it('Step 11: Another driver attempting to retrieve receipt -> 403 Forbidden', async () => {
+      const otherSuffix = `${Date.now()}-other`;
+      const otherGoogleToken = `mock-google-id-token:sub-s8-drv-other:${otherSuffix}@pdeu.ac.in:Other Driver`;
+      const authRes = await request(app.getHttpServer())
+        .post('/api/v1/auth/google')
+        .send({ idToken: otherGoogleToken });
+      const otherToken = authRes.body.data.accessToken;
+      const otherUserId = authRes.body.data.user.id;
+      createdUserIds.push(otherUserId);
+
+      const onboardRes = await request(app.getHttpServer())
+        .post('/api/v1/drivers/onboard')
+        .set('Authorization', `Bearer ${otherToken}`)
+        .send({
+          licenseNumber: `DL-OTHER-${otherSuffix}`,
+          vehicle: {
+            registrationNumber: `GJ-18-OT-${Math.floor(1000 + Math.random() * 9000)}`,
+            vehicleType: 'E_RICKSHAW',
+            passengerCapacity: 4,
+            makeModel: 'Mahindra Treo Electric',
+          },
+        });
+      const otherProfileId = onboardRes.body.data.driverProfile.id;
+
+      await prisma.driverProfile.update({
+        where: { id: otherProfileId },
+        data: {
+          verificationStatus: 'APPROVED',
+          operationalStatus: 'AVAILABLE',
+          isOnline: true,
+        },
+      });
+
+      const res = await request(app.getHttpServer())
+        .get(`/api/v1/payments/receipts/${tripPassengerId}`)
+        .set('Authorization', `Bearer ${otherToken}`)
+        .expect(403);
+
+      expect(res.body.errorCode).toBe('DRIVER_NOT_ASSIGNED_TO_TRIP');
+    });
+
+    it('Step 12: Unauthenticated request -> 401 Unauthorized', async () => {
+      await request(app.getHttpServer())
+        .get(`/api/v1/payments/receipts/${tripPassengerId}`)
+        .expect(401);
+    });
+
+    it('Step 13: Nonexistent trip passenger -> 404 Not Found (TRIP_PASSENGER_NOT_FOUND)', async () => {
+      const res = await request(app.getHttpServer())
+        .get(`/api/v1/payments/receipts/${crypto.randomUUID()}`)
+        .set('Authorization', `Bearer ${driverToken}`)
+        .expect(404);
+
+      expect(res.body.errorCode).toBe('TRIP_PASSENGER_NOT_FOUND');
+    });
+
+    it('Step 14: Non-UUID trip passenger parameter -> 400 Bad Request', async () => {
+      await request(app.getHttpServer())
+        .get('/api/v1/payments/receipts/not-a-valid-uuid')
+        .set('Authorization', `Bearer ${driverToken}`)
+        .expect(400);
     });
   });
 

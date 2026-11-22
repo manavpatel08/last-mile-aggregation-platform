@@ -1,5 +1,6 @@
 import '../../../core/network/api_client.dart';
 import '../../../core/network/api_exception.dart';
+import '../models/cash_confirmation_model.dart';
 import '../models/passenger_boarding_pass.dart';
 import '../models/trip_detail_model.dart';
 import 'trip_repository.dart';
@@ -173,5 +174,34 @@ class ApiTripRepository implements TripRepository {
     }
 
     return CompleteTripResponse.fromJson(rawData);
+  }
+
+  @override
+  Future<CashConfirmationModel> confirmCash({
+    required String tripId,
+    required String tripPassengerId,
+    required int amountCollectedPaise,
+    required String idempotencyKey,
+  }) async {
+    final response = await apiClient.post<Map<String, dynamic>>(
+      _resolvePath('payments/confirm-cash'),
+      data: {
+        'tripId': tripId,
+        'tripPassengerId': tripPassengerId,
+        'amountCollectedPaise': amountCollectedPaise,
+      },
+      idempotencyKey: idempotencyKey,
+      requiresAuth: true,
+    );
+
+    final rawData = response.data?['data'];
+    if (rawData is! Map<String, dynamic>) {
+      throw const ApiException(
+        errorCode: 'INVALID_RESPONSE',
+        message: 'Invalid cash confirmation response structure from backend.',
+      );
+    }
+
+    return CashConfirmationModel.fromJson(rawData);
   }
 }

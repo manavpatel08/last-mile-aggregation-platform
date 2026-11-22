@@ -3,6 +3,7 @@ import 'package:uuid/uuid.dart';
 
 import '../../../core/network/api_exception.dart';
 import '../data/trip_repository.dart';
+import '../models/cash_confirmation_model.dart';
 import '../models/trip_detail_model.dart';
 
 /// State management provider for the driver active trip and passenger boarding screen.
@@ -19,10 +20,13 @@ class DriverActiveTripProvider extends ChangeNotifier {
   bool _isCompletingTrip = false;
   final Map<String, bool> _verifyingPassengers = {};
   final Map<String, bool> _completingPassengers = {};
+  final Map<String, bool> _confirmingCashPassengers = {};
   final Map<String, String?> _passengerErrors = {};
+  final Map<String, String?> _cashErrors = {};
   final Map<String, String> _idempotencyKeys = {};
   final Map<String, String> _lastAttemptedOtps = {};
   final Map<String, CompletePassengerResponse> _completedDropOffs = {};
+  final Map<String, CashConfirmationModel> _confirmedCashReceipts = {};
   String? _generalError;
   String? _generalSuccess;
   String? _currentTripId;
@@ -56,17 +60,42 @@ class DriverActiveTripProvider extends ChangeNotifier {
   bool isCompletingPassenger(String passengerId) =>
       _completingPassengers[passengerId] ?? false;
 
+  bool isConfirmingCash(String passengerId) =>
+      _confirmingCashPassengers[passengerId] ?? false;
+
   String? errorForPassenger(String passengerId) =>
       _passengerErrors[passengerId];
 
+  String? cashError(String passengerId) => _cashErrors[passengerId];
+
   CompletePassengerResponse? dropOffResult(String passengerId) =>
       _completedDropOffs[passengerId];
+
+  CashConfirmationModel? cashReceipt(String passengerId) =>
+      _confirmedCashReceipts[passengerId];
+
+  bool isCashCollected(String passengerId) =>
+      _confirmedCashReceipts.containsKey(passengerId);
 
   @visibleForTesting
   String? getIdempotencyKeyForPassenger(String passengerId) {
     final tripId = _currentTripId ?? _trip?.tripId;
     if (tripId == null) return null;
     return _idempotencyKeys['verify_${tripId}_$passengerId'];
+  }
+
+  @visibleForTesting
+  String? getCashIdempotencyKeyForPassenger(String passengerId) {
+    final tripId = _currentTripId ?? _trip?.tripId;
+    if (tripId == null) return null;
+    TripPassengerModel? passenger;
+    try {
+      passenger = _trip?.passengers.firstWhere(
+        (p) => p.passengerId == passengerId || p.id == passengerId,
+      );
+    } catch (_) {}
+    final tpId = passenger?.id ?? passengerId;
+    return _idempotencyKeys['confirm_cash_${tripId}_$tpId'];
   }
 
   void setRepository(TripRepository repository) {
@@ -259,6 +288,7 @@ class DriverActiveTripProvider extends ChangeNotifier {
 
   void clearPassengerError(String passengerId) {
     _passengerErrors.remove(passengerId);
+    _cashErrors.remove(passengerId);
     notifyListeners();
   }
 
@@ -386,6 +416,105 @@ class DriverActiveTripProvider extends ChangeNotifier {
     }
   }
 
+  /// Confirms physical cash collection for a completed passenger (`POST /api/v1/payments/confirm-cash`).
+  Future<bool> confirmCashCollection({
+    required String passengerId,
+    TripRepository? repository,
+  }) async {
+    final repo = repository ?? _repository;
+    final tripId = _currentTripId ?? _trip?.tripId;
+
+    if (repo == null || tripId == null) {
+      _cashErrors[passengerId] = 'Trip details not initialized.';
+      notifyListeners();
+      return false;
+    }
+
+    // Duplicate submission prevention
+    if (_confirmingCashPassengers[passengerId] == true) return false;
+    if (_confirmedCashReceipts.containsKey(passengerId)) return false;
+
+    // Verify passenger journey is completed
+    TripPassengerModel? passenger;
+    try {
+      passenger = _trip?.passengers.firstWhere(
+        (p) => p.passengerId == passengerId || p.id == passengerId,
+      );
+    } catch (_) {}
+
+    if (passenger == null || !passenger.isCompleted) {
+      _cashErrors[passengerId] =
+          'Cash collection is only permitted after drop-off completion.';
+      notifyListeners();
+      return false;
+    }
+
+    // Authoritative amount from existing drop-off response
+    final dropOff = _completedDropOffs[passengerId] ??
+        _completedDropOffs[passenger.passengerId] ??
+        _completedDropOffs[passenger.id];
+
+    if (dropOff == null) {
+      _cashErrors[passengerId] =
+          'Authoritative drop-off fare breakdown not found.';
+      notifyListeners();
+      return false;
+    }
+
+    final amountCollectedPaise = dropOff.totalCashToCollectPaise;
+    final tripPassengerId = passenger.id;
+
+    _confirmingCashPassengers[passengerId] = true;
+    _cashErrors[passengerId] = null;
+    _generalSuccess = null;
+    notifyListeners();
+
+    final keyIdentifier = 'confirm_cash_${tripId}_$tripPassengerId';
+    final idempotencyKey = _idempotencyKeys.putIfAbsent(
+      keyIdentifier,
+      () => const Uuid().v4(),
+    );
+
+    try {
+      final receipt = await repo.confirmCash(
+        tripId: tripId,
+        tripPassengerId: tripPassengerId,
+        amountCollectedPaise: amountCollectedPaise,
+        idempotencyKey: idempotencyKey,
+      );
+
+      _confirmedCashReceipts[passengerId] = receipt;
+      if (passenger.passengerId != passengerId) {
+        _confirmedCashReceipts[passenger.passengerId] = receipt;
+      }
+      if (passenger.id != passengerId) {
+        _confirmedCashReceipts[passenger.id] = receipt;
+      }
+
+      _cashErrors[passengerId] = null;
+      _generalSuccess = 'Cash payment confirmed and receipt generated!';
+      _idempotencyKeys.remove(keyIdentifier);
+      return true;
+    } on ApiException catch (e) {
+      _cashErrors[passengerId] = e.message;
+      if (e.errorCode == 'CASH_ALREADY_COLLECTED') {
+        _idempotencyKeys.remove(keyIdentifier);
+      } else if (!e.isTransient) {
+        _idempotencyKeys.remove(keyIdentifier);
+      }
+      // If e.isTransient, key is retained so safe retry reuses the key
+      return false;
+    } catch (e) {
+      // Ambiguous transport error: retain key for safe retry
+      _cashErrors[passengerId] =
+          'Network error during cash confirmation. Please retry.';
+      return false;
+    } finally {
+      _confirmingCashPassengers[passengerId] = false;
+      notifyListeners();
+    }
+  }
+
   /// Finalizes the overall vehicle trip (`POST /api/v1/trips/:id/complete`).
   Future<bool> completeTrip({TripRepository? repository}) async {
     final repo = repository ?? _repository;
@@ -453,8 +582,11 @@ class DriverActiveTripProvider extends ChangeNotifier {
     _isCompletingTrip = false;
     _verifyingPassengers.clear();
     _completingPassengers.clear();
+    _confirmingCashPassengers.clear();
     _passengerErrors.clear();
+    _cashErrors.clear();
     _completedDropOffs.clear();
+    _confirmedCashReceipts.clear();
     _idempotencyKeys.clear();
     _lastAttemptedOtps.clear();
     _generalError = null;

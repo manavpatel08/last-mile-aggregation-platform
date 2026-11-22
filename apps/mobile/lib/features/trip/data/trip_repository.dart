@@ -1,3 +1,4 @@
+import '../models/cash_confirmation_model.dart';
 import '../models/passenger_boarding_pass.dart';
 import '../models/trip_detail_model.dart';
 
@@ -40,6 +41,14 @@ abstract class TripRepository {
   /// Finalizes the overall vehicle trip after all drop-offs (`POST /api/v1/trips/:id/complete`).
   Future<CompleteTripResponse> completeTrip({
     required String tripId,
+    required String idempotencyKey,
+  });
+
+  /// Confirms physical cash collection upon passenger drop-off (`POST /api/v1/payments/confirm-cash`).
+  Future<CashConfirmationModel> confirmCash({
+    required String tripId,
+    required String tripPassengerId,
+    required int amountCollectedPaise,
     required String idempotencyKey,
   });
 }

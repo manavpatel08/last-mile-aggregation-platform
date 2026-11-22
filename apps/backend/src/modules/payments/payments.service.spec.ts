@@ -1086,13 +1086,10 @@ describe('Stage 8 — Phase 4: Cash Confirmation & Payment Allocation Ledger', (
       // Driver B tries to retrieve Driver A's receipt
       await expect(
         paymentsService.getCashReceipt(driverB.user.id, tripPassenger.id),
-      ).rejects.toThrow(ForbiddenException);
-
-      try {
-        await paymentsService.getCashReceipt(driverB.user.id, tripPassenger.id);
-      } catch (err: any) {
-        expect(err.response?.errorCode).toBe('DRIVER_NOT_ASSIGNED_TO_TRIP');
-      }
+      ).rejects.toMatchObject({
+        response: { errorCode: 'DRIVER_NOT_ASSIGNED_TO_TRIP' },
+        status: 403,
+      });
     });
 
     it('21. Rejects unapproved driver with 403 Forbidden', async () => {
@@ -1108,16 +1105,10 @@ describe('Stage 8 — Phase 4: Cash Confirmation & Payment Allocation Ledger', (
           unapprovedDriver.user.id,
           tripPassenger.id,
         ),
-      ).rejects.toThrow(ForbiddenException);
-
-      try {
-        await paymentsService.getCashReceipt(
-          unapprovedDriver.user.id,
-          tripPassenger.id,
-        );
-      } catch (err: any) {
-        expect(err.response?.errorCode).toBe('DRIVER_NOT_APPROVED');
-      }
+      ).rejects.toMatchObject({
+        response: { errorCode: 'DRIVER_NOT_APPROVED' },
+        status: 403,
+      });
     });
 
     it('22. Rejects nonexistent trip-passenger ID with 404 Not Found', async () => {
@@ -1126,13 +1117,10 @@ describe('Stage 8 — Phase 4: Cash Confirmation & Payment Allocation Ledger', (
 
       await expect(
         paymentsService.getCashReceipt(driver.user.id, nonexistentId),
-      ).rejects.toThrow(NotFoundException);
-
-      try {
-        await paymentsService.getCashReceipt(driver.user.id, nonexistentId);
-      } catch (err: any) {
-        expect(err.response?.errorCode).toBe('TRIP_PASSENGER_NOT_FOUND');
-      }
+      ).rejects.toMatchObject({
+        response: { errorCode: 'TRIP_PASSENGER_NOT_FOUND' },
+        status: 404,
+      });
     });
 
     it('23. Returns 404 Not Found with CASH_NOT_YET_COLLECTED when collection not recorded', async () => {
@@ -1146,13 +1134,10 @@ describe('Stage 8 — Phase 4: Cash Confirmation & Payment Allocation Ledger', (
       // Cash has NOT been collected yet
       await expect(
         paymentsService.getCashReceipt(driverUserId, tripPassenger.id),
-      ).rejects.toThrow(NotFoundException);
-
-      try {
-        await paymentsService.getCashReceipt(driverUserId, tripPassenger.id);
-      } catch (err: any) {
-        expect(err.response?.errorCode).toBe('CASH_NOT_YET_COLLECTED');
-      }
+      ).rejects.toMatchObject({
+        response: { errorCode: 'CASH_NOT_YET_COLLECTED' },
+        status: 404,
+      });
     });
 
     it('24. Repeated retrieval returns the exact same receipt without creating duplicates or mutating state', async () => {
@@ -1246,13 +1231,10 @@ describe('Stage 8 — Phase 4: Cash Confirmation & Payment Allocation Ledger', (
       // 3. Completely unrelated driver is strictly rejected (403)
       await expect(
         paymentsService.getCashReceipt(driverUnrelated.user.id, tripPassenger.id),
-      ).rejects.toThrow(ForbiddenException);
-
-      try {
-        await paymentsService.getCashReceipt(driverUnrelated.user.id, tripPassenger.id);
-      } catch (err: any) {
-        expect(err.response?.errorCode).toBe('DRIVER_NOT_ASSIGNED_TO_TRIP');
-      }
+      ).rejects.toMatchObject({
+        response: { errorCode: 'DRIVER_NOT_ASSIGNED_TO_TRIP' },
+        status: 403,
+      });
     });
 
     it('26. Rejects unrelated driver with 403 Forbidden even when cash is not yet collected (prevents info leakage)', async () => {
@@ -1270,20 +1252,20 @@ describe('Stage 8 — Phase 4: Cash Confirmation & Payment Allocation Ledger', (
 
       // Cash NOT yet collected
       // Assigned driver gets 404 CASH_NOT_YET_COLLECTED
-      try {
-        await paymentsService.getCashReceipt(driverAssigned.user.id, tripPassenger.id);
-      } catch (err: any) {
-        expect(err).toBeInstanceOf(NotFoundException);
-        expect(err.response?.errorCode).toBe('CASH_NOT_YET_COLLECTED');
-      }
+      await expect(
+        paymentsService.getCashReceipt(driverAssigned.user.id, tripPassenger.id),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'CASH_NOT_YET_COLLECTED' },
+        status: 404,
+      });
 
       // Unrelated driver gets 403 DRIVER_NOT_ASSIGNED_TO_TRIP (cannot inspect another driver's trip status)
-      try {
-        await paymentsService.getCashReceipt(driverUnrelated.user.id, tripPassenger.id);
-      } catch (err: any) {
-        expect(err).toBeInstanceOf(ForbiddenException);
-        expect(err.response?.errorCode).toBe('DRIVER_NOT_ASSIGNED_TO_TRIP');
-      }
+      await expect(
+        paymentsService.getCashReceipt(driverUnrelated.user.id, tripPassenger.id),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'DRIVER_NOT_ASSIGNED_TO_TRIP' },
+        status: 403,
+      });
     });
   });
 });

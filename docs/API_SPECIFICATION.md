@@ -609,7 +609,7 @@ Idempotency-Key: <unique-uuid-or-client-nonce>
 
 #### 19.2 Retrieve Cash Collection Receipt
 - **Method & Path:** `GET /api/v1/payments/receipts/:tripPassengerId` (Alias: `GET /api/v1/payments/cash-receipts/:tripPassengerId`)
-- **Auth:** Bearer Token (Assigned Driver, requires `verification_status = 'APPROVED'`)
+- **Auth:** Bearer Token (Approved Driver: either the currently assigned driver of the trip or the historical driver recorded on the cash collection; requires `verification_status = 'APPROVED'`)
 - **Path Parameters:**
   - `tripPassengerId` (UUID, required): The UUID of the completed passenger journey (`trip_passengers.id`).
 - **Success Response (200 OK):**
@@ -667,11 +667,18 @@ Idempotency-Key: <unique-uuid-or-client-nonce>
   - `403 Forbidden`:
     - `DRIVER_PROFILE_NOT_FOUND`: Caller has no driver profile.
     - `DRIVER_NOT_APPROVED`: Driver profile verification status is not `APPROVED`.
-    - `DRIVER_NOT_ASSIGNED_TO_TRIP`: Calling driver is not the authorized driver assigned to this trip/passenger journey.
+    - `DRIVER_NOT_ASSIGNED_TO_TRIP`: Calling driver is neither the currently assigned driver of the trip (`trips.active_driver_id`) nor the historical driver who collected the cash (`cash_collections.driver_id`).
   - `404 Not Found`:
     - `TRIP_PASSENGER_NOT_FOUND`: No passenger journey exists with the given `tripPassengerId`.
 - **Behavior & Guarantees:**
   - Strictly read-only: does not create, update, or mutate any payments, allocations, cancellation fees, or outbox events.
+  - Dual driver authorization:
+    - Receipt retrieval is allowed strictly to:
+      1. The currently assigned driver of the trip (`trips.active_driver_id`).
+      2. The historical driver recorded as the cash collection's `driver_id` (`cash_collections.driver_id`).
+    - When an active driver is replaced or reassigned (e.g. Stage 9 replacement dispatch scenario), the original driver who collected the cash retains access to their receipt, while the replacement driver actively assigned to the trip can also inspect the trip passenger receipt.
+    - All other drivers receive `403 DRIVER_NOT_ASSIGNED_TO_TRIP`.
+  - Information leakage prevention: Driver authorization checks are enforced before collection existence checks. If an unrelated driver attempts to query a passenger journey where cash has not yet been collected, the endpoint returns `403 DRIVER_NOT_ASSIGNED_TO_TRIP` (never `404 CASH_NOT_YET_COLLECTED`), preventing unauthorized drivers from probing another driver's trip payment progress.
   - Returns the original persisted receipt from PostgreSQL (`cash_collections` and `payment_allocations`), never recalculating or fabricating payment amounts.
   - Repeated retrievals return the identical receipt deterministically.
 

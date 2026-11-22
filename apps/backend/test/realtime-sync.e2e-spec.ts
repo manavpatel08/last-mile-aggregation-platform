@@ -222,6 +222,45 @@ describe('Realtime Socket Gateway & Sync API (E2E)', () => {
       expect(errorAck.code).toBe('UNAUTHORIZED');
       expect(errorAck.message).toContain('Valid socket ticket UUID required');
     });
+
+    it('rejects connection when authoritative user is deactivated in PostgreSQL', async () => {
+      // 1. Get passenger ticket
+      const ticketRes = await request(app.getHttpServer())
+        .get('/api/v1/auth/socket-ticket')
+        .set('Authorization', `Bearer ${passengerToken}`)
+        .expect(200);
+
+      const ticket = ticketRes.body.data.ticket;
+
+      // 2. Temporarily deactivate passenger in PostgreSQL
+      await prisma.user.update({
+        where: { id: passengerUserId },
+        data: { isActive: false },
+      });
+
+      // 3. Connect client socket
+      const client = io(`http://127.0.0.1:${serverPort}/realtime`, {
+        forceNew: true,
+        auth: { ticket },
+        transports: ['websocket'],
+        reconnection: false,
+      });
+      activeSockets.push(client);
+
+      const errorPromise = new Promise<{ code: string; message: string }>((resolve) => {
+        client.on('error', (err) => resolve(err));
+      });
+
+      const errorAck = await errorPromise;
+      expect(errorAck.code).toBe('UNAUTHORIZED');
+      expect(errorAck.message).toContain('deactivated or suspended');
+
+      // 4. Restore user active status
+      await prisma.user.update({
+        where: { id: passengerUserId },
+        data: { isActive: true },
+      });
+    });
   });
 
   describe('2. Driver GPS Telemetry Stream & Broadcast', () => {

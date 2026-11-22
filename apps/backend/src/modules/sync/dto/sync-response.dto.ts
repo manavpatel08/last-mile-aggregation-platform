@@ -8,11 +8,13 @@ export interface SyncPassengerState {
     fareQuotePaise: number;
     createdAt: string;
     updatedAt: string;
+    /** Group version when booking is member of active ride group; 1 if unmatched */
     entityVersion: number;
   } | null;
   activeGroup: {
     id: string;
     status: string;
+    /** Authoritative PostgreSQL ride_groups.group_version */
     groupVersion: number;
     pickupPointId: string;
     memberCount: number;
@@ -20,6 +22,7 @@ export interface SyncPassengerState {
   activeTrip: {
     id: string;
     status: string;
+    /** Authoritative PostgreSQL ride_groups.group_version for the trip */
     tripVersion: number;
     activeDriverId: string;
     driverName?: string | null;

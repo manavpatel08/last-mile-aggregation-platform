@@ -275,7 +275,7 @@ describe('RealtimeService (Unit Tests)', () => {
       expect(result.broadcastData.heading).toBe(90);
     });
 
-    it('persists durable PostGIS snapshot when driver is operating an active trip and throttle expires', async () => {
+    it('persists durable PostGIS snapshot when driver is operating an active trip and atomic SET EX 15 NX succeeds', async () => {
       const activeTripId = 'trip-active-1';
       prismaMock.driverProfile.findUnique.mockResolvedValueOnce({
         id: driverId,
@@ -284,8 +284,8 @@ describe('RealtimeService (Unit Tests)', () => {
         isOnline: true,
       });
       prismaMock.trip.findFirst.mockResolvedValueOnce({ id: activeTripId });
-      // Throttle key not set yet
-      redisMock.get.mockResolvedValueOnce(null);
+      // Atomic SET EX 15 NX succeeds
+      redisMock.set.mockResolvedValueOnce('OK');
 
       const result = await service.ingestDriverLocation(userId, {
         latitude: 23.185,
@@ -294,8 +294,55 @@ describe('RealtimeService (Unit Tests)', () => {
       });
 
       expect(result.activeTripId).toBe(activeTripId);
-      expect(redisMock.set).toHaveBeenCalledWith(`throttle:trip_gps:${activeTripId}`, '1', 'EX', 15);
+      expect(redisMock.set).toHaveBeenCalledWith(`throttle:trip_gps:${activeTripId}`, '1', 'EX', 15, 'NX');
       expect(prismaMock.$executeRaw).toHaveBeenCalled();
+    });
+
+    it('skips durable PostGIS snapshot when atomic SET EX 15 NX returns null (already throttled)', async () => {
+      const activeTripId = 'trip-active-2';
+      prismaMock.driverProfile.findUnique.mockResolvedValueOnce({
+        id: driverId,
+        verificationStatus: 'APPROVED',
+        operationalStatus: 'ONLINE',
+        isOnline: true,
+      });
+      prismaMock.trip.findFirst.mockResolvedValueOnce({ id: activeTripId });
+      // GPS key succeeds ('OK'), throttle key already held (returns null)
+      redisMock.set.mockResolvedValueOnce('OK').mockResolvedValueOnce(null);
+
+      const result = await service.ingestDriverLocation(userId, {
+        latitude: 23.185,
+        longitude: 72.635,
+        tripId: activeTripId,
+      });
+
+      expect(result.activeTripId).toBe(activeTripId);
+      expect(redisMock.set).toHaveBeenCalledWith(`throttle:trip_gps:${activeTripId}`, '1', 'EX', 15, 'NX');
+      expect(prismaMock.$executeRaw).not.toHaveBeenCalled();
+    });
+
+    it('does not corrupt or fail GPS ingestion when Redis throws during snapshot throttling', async () => {
+      const activeTripId = 'trip-active-3';
+      prismaMock.driverProfile.findUnique.mockResolvedValueOnce({
+        id: driverId,
+        verificationStatus: 'APPROVED',
+        operationalStatus: 'ONLINE',
+        isOnline: true,
+      });
+      prismaMock.trip.findFirst.mockResolvedValueOnce({ id: activeTripId });
+      // First call is for driver GPS cache, second call is for throttle key
+      redisMock.set
+        .mockResolvedValueOnce('OK') // GPS key set
+        .mockRejectedValueOnce(new Error('Redis connection timeout')); // Throttle key error
+
+      const result = await service.ingestDriverLocation(userId, {
+        latitude: 23.185,
+        longitude: 72.635,
+        tripId: activeTripId,
+      });
+
+      expect(result.broadcastData.driverId).toBe(driverId);
+      expect(result.broadcastData.latitude).toBe(23.185);
     });
   });
 

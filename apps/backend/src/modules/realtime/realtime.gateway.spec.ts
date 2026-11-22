@@ -13,6 +13,16 @@ describe('RealtimeGateway (Unit Tests)', () => {
 
   beforeEach(() => {
     prismaMock = {
+      user: {
+        findUnique: vi.fn().mockImplementation(({ where }) => {
+          return Promise.resolve({
+            id: where.id,
+            isActive: true,
+            role: 'PASSENGER',
+            roles: [{ roleName: 'PASSENGER' }],
+          });
+        }),
+      },
       driverProfile: {
         findUnique: vi.fn(),
       },
@@ -215,6 +225,12 @@ describe('RealtimeGateway (Unit Tests)', () => {
           sessionId: 'active-session-id',
         }),
       );
+      prismaMock.user.findUnique.mockResolvedValueOnce({
+        id: 'user-driv-1',
+        isActive: true,
+        role: 'DRIVER',
+        roles: [{ roleName: 'DRIVER' }],
+      });
       prismaMock.driverProfile.findUnique.mockResolvedValueOnce({
         id: 'driver-profile-1',
         verificationStatus: 'APPROVED',
@@ -248,6 +264,12 @@ describe('RealtimeGateway (Unit Tests)', () => {
           sessionId: 'active-session-id',
         }),
       );
+      prismaMock.user.findUnique.mockResolvedValueOnce({
+        id: 'user-admin-1',
+        isActive: true,
+        role: 'ADMIN',
+        roles: [{ roleName: 'ADMIN' }],
+      });
 
       await gateway.handleConnection(socketMock);
 
@@ -258,6 +280,94 @@ describe('RealtimeGateway (Unit Tests)', () => {
         authenticated: true,
         rooms: expect.arrayContaining(['user:user-admin-1', 'admin']),
       });
+    });
+
+    it('rejects connection if user does not exist in PostgreSQL', async () => {
+      const ticket = 'a0000000-0000-4000-8000-000000000005';
+      const socketMock: any = {
+        id: 'sock-missing-user',
+        handshake: { auth: { ticket } },
+        emit: vi.fn(),
+        disconnect: vi.fn(),
+      };
+      redisMock.getdel.mockResolvedValueOnce(
+        JSON.stringify({
+          userId: 'user-missing',
+          role: 'PASSENGER',
+          sessionId: 'active-session-id',
+        }),
+      );
+      prismaMock.user.findUnique.mockResolvedValueOnce(null);
+
+      await gateway.handleConnection(socketMock);
+
+      expect(socketMock.emit).toHaveBeenCalledWith('error', {
+        code: 'UNAUTHORIZED',
+        message: 'User account not found',
+      });
+      expect(socketMock.disconnect).toHaveBeenCalledWith(true);
+    });
+
+    it('rejects connection if user account is deactivated / inactive in PostgreSQL', async () => {
+      const ticket = 'a0000000-0000-4000-8000-000000000006';
+      const socketMock: any = {
+        id: 'sock-inactive-user',
+        handshake: { auth: { ticket } },
+        emit: vi.fn(),
+        disconnect: vi.fn(),
+      };
+      redisMock.getdel.mockResolvedValueOnce(
+        JSON.stringify({
+          userId: 'user-inactive',
+          role: 'PASSENGER',
+          sessionId: 'active-session-id',
+        }),
+      );
+      prismaMock.user.findUnique.mockResolvedValueOnce({
+        id: 'user-inactive',
+        isActive: false,
+        role: 'PASSENGER',
+        roles: [{ roleName: 'PASSENGER' }],
+      });
+
+      await gateway.handleConnection(socketMock);
+
+      expect(socketMock.emit).toHaveBeenCalledWith('error', {
+        code: 'UNAUTHORIZED',
+        message: 'User account is deactivated or suspended',
+      });
+      expect(socketMock.disconnect).toHaveBeenCalledWith(true);
+    });
+
+    it('rejects connection if ticket role does not match authoritative database account roles', async () => {
+      const ticket = 'a0000000-0000-4000-8000-000000000007';
+      const socketMock: any = {
+        id: 'sock-role-mismatch',
+        handshake: { auth: { ticket } },
+        emit: vi.fn(),
+        disconnect: vi.fn(),
+      };
+      redisMock.getdel.mockResolvedValueOnce(
+        JSON.stringify({
+          userId: 'user-mismatch',
+          role: 'DRIVER', // Ticket claims driver
+          sessionId: 'active-session-id',
+        }),
+      );
+      prismaMock.user.findUnique.mockResolvedValueOnce({
+        id: 'user-mismatch',
+        isActive: true,
+        role: 'PASSENGER', // Database only has passenger
+        roles: [{ roleName: 'PASSENGER' }],
+      });
+
+      await gateway.handleConnection(socketMock);
+
+      expect(socketMock.emit).toHaveBeenCalledWith('error', {
+        code: 'UNAUTHORIZED',
+        message: 'User role mismatch with authoritative database account',
+      });
+      expect(socketMock.disconnect).toHaveBeenCalledWith(true);
     });
   });
 

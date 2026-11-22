@@ -258,16 +258,14 @@ export class RealtimeService {
     // 5. Store in Redis with strict 30s TTL
     await redis.set(redisGpsKey, JSON.stringify(gpsRecord), 'EX', 30);
 
-    // 6. Throttled Durable PostgreSQL Snapshot (Every 15–30s during active trip)
+    // 6. Throttled Durable PostgreSQL Snapshot (Every 15s during active trip)
     if (activeTripId) {
       const throttleKey = `throttle:trip_gps:${activeTripId}`;
       try {
-        const hasThrottle = await redis.get(throttleKey);
-        if (!hasThrottle) {
-          // Set 15s throttle lease
-          await redis.set(throttleKey, '1', 'EX', 15);
-
-          // Update PostgreSQL trips.current_vehicle_location using PostGIS ST_SetSRID
+        // Atomic acquisition of 15s persistence throttle lease using SET ... EX 15 NX
+        const acquired = await redis.set(throttleKey, '1', 'EX', 15, 'NX');
+        if (acquired === 'OK') {
+          // Persist durable location snapshot to PostgreSQL PostGIS column
           await this.prisma.$executeRaw`
             UPDATE trips
             SET current_vehicle_location = ST_SetSRID(ST_MakePoint(${longitude}, ${latitude}), 4326),
@@ -277,6 +275,7 @@ export class RealtimeService {
           this.logger.debug(`Durable PostGIS location snapshot persisted for trip ${activeTripId}`);
         }
       } catch (err: any) {
+        // Redis or DB snapshot errors must never crash or corrupt GPS ingestion behavior
         this.logger.warn(`Failed to persist PostGIS snapshot for trip ${activeTripId}: ${err?.message}`);
       }
     }
@@ -365,7 +364,7 @@ export class RealtimeService {
       ? outboxEvent.createdAt.toISOString()
       : new Date().toISOString();
 
-    const version = p?.groupVersion ?? p?.attemptNumber ?? p?.entityVersion ?? 1;
+    const version = p?.groupVersion ?? p?.attemptNumber ?? p?.versionNumber ?? p?.entityVersion ?? 1;
 
     switch (eventType) {
       // 1. Booking Events

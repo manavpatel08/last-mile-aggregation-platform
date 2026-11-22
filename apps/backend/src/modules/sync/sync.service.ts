@@ -36,17 +36,23 @@ export class SyncService {
     if (role === 'PASSENGER' || role === 'ADMIN') {
       passengerState = await this.buildPassengerState(userId);
 
-      // Check if client version is out of sync or entities diverged
+      // Authoritative ID-based reconciliation for MVP
       if (dto.activeBookingId && (!passengerState.activeBooking || passengerState.activeBooking.id !== dto.activeBookingId)) {
         reconciled = true;
       }
-      if (passengerState.activeBooking && dto.lastKnownEntityVersion !== undefined) {
-        if (dto.lastKnownEntityVersion !== passengerState.activeBooking.entityVersion) {
-          reconciled = true;
-        }
-      }
       if (dto.activeTripId && (!passengerState.activeTrip || passengerState.activeTrip.id !== dto.activeTripId)) {
         reconciled = true;
+      }
+
+      // Version-based reconciliation against reliable database-backed groupVersion
+      if (dto.lastKnownEntityVersion !== undefined) {
+        if (passengerState.activeGroup && dto.lastKnownEntityVersion !== passengerState.activeGroup.groupVersion) {
+          reconciled = true;
+        } else if (passengerState.activeTrip && dto.lastKnownEntityVersion !== passengerState.activeTrip.tripVersion) {
+          reconciled = true;
+        } else if (passengerState.activeBooking && dto.lastKnownEntityVersion !== passengerState.activeBooking.entityVersion) {
+          reconciled = true;
+        }
       }
     }
 
@@ -54,11 +60,16 @@ export class SyncService {
     if (role === 'DRIVER' || role === 'ADMIN') {
       driverState = await this.buildDriverState(userId);
 
+      // Authoritative ID-based reconciliation for MVP
       if (dto.activeTripId && (!driverState.activeTrip || driverState.activeTrip.id !== dto.activeTripId)) {
         reconciled = true;
       }
-      if (driverState.activeTrip && dto.lastKnownEntityVersion !== undefined) {
-        if (dto.lastKnownEntityVersion !== driverState.activeTrip.tripVersion) {
+
+      // Version-based reconciliation against reliable database-backed trip/offer groupVersion
+      if (dto.lastKnownEntityVersion !== undefined) {
+        if (driverState.activeTrip && dto.lastKnownEntityVersion !== driverState.activeTrip.tripVersion) {
+          reconciled = true;
+        } else if (driverState.activeOffer && dto.lastKnownEntityVersion !== driverState.activeOffer.groupVersion) {
           reconciled = true;
         }
       }
@@ -131,6 +142,7 @@ export class SyncService {
         include: {
           trip: {
             include: {
+              rideGroup: { select: { groupVersion: true } },
               activeDriver: {
                 include: {
                   user: { select: { fullName: true } },
@@ -158,7 +170,7 @@ export class SyncService {
         activeTrip = {
           id: trip.id,
           status: trip.status,
-          tripVersion: 1, // Default or computed version
+          tripVersion: trip.rideGroup?.groupVersion ?? 1,
           activeDriverId: trip.activeDriverId,
           driverName: trip.activeDriver?.user?.fullName ?? null,
           vehicleNumber: trip.activeDriver?.vehicles?.[0]?.registrationNumber ?? null,
@@ -195,7 +207,7 @@ export class SyncService {
             fareQuotePaise: activeBooking.agreedFareCeilingPaise,
             createdAt: activeBooking.createdAt.toISOString(),
             updatedAt: activeBooking.updatedAt.toISOString(),
-            entityVersion: 1,
+            entityVersion: activeGroup?.groupVersion ?? 1,
           }
         : null,
       activeGroup,
@@ -256,6 +268,7 @@ export class SyncService {
         status: { in: ['CREATED', 'DRIVER_ARRIVED', 'IN_PROGRESS', 'INTERRUPTED'] },
       },
       include: {
+        rideGroup: { select: { groupVersion: true } },
         passengers: {
           select: {
             passengerId: true,
@@ -286,7 +299,7 @@ export class SyncService {
         ? {
             id: activeTrip.id,
             status: activeTrip.status,
-            tripVersion: 1,
+            tripVersion: activeTrip.rideGroup?.groupVersion ?? 1,
             rideGroupId: activeTrip.rideGroupId,
             currentStopOrder: activeTrip.currentStopOrder,
             passengerManifest: activeTrip.passengers.map((p) => ({

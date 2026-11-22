@@ -96,6 +96,7 @@ describe('SyncService (Unit Tests)', () => {
           activeDriverId: driverId,
           currentStopOrder: 2,
           updatedAt: now,
+          rideGroup: { groupVersion: 2 },
           activeDriver: {
             user: { fullName: 'Ramesh Patel' },
             vehicles: [{ registrationNumber: 'GJ-01-AB-1234' }],
@@ -115,15 +116,18 @@ describe('SyncService (Unit Tests)', () => {
       const sync = await service.reconcileState(passengerUserId, 'PASSENGER', {
         activeBookingId: bookingId,
         activeTripId: tripId,
-        lastKnownEntityVersion: 1,
+        lastKnownEntityVersion: 2,
       });
 
       expect(sync.success).toBe(true);
       expect(sync.reconciled).toBe(false);
       expect(sync.passengerState?.activeBooking?.id).toBe(bookingId);
+      expect(sync.passengerState?.activeBooking?.entityVersion).toBe(2);
       expect(sync.passengerState?.activeGroup?.id).toBe(groupId);
+      expect(sync.passengerState?.activeGroup?.groupVersion).toBe(2);
       expect(sync.passengerState?.activeGroup?.memberCount).toBe(2);
       expect(sync.passengerState?.activeTrip?.id).toBe(tripId);
+      expect(sync.passengerState?.activeTrip?.tripVersion).toBe(2);
       expect(sync.passengerState?.activeTrip?.driverName).toBe('Ramesh Patel');
       expect(sync.passengerState?.activeTrip?.vehicleNumber).toBe('GJ-01-AB-1234');
       expect(sync.passengerState?.activeTrip?.driverLocation?.latitude).toBe(23.185);
@@ -218,6 +222,7 @@ describe('SyncService (Unit Tests)', () => {
         status: 'DRIVER_ARRIVED',
         rideGroupId: groupId,
         currentStopOrder: 1,
+        rideGroup: { groupVersion: 1 },
         passengers: [
           {
             passengerId: 'p-1',
@@ -235,6 +240,7 @@ describe('SyncService (Unit Tests)', () => {
       expect(sync.driverState?.activeOffer?.id).toBe('offer-1');
       expect(sync.driverState?.activeOffer?.status).toBe('PENDING');
       expect(sync.driverState?.activeTrip?.id).toBe(tripId);
+      expect(sync.driverState?.activeTrip?.tripVersion).toBe(1);
       expect(sync.driverState?.activeTrip?.currentStopOrder).toBe(1);
       expect(sync.driverState?.activeTrip?.passengerManifest[0].status).toBe('WAITING');
       expect(sync.driverState?.activeTrip?.passengerManifest[0].bookingId).toBe('b-1');

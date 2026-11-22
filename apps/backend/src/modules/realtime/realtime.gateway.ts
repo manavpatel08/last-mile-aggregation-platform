@@ -24,11 +24,37 @@ import {
 const UUID_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+const DEFAULT_ALLOWED_ORIGINS = [
+  /^http:\/\/localhost(:[0-9]+)?$/,
+  /^http:\/\/127\.0\.0\.1(:[0-9]+)?$/,
+  /^http:\/\/10\.0\.2\.2(:[0-9]+)?$/,
+];
+
 @WebSocketGateway({
   namespace: '/realtime',
   path: '/socket.io',
   cors: {
-    origin: '*',
+    origin: (
+      origin: string | undefined,
+      callback: (err: Error | null, allow?: boolean) => void,
+    ) => {
+      // Non-browser clients (iOS simulator, native mobile app, curl, backend tests) do not send Origin header
+      if (!origin) {
+        return callback(null, true);
+      }
+      const envOrigins = process.env.SOCKET_CORS_ORIGINS || process.env.CORS_ORIGIN;
+      const configuredOrigins = envOrigins
+        ? envOrigins.split(',').map((o) => o.trim())
+        : [];
+      if (configuredOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      const isAllowed = DEFAULT_ALLOWED_ORIGINS.some((pattern) => pattern.test(origin));
+      if (isAllowed) {
+        return callback(null, true);
+      }
+      return callback(null, false);
+    },
     credentials: true,
   },
   pingInterval: 25000,
@@ -134,7 +160,54 @@ export class RealtimeGateway
         return;
       }
 
-      // 4. Validate Driver Status if applicable
+      // 4. Validate Authoritative User Record in PostgreSQL
+      const dbUser = await this.prisma.user.findUnique({
+        where: { id: userContext.userId },
+        include: { roles: true },
+      });
+
+      if (!dbUser) {
+        this.logger.warn(
+          `Connection rejected for socket ${client.id}: User ${userContext.userId} not found in database`,
+        );
+        client.emit('error', {
+          code: 'UNAUTHORIZED',
+          message: 'User account not found',
+        });
+        client.disconnect(true);
+        return;
+      }
+
+      if (!dbUser.isActive) {
+        this.logger.warn(
+          `Connection rejected for socket ${client.id}: User ${userContext.userId} is inactive/deactivated`,
+        );
+        client.emit('error', {
+          code: 'UNAUTHORIZED',
+          message: 'User account is deactivated or suspended',
+        });
+        client.disconnect(true);
+        return;
+      }
+
+      const activeUserRoles: string[] = dbUser.roles ? dbUser.roles.map((r) => r.roleName) : [];
+      if (dbUser.role && !activeUserRoles.includes(dbUser.role)) {
+        activeUserRoles.push(dbUser.role);
+      }
+
+      if (!activeUserRoles.includes(userContext.role)) {
+        this.logger.warn(
+          `Connection rejected for socket ${client.id}: User ${userContext.userId} role mismatch (ticket=${userContext.role}, db=${activeUserRoles.join(',')})`,
+        );
+        client.emit('error', {
+          code: 'UNAUTHORIZED',
+          message: 'User role mismatch with authoritative database account',
+        });
+        client.disconnect(true);
+        return;
+      }
+
+      // 5. Validate Driver Status if applicable
       let driverProfileId: string | null = null;
       if (userContext.role === 'DRIVER') {
         const driverProfile = await this.prisma.driverProfile.findUnique({

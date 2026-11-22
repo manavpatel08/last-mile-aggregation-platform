@@ -16,6 +16,7 @@ import { RedisService } from '../../infrastructure/redis/redis.service.js';
 import { DriversService } from '../drivers/drivers.service.js';
 import { RoutingService } from '../routing/routing.service.js';
 import { OutboxService } from '../../infrastructure/outbox/outbox.service.js';
+import type { OutboxProcessingSummary } from '../../infrastructure/outbox/outbox.interfaces.js';
 import { QUEUES } from '../../common/constants/index.js';
 import { deriveBoardingOtp, hashBoardingOtp } from '../../common/utils/otp.util.js';
 import { fenceAndCompleteIdempotentTransaction } from '../../common/interceptors/idempotency.interceptor.js';
@@ -74,6 +75,18 @@ import { RejectOfferDto } from './dto/reject-offer.dto.js';
  *       - Pending offers for this group to other drivers -> WITHDRAWN
  * ============================================================================
  */
+/**
+ * Narrow interface for dispatch-initiated outbox immediate triggers.
+ * Decouples constructor parameter type metadata from the concrete OutboxService class
+ * to eliminate Node.js ESM circular initialization Temporal Dead Zone errors.
+ */
+export interface IOutboxDispatchTrigger {
+  triggerImmediateProcessing(filter?: {
+    eventType?: string;
+    aggregateId?: string;
+  }): Promise<OutboxProcessingSummary>;
+}
+
 @Injectable()
 export class DispatchService {
   private readonly logger = new Logger(DispatchService.name);
@@ -87,7 +100,7 @@ export class DispatchService {
     private readonly dispatchQueue?: Queue<DispatchTimeoutJobPayload>,
     @Optional()
     @Inject(forwardRef(() => OutboxService))
-    private readonly outboxService?: OutboxService,
+    private readonly outboxService?: IOutboxDispatchTrigger,
     @Optional()
     private readonly redisService?: RedisService,
   ) {}

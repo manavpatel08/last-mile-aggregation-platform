@@ -9,6 +9,7 @@ import {
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { DispatchService } from '../../modules/dispatch/dispatch.service.js';
+import type { DispatchResult } from '../../modules/dispatch/dispatch.interfaces.js';
 import { RealtimeService } from '../../modules/realtime/realtime.service.js';
 import {
   GroupFormedPayload,
@@ -26,6 +27,21 @@ const UUID_REGEX =
 export const MAX_OUTBOX_RETRIES = 5;
 export const STALE_PROCESSING_INTERVAL_SEC = 30;
 
+/**
+ * Narrow interface for outbox consumer dispatch invocations.
+ * Decouples constructor parameter type metadata from the concrete DispatchService class
+ * to eliminate Node.js ESM circular initialization Temporal Dead Zone errors.
+ */
+export interface IDispatchServiceOperations {
+  initiateDispatchForGroup(rideGroupId: string): Promise<DispatchResult>;
+  scheduleOfferTimeout(offerId: string): Promise<{
+    scheduled: boolean;
+    jobId?: string;
+    remainingMs?: number;
+    reason?: string;
+  }>;
+}
+
 @Injectable()
 export class OutboxService {
   private readonly logger = new Logger(OutboxService.name);
@@ -33,7 +49,7 @@ export class OutboxService {
   constructor(
     private readonly prisma: PrismaService,
     @Inject(forwardRef(() => DispatchService))
-    private readonly dispatchService: DispatchService,
+    private readonly dispatchService: IDispatchServiceOperations,
     @Optional()
     @Inject(forwardRef(() => RealtimeService))
     private readonly realtimeService?: RealtimeService,

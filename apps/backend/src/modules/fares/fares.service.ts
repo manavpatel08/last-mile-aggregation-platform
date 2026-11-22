@@ -295,10 +295,10 @@ export class FaresService {
       });
     }
 
-    // 1. Group Fare G
+    // 1. Group Fare G (rounded to nearest whole rupee / 100 paise for cash settlement)
     const groupFarePaise =
       baseFarePaise +
-      Math.round((totalSharedDistanceMeters / 1000) * perKmRatePaise);
+      Math.round(((totalSharedDistanceMeters / 1000) * perKmRatePaise) / 100) * 100;
 
     // 2. Sum of solo fares
     const sumSoloFares = members.reduce(

@@ -155,6 +155,71 @@ describe('FaresService (Tariff Arithmetic & Allocation Formula)', () => {
         faresService.allocateSharedFares(members, 4000, 2000, 1000),
       ).toThrow(UnprocessableEntityException);
     });
+
+    it('should reconcile and allocate whole-rupee fares for fractional distance remainder (7,624.9m demo case)', () => {
+      // Failing scenario from live OSRM route: distance = 7624.9m
+      // Passenger 1 ceiling = 5349, Passenger 2 ceiling = 9545
+      const members = [
+        { id: 'p1', soloFarePaise: 5349, ceilingPaise: 5349 },
+        { id: 'p2', soloFarePaise: 9545, ceilingPaise: 9545 },
+      ];
+
+      // G = 2000 + round((7624.9/1000 * 1000) / 100) * 100 = 2000 + 7600 = 9600 paise
+      const allocations = faresService.allocateSharedFares(
+        members,
+        7624.9,
+        2000,
+        1000,
+      );
+
+      const p1 = allocations.find((a) => a.id === 'p1');
+      const p2 = allocations.find((a) => a.id === 'p2');
+
+      expect(p1).toBeDefined();
+      expect(p2).toBeDefined();
+
+      // Each allocation must be a whole rupee (multiple of 100 paise)
+      expect(p1!.allocatedFarePaise % 100).toBe(0);
+      expect(p2!.allocatedFarePaise % 100).toBe(0);
+
+      // Sum must equal group fare G (9600 paise) exactly
+      const sum = allocations.reduce((acc, a) => acc + a.allocatedFarePaise, 0);
+      expect(sum).toBe(9600);
+      expect(p1!.allocatedFarePaise).toBe(3400); // ₹34.00
+      expect(p2!.allocatedFarePaise).toBe(6200); // ₹62.00
+
+      // Neither passenger exceeds their agreed fare ceiling
+      expect(p1!.allocatedFarePaise).toBeLessThanOrEqual(5349);
+      expect(p2!.allocatedFarePaise).toBeLessThanOrEqual(9545);
+      expect(p1!.allocatedFarePaise).toBeGreaterThanOrEqual(2000);
+      expect(p2!.allocatedFarePaise).toBeGreaterThanOrEqual(2000);
+    });
+
+    it('should reconcile and allocate whole-rupee fares for fractional distance rounding upward (5,380.6m, 3 passengers)', () => {
+      const members = [
+        { id: 'p1', soloFarePaise: 4000, ceilingPaise: 4000 },
+        { id: 'p2', soloFarePaise: 5000, ceilingPaise: 5000 },
+        { id: 'p3', soloFarePaise: 6000, ceilingPaise: 6000 },
+      ];
+
+      // G = 2000 + round((5380.6 / 100) * 100) = 2000 + 5400 = 7400 paise
+      const allocations = faresService.allocateSharedFares(
+        members,
+        5380.6,
+        2000,
+        1000,
+      );
+
+      const sum = allocations.reduce((acc, a) => acc + a.allocatedFarePaise, 0);
+      expect(sum).toBe(7400);
+
+      for (const a of allocations) {
+        const member = members.find((m) => m.id === a.id)!;
+        expect(a.allocatedFarePaise % 100).toBe(0);
+        expect(a.allocatedFarePaise).toBeLessThanOrEqual(member.ceilingPaise);
+        expect(a.allocatedFarePaise).toBeGreaterThanOrEqual(2000);
+      }
+    });
   });
 
   describe('generateQuote (Fallback Safety)', () => {

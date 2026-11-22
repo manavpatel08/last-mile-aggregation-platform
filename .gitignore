@@ -1,0 +1,14 @@
+# Local OSRM map extracts and generated routing graphs
+/routing/
+
+# Local environment secrets (keep example templates)
+**/.env
+**/.env.*
+!**/.env.example
+
+# Dependencies and build output
+node_modules/
+.next/
+.next-dev/
+dist/
+coverage/

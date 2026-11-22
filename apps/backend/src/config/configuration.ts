@@ -51,5 +51,7 @@ export default () => ({
     baseFarePaise: parseInt(process.env.BASE_FARE_PAISE ?? '2000', 10),
     perKmRatePaise: parseInt(process.env.PER_KM_RATE_PAISE ?? '1000', 10),
   },
-  demoMode: process.env.DEMO_MODE === 'true' || process.env.DEMO_MODE === '1',
+  demoMode:
+    process.env.NODE_ENV !== 'production' &&
+    (process.env.DEMO_MODE === 'true' || process.env.DEMO_MODE === '1'),
 });

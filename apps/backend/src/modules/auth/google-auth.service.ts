@@ -15,6 +15,7 @@ export class GoogleAuthService {
   private readonly oauth2Client: OAuth2Client;
   private readonly allowedAudiences: string[];
   private readonly isDemoMode: boolean;
+  private readonly isTestMode: boolean;
 
   constructor(private readonly configService: ConfigService) {
     this.oauth2Client = new OAuth2Client();
@@ -26,9 +27,19 @@ export class GoogleAuthService {
       (aud) => typeof aud === 'string' && aud.trim().length > 0,
     );
 
-    this.isDemoMode =
-      this.configService.get<string>('environment') === 'test' ||
-      this.configService.get<boolean>('DEMO_MODE', true);
+    const env =
+      this.configService.get<string>('environment') ||
+      process.env.NODE_ENV ||
+      'development';
+    const isProd = env === 'production' || process.env.NODE_ENV === 'production';
+    const demoFlag =
+      this.configService.get<boolean>('demoMode', false) ||
+      this.configService.get<boolean>('DEMO_MODE', false) ||
+      process.env.DEMO_MODE === 'true' ||
+      process.env.DEMO_MODE === '1';
+
+    this.isDemoMode = !isProd && Boolean(demoFlag);
+    this.isTestMode = !isProd && (env === 'test' || process.env.NODE_ENV === 'test');
   }
 
   async verifyIdToken(idToken: string): Promise<VerifiedGoogleUser> {
@@ -36,9 +47,28 @@ export class GoogleAuthService {
       throw new UnauthorizedException('Missing or invalid Google ID token');
     }
 
-    // Support deterministic testing and simulated tokens in test / demo environments
-    if (idToken.startsWith('mock-google-id-token:') || idToken.startsWith('demo-google-token:')) {
-      return this.verifyMockToken(idToken);
+    const env =
+      this.configService.get<string>('environment') ||
+      process.env.NODE_ENV ||
+      'development';
+    const isProd = env === 'production' || process.env.NODE_ENV === 'production';
+
+    // 1. Test mock tokens: strictly test environment only, rejected in production
+    if (idToken.startsWith('mock-google-id-token:')) {
+      if (isProd || !this.isTestMode) {
+        throw new UnauthorizedException(
+          'Mock identity tokens are only permitted in test environments',
+        );
+      }
+      return this.verifyMockToken(idToken, 'mock');
+    }
+
+    // 2. Demo simulation tokens: strictly non-prod with DEMO_MODE enabled, rejected in production
+    if (idToken.startsWith('demo-google-token:')) {
+      if (isProd || !this.isDemoMode) {
+        throw new UnauthorizedException('Demo tokens are disabled');
+      }
+      return this.verifyMockToken(idToken, 'demo');
     }
 
     try {
@@ -80,12 +110,12 @@ export class GoogleAuthService {
     }
   }
 
-  private verifyMockToken(token: string): VerifiedGoogleUser {
-    // Format: mock-google-id-token:<sub-id>:<email>:<name>[:flag]
+  private verifyMockToken(token: string, type: 'mock' | 'demo'): VerifiedGoogleUser {
+    // Format: <prefix>:<sub-id>:<email>:<name>[:flag]
     const parts = token.split(':');
     const sub = parts[1];
     const email = parts[2];
-    const name = parts[3] || 'Mock Google User';
+    const name = parts[3] || (type === 'demo' ? 'Simulation Agent' : 'Mock Google User');
     const flag = parts[4];
 
     if (flag === 'invalid-signature') {
@@ -104,9 +134,31 @@ export class GoogleAuthService {
       throw new UnauthorizedException('Missing required identity claims (sub, email)');
     }
 
+    const normalizedEmail = email.toLowerCase().trim();
+
+    if (type === 'demo') {
+      // Demo tokens cannot be used to impersonate arbitrary or non-demo accounts
+      const isApprovedDemo =
+        normalizedEmail === 'admin@pdeu.ac.in' ||
+        (normalizedEmail.startsWith('demo.') && normalizedEmail.endsWith('@pdeu.ac.in'));
+
+      if (!isApprovedDemo) {
+        throw new UnauthorizedException(
+          'Demo tokens cannot be used for non-demo accounts',
+        );
+      }
+
+      // If claiming admin, sub MUST match the provisioned bootstrap sub
+      if (normalizedEmail === 'admin@pdeu.ac.in' && sub !== 'admin-google-sub-001') {
+        throw new UnauthorizedException(
+          'Demo token sub mismatch for administrator account',
+        );
+      }
+    }
+
     return {
       sub,
-      email: email.toLowerCase(),
+      email: normalizedEmail,
       fullName: name,
       avatarUrl: `https://profiles.google.com/mock/${sub}.png`,
     };

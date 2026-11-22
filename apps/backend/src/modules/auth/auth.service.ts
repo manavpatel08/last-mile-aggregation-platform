@@ -104,6 +104,17 @@ export class AuthService {
           throw new ForbiddenException('User account has been disabled');
         }
 
+        // Security Directive: Automatic identity linking to administrator accounts is strictly forbidden
+        const hasAdminRole =
+          existingUserByEmail.role === 'ADMIN' ||
+          existingUserByEmail.roles.some((r) => r.roleName === 'ADMIN');
+
+        if (hasAdminRole) {
+          throw new ForbiddenException(
+            'Automatic identity linking to administrator accounts is forbidden',
+          );
+        }
+
         // Link identity to existing user
         await tx.authIdentity.create({
           data: {

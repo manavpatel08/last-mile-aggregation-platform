@@ -2,6 +2,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:lastmile_mobile/core/network/api_exception.dart';
 import 'package:lastmile_mobile/features/trip/data/trip_repository.dart';
+import 'package:lastmile_mobile/features/trip/models/cash_confirmation_model.dart';
 import 'package:lastmile_mobile/features/trip/models/passenger_boarding_pass.dart';
 import 'package:lastmile_mobile/features/trip/models/trip_detail_model.dart';
 import 'package:lastmile_mobile/features/trip/presentation/screens/driver_active_trip_screen.dart';
@@ -148,6 +149,83 @@ class _FakeTripRepository implements TripRepository {
       tripId: tripId,
       status: 'COMPLETED',
       completedAt: DateTime.now(),
+    );
+  }
+
+  int confirmCashCalls = 0;
+  Exception? confirmCashError;
+  String? lastConfirmedTripId;
+  String? lastConfirmedTripPassengerId;
+  int? lastConfirmedAmountPaise;
+  String? lastConfirmedIdempotencyKey;
+  final List<String> confirmCashIdempotencyKeys = [];
+  CashConfirmationModel Function(
+    String tripId,
+    String tripPassengerId,
+    int amountCollectedPaise,
+    String idempotencyKey,
+  )? onConfirmCash;
+
+  @override
+  Future<CashConfirmationModel> confirmCash({
+    required String tripId,
+    required String tripPassengerId,
+    required int amountCollectedPaise,
+    required String idempotencyKey,
+  }) async {
+    confirmCashCalls++;
+    lastConfirmedTripId = tripId;
+    lastConfirmedTripPassengerId = tripPassengerId;
+    lastConfirmedAmountPaise = amountCollectedPaise;
+    lastConfirmedIdempotencyKey = idempotencyKey;
+    confirmCashIdempotencyKeys.add(idempotencyKey);
+    if (confirmCashError != null) throw confirmCashError!;
+    if (onConfirmCash != null) {
+      return onConfirmCash!(
+        tripId,
+        tripPassengerId,
+        amountCollectedPaise,
+        idempotencyKey,
+      );
+    }
+    return CashConfirmationModel(
+      collectionId: 'coll-test-1',
+      tripId: tripId,
+      tripPassengerId: tripPassengerId,
+      driverId: 'driver-1',
+      totalCashCollectedPaise: amountCollectedPaise,
+      totalCashCollected: (amountCollectedPaise / 100).toStringAsFixed(2),
+      rideFarePaise: 3800,
+      rideFare: '38.00',
+      waitingChargePaise: 0,
+      waitingCharge: '0.00',
+      surchargeFeesPaise:
+          amountCollectedPaise > 3800 ? amountCollectedPaise - 3800 : 0,
+      surchargeFees: amountCollectedPaise > 3800
+          ? ((amountCollectedPaise - 3800) / 100).toStringAsFixed(2)
+          : '0.00',
+      collectedFeeIds:
+          amountCollectedPaise > 3800 ? const ['fee-1'] : const [],
+      paymentStatus: 'PAID',
+      confirmedAt: DateTime.parse('2026-11-22T04:00:00.000Z'),
+      paymentAllocations: [
+        PaymentAllocationModel(
+          id: 'alloc-1',
+          obligationType: 'RIDE_FARE',
+          obligationEntityId: tripPassengerId,
+          allocatedAmountPaise: 3800,
+          allocatedAmount: '38.00',
+        ),
+        if (amountCollectedPaise > 3800)
+          PaymentAllocationModel(
+            id: 'alloc-2',
+            obligationType: 'CANCELLATION_FEE_SURCHARGE',
+            obligationEntityId: 'fee-1',
+            allocatedAmountPaise: amountCollectedPaise - 3800,
+            allocatedAmount:
+                ((amountCollectedPaise - 3800) / 100).toStringAsFixed(2),
+          ),
+      ],
     );
   }
 }
@@ -785,6 +863,604 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.byKey(const Key('finalize_trip_button')), findsNothing);
+    });
+  });
+
+  group('DriverActiveTrip - Cash Collection and Payment Receipt', () {
+    testWidgets(
+        'confirms cash payment with authoritative paise, tripPassengerId, and Idempotency-Key, then renders receipt with breakdown and allocations',
+        (tester) async {
+      tester.view.physicalSize = const Size(2400, 4800);
+      addTearDown(tester.view.resetPhysicalSize);
+
+      final fakeRepo = _FakeTripRepository()
+        ..tripToReturn = TripDetailModel(
+          tripId: 'trip-cash-1',
+          rideGroupId: 'grp-1',
+          activeDriverId: 'driver-1',
+          status: 'IN_PROGRESS',
+          startedAt: DateTime.now(),
+          passengers: const [
+            TripPassengerModel(
+              id: 'tp-uuid-1',
+              passengerId: 'p-user-1',
+              bookingId: 'book-1',
+              status: 'COMPLETED',
+              finalRideFarePaise: 3800,
+              waitingChargePaise: 0,
+            ),
+          ],
+        );
+
+      final provider = DriverActiveTripProvider(repository: fakeRepo);
+      await provider.loadTrip('trip-cash-1');
+
+      // Complete drop-off first to establish authoritative drop-off response with surcharge
+      fakeRepo.completePassengerError = null;
+      await provider.completePassengerDropOff(passengerId: 'p-user-1');
+
+      await tester.pumpWidget(
+        buildTestWidget(
+          tripId: 'trip-cash-1',
+          repository: fakeRepo,
+          provider: provider,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Drop-off breakdown is rendered with Confirm Cash button
+      expect(find.byKey(const Key('cash_breakdown_p-user-1')), findsOneWidget);
+      expect(
+        find.byKey(const Key('confirm_cash_button_p-user-1')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const Key('payment_receipt_p-user-1')),
+        findsNothing,
+      );
+
+      // Tap Confirm Cash Payment
+      await tester.ensureVisible(
+        find.byKey(const Key('confirm_cash_button_p-user-1')),
+      );
+      await tester.tap(find.byKey(const Key('confirm_cash_button_p-user-1')));
+      await tester.pumpAndSettle();
+
+      // 1. Verify repository call and exact parameters
+      expect(fakeRepo.confirmCashCalls, 1);
+      expect(fakeRepo.lastConfirmedTripId, 'trip-cash-1');
+      expect(fakeRepo.lastConfirmedTripPassengerId, 'tp-uuid-1');
+      expect(fakeRepo.lastConfirmedAmountPaise, 3800);
+      expect(fakeRepo.lastConfirmedIdempotencyKey, isNotNull);
+      expect(fakeRepo.lastConfirmedIdempotencyKey, isNotEmpty);
+
+      // 2. Button is replaced by Payment Collected receipt
+      expect(
+        find.byKey(const Key('confirm_cash_button_p-user-1')),
+        findsNothing,
+      );
+      expect(find.byKey(const Key('payment_receipt_p-user-1')), findsOneWidget);
+      expect(
+        find.byKey(const Key('payment_collected_badge_p-user-1')),
+        findsOneWidget,
+      );
+      expect(find.text('Payment Collected'), findsOneWidget);
+      expect(find.byKey(const Key('receipt_status_p-user-1')), findsOneWidget);
+      expect(find.text('PAID'), findsOneWidget);
+
+      // 3. Receipt details and payment breakdown rendering
+      expect(
+        find.byKey(const Key('confirmed_cash_total_p-user-1')),
+        findsOneWidget,
+      );
+      expect(find.text('₹38.00'), findsWidgets);
+      expect(find.text('Ride Fare: ₹38.00'), findsOneWidget);
+      expect(find.text('Waiting Charge: ₹0.00'), findsOneWidget);
+      expect(find.text('• RIDE_FARE: ₹38.00'), findsOneWidget);
+      expect(
+        find.byKey(const Key('confirmed_at_text_p-user-1')),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets(
+        'renders surcharge fees and allocations when returned by backend',
+        (tester) async {
+      tester.view.physicalSize = const Size(2400, 4800);
+      addTearDown(tester.view.resetPhysicalSize);
+
+      final fakeRepo = _FakeTripRepository()
+        ..tripToReturn = TripDetailModel(
+          tripId: 'trip-surcharge-1',
+          rideGroupId: 'grp-1',
+          activeDriverId: 'driver-1',
+          status: 'IN_PROGRESS',
+          startedAt: DateTime.now(),
+          passengers: const [
+            TripPassengerModel(
+              id: 'tp-sur-1',
+              passengerId: 'p-sur-1',
+              bookingId: 'book-1',
+              status: 'COMPLETED',
+              finalRideFarePaise: 3800,
+              waitingChargePaise: 0,
+            ),
+          ],
+        )
+        ..onConfirmCash = (tripId, tripPassengerId, amount, key) {
+          return CashConfirmationModel(
+            collectionId: 'coll-sur-1',
+            tripId: tripId,
+            tripPassengerId: tripPassengerId,
+            driverId: 'driver-1',
+            totalCashCollectedPaise: 6800,
+            totalCashCollected: '68.00',
+            rideFarePaise: 3800,
+            rideFare: '38.00',
+            waitingChargePaise: 0,
+            waitingCharge: '0.00',
+            surchargeFeesPaise: 3000,
+            surchargeFees: '30.00',
+            collectedFeeIds: const ['fee-uuid-1'],
+            paymentStatus: 'PAID',
+            confirmedAt: DateTime.parse('2026-11-22T04:00:00.000Z'),
+            paymentAllocations: const [
+              PaymentAllocationModel(
+                id: 'alloc-1',
+                obligationType: 'RIDE_FARE',
+                obligationEntityId: 'tp-sur-1',
+                allocatedAmountPaise: 3800,
+                allocatedAmount: '38.00',
+              ),
+              PaymentAllocationModel(
+                id: 'alloc-2',
+                obligationType: 'CANCELLATION_FEE_SURCHARGE',
+                obligationEntityId: 'fee-uuid-1',
+                allocatedAmountPaise: 3000,
+                allocatedAmount: '30.00',
+              ),
+            ],
+          );
+        };
+
+      final provider = DriverActiveTripProvider(repository: fakeRepo);
+      await provider.loadTrip('trip-surcharge-1');
+      await provider.completePassengerDropOff(passengerId: 'p-sur-1');
+
+      await tester.pumpWidget(
+        buildTestWidget(
+          tripId: 'trip-surcharge-1',
+          repository: fakeRepo,
+          provider: provider,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.ensureVisible(
+        find.byKey(const Key('confirm_cash_button_p-sur-1')),
+      );
+      await tester.tap(find.byKey(const Key('confirm_cash_button_p-sur-1')));
+      await tester.pumpAndSettle();
+
+      expect(find.byKey(const Key('payment_receipt_p-sur-1')), findsOneWidget);
+      expect(
+        find.byKey(const Key('confirmed_cash_total_p-sur-1')),
+        findsOneWidget,
+      );
+      expect(find.text('₹68.00'), findsOneWidget);
+      expect(
+        find.byKey(const Key('receipt_surcharge_fees_p-sur-1')),
+        findsOneWidget,
+      );
+      expect(find.text('Surcharge Fees: ₹30.00'), findsOneWidget);
+      expect(find.text('• RIDE_FARE: ₹38.00'), findsOneWidget);
+      expect(
+        find.text('• CANCELLATION_FEE_SURCHARGE: ₹30.00'),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets(
+        'handles CASH_ALREADY_COLLECTED error and does not show false receipt',
+        (tester) async {
+      tester.view.physicalSize = const Size(2400, 4800);
+      addTearDown(tester.view.resetPhysicalSize);
+
+      final fakeRepo = _FakeTripRepository()
+        ..tripToReturn = TripDetailModel(
+          tripId: 'trip-conflict-1',
+          rideGroupId: 'grp-1',
+          activeDriverId: 'driver-1',
+          status: 'IN_PROGRESS',
+          startedAt: DateTime.now(),
+          passengers: const [
+            TripPassengerModel(
+              id: 'tp-c-1',
+              passengerId: 'p-c-1',
+              bookingId: 'book-1',
+              status: 'COMPLETED',
+              finalRideFarePaise: 3800,
+              waitingChargePaise: 0,
+            ),
+          ],
+        )
+        ..confirmCashError = const ApiException(
+          statusCode: 409,
+          errorCode: 'CASH_ALREADY_COLLECTED',
+          message:
+              'Cash collection has already been confirmed for this passenger journey.',
+        );
+
+      final provider = DriverActiveTripProvider(repository: fakeRepo);
+      await provider.loadTrip('trip-conflict-1');
+      await provider.completePassengerDropOff(passengerId: 'p-c-1');
+
+      await tester.pumpWidget(
+        buildTestWidget(
+          tripId: 'trip-conflict-1',
+          repository: fakeRepo,
+          provider: provider,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.ensureVisible(
+        find.byKey(const Key('confirm_cash_button_p-c-1')),
+      );
+      await tester.tap(find.byKey(const Key('confirm_cash_button_p-c-1')));
+      await tester.pumpAndSettle();
+
+      expect(fakeRepo.confirmCashCalls, 1);
+      expect(find.byKey(const Key('payment_receipt_p-c-1')), findsNothing);
+      expect(find.byKey(const Key('cash_error_p-c-1')), findsOneWidget);
+      expect(
+        find.text(
+          'Cash collection has already been confirmed for this passenger journey.',
+        ),
+        findsOneWidget,
+      );
+      // Key is cleared on definitive error
+      expect(provider.getCashIdempotencyKeyForPassenger('p-c-1'), isNull);
+    });
+
+    testWidgets(
+        'handles INVALID_COLLECTION_AMOUNT error and clears idempotency key',
+        (tester) async {
+      tester.view.physicalSize = const Size(2400, 4800);
+      addTearDown(tester.view.resetPhysicalSize);
+
+      final fakeRepo = _FakeTripRepository()
+        ..tripToReturn = TripDetailModel(
+          tripId: 'trip-invalid-amt',
+          rideGroupId: 'grp-1',
+          activeDriverId: 'driver-1',
+          status: 'IN_PROGRESS',
+          startedAt: DateTime.now(),
+          passengers: const [
+            TripPassengerModel(
+              id: 'tp-inv-1',
+              passengerId: 'p-inv-1',
+              bookingId: 'book-1',
+              status: 'COMPLETED',
+              finalRideFarePaise: 3800,
+              waitingChargePaise: 0,
+            ),
+          ],
+        )
+        ..confirmCashError = const ApiException(
+          statusCode: 400,
+          errorCode: 'INVALID_COLLECTION_AMOUNT',
+          message:
+              'Collected amount (3800 paise) does not match expected payable total (6800 paise).',
+        );
+
+      final provider = DriverActiveTripProvider(repository: fakeRepo);
+      await provider.loadTrip('trip-invalid-amt');
+      await provider.completePassengerDropOff(passengerId: 'p-inv-1');
+
+      await tester.pumpWidget(
+        buildTestWidget(
+          tripId: 'trip-invalid-amt',
+          repository: fakeRepo,
+          provider: provider,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.ensureVisible(
+        find.byKey(const Key('confirm_cash_button_p-inv-1')),
+      );
+      await tester.tap(find.byKey(const Key('confirm_cash_button_p-inv-1')));
+      await tester.pumpAndSettle();
+
+      expect(fakeRepo.confirmCashCalls, 1);
+      expect(find.byKey(const Key('payment_receipt_p-inv-1')), findsNothing);
+      expect(find.byKey(const Key('cash_error_p-inv-1')), findsOneWidget);
+      expect(
+        find.text(
+          'Collected amount (3800 paise) does not match expected payable total (6800 paise).',
+        ),
+        findsOneWidget,
+      );
+      expect(provider.getCashIdempotencyKeyForPassenger('p-inv-1'), isNull);
+    });
+
+    testWidgets(
+        'retains exact same Idempotency-Key across ambiguous network timeout and safe retry succeeds',
+        (tester) async {
+      tester.view.physicalSize = const Size(2400, 4800);
+      addTearDown(tester.view.resetPhysicalSize);
+
+      final fakeRepo = _FakeTripRepository()
+        ..tripToReturn = TripDetailModel(
+          tripId: 'trip-timeout-1',
+          rideGroupId: 'grp-1',
+          activeDriverId: 'driver-1',
+          status: 'IN_PROGRESS',
+          startedAt: DateTime.now(),
+          passengers: const [
+            TripPassengerModel(
+              id: 'tp-timeout-1',
+              passengerId: 'p-timeout-1',
+              bookingId: 'book-1',
+              status: 'COMPLETED',
+              finalRideFarePaise: 3800,
+              waitingChargePaise: 0,
+            ),
+          ],
+        )
+        ..confirmCashError = const ApiException(
+          statusCode: null,
+          errorCode: 'REQUEST_TIMEOUT',
+          message: 'The request timed out. Please try again.',
+        );
+
+      final provider = DriverActiveTripProvider(repository: fakeRepo);
+      await provider.loadTrip('trip-timeout-1');
+      await provider.completePassengerDropOff(passengerId: 'p-timeout-1');
+
+      await tester.pumpWidget(
+        buildTestWidget(
+          tripId: 'trip-timeout-1',
+          repository: fakeRepo,
+          provider: provider,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // First attempt triggers timeout
+      await tester.ensureVisible(
+        find.byKey(const Key('confirm_cash_button_p-timeout-1')),
+      );
+      await tester.tap(find.byKey(const Key('confirm_cash_button_p-timeout-1')));
+      await tester.pumpAndSettle();
+
+      expect(fakeRepo.confirmCashCalls, 1);
+      final initialKey = fakeRepo.lastConfirmedIdempotencyKey;
+      expect(initialKey, isNotNull);
+      expect(find.byKey(const Key('cash_error_p-timeout-1')), findsOneWidget);
+      expect(
+        find.text('The request timed out. Please try again.'),
+        findsOneWidget,
+      );
+
+      // Verify idempotency key was retained in provider
+      expect(
+        provider.getCashIdempotencyKeyForPassenger('p-timeout-1'),
+        initialKey,
+      );
+
+      // Network recovers
+      fakeRepo.confirmCashError = null;
+
+      // Safe retry
+      await tester.ensureVisible(
+        find.byKey(const Key('confirm_cash_button_p-timeout-1')),
+      );
+      await tester.tap(find.byKey(const Key('confirm_cash_button_p-timeout-1')));
+      await tester.pumpAndSettle();
+
+      expect(fakeRepo.confirmCashCalls, 2);
+      expect(fakeRepo.lastConfirmedIdempotencyKey, initialKey);
+      expect(fakeRepo.confirmCashIdempotencyKeys[0], initialKey);
+      expect(fakeRepo.confirmCashIdempotencyKeys[1], initialKey);
+      expect(find.byKey(const Key('payment_receipt_p-timeout-1')), findsOneWidget);
+    });
+
+    test(
+        'duplicate submission prevention: rejects concurrent in-flight or already confirmed calls',
+        () async {
+      final fakeRepo = _FakeTripRepository()
+        ..tripToReturn = TripDetailModel(
+          tripId: 'trip-dup-1',
+          rideGroupId: 'grp-1',
+          activeDriverId: 'driver-1',
+          status: 'IN_PROGRESS',
+          startedAt: DateTime.now(),
+          passengers: const [
+            TripPassengerModel(
+              id: 'tp-dup-1',
+              passengerId: 'p-dup-1',
+              bookingId: 'book-1',
+              status: 'COMPLETED',
+              finalRideFarePaise: 3800,
+              waitingChargePaise: 0,
+            ),
+          ],
+        );
+
+      final provider = DriverActiveTripProvider(repository: fakeRepo);
+      await provider.loadTrip('trip-dup-1');
+      await provider.completePassengerDropOff(passengerId: 'p-dup-1');
+
+      // First call succeeds
+      final firstCall =
+          await provider.confirmCashCollection(passengerId: 'p-dup-1');
+      expect(firstCall, isTrue);
+      expect(fakeRepo.confirmCashCalls, 1);
+
+      // Second call when already confirmed must be prevented
+      final secondCall =
+          await provider.confirmCashCollection(passengerId: 'p-dup-1');
+      expect(secondCall, isFalse);
+      expect(fakeRepo.confirmCashCalls, 1); // No additional call made
+    });
+
+    testWidgets(
+        'action visibility: hidden for incomplete passengers, visible after drop-off, replaced by receipt upon confirmation',
+        (tester) async {
+      tester.view.physicalSize = const Size(2400, 4800);
+      addTearDown(tester.view.resetPhysicalSize);
+
+      final fakeRepo = _FakeTripRepository()
+        ..tripToReturn = TripDetailModel(
+          tripId: 'trip-vis-1',
+          rideGroupId: 'grp-1',
+          activeDriverId: 'driver-1',
+          status: 'IN_PROGRESS',
+          startedAt: DateTime.now(),
+          passengers: const [
+            TripPassengerModel(
+              id: 'tp-vis-1',
+              passengerId: 'p-vis-1',
+              bookingId: 'book-1',
+              status: 'BOARDED',
+              finalRideFarePaise: 3800,
+              waitingChargePaise: 0,
+            ),
+          ],
+        );
+
+      final provider = DriverActiveTripProvider(repository: fakeRepo);
+      await provider.loadTrip('trip-vis-1');
+
+      await tester.pumpWidget(
+        buildTestWidget(
+          tripId: 'trip-vis-1',
+          repository: fakeRepo,
+          provider: provider,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // 1. While passenger is BOARDED: Complete Drop-Off is visible, cash confirmation is NOT visible
+      expect(
+        find.byKey(const Key('complete_drop_off_button_p-vis-1')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const Key('confirm_cash_button_p-vis-1')),
+        findsNothing,
+      );
+      expect(
+        find.byKey(const Key('payment_receipt_p-vis-1')),
+        findsNothing,
+      );
+
+      // 2. Drop off passenger
+      await tester.ensureVisible(
+        find.byKey(const Key('complete_drop_off_button_p-vis-1')),
+      );
+      await tester.tap(find.byKey(const Key('complete_drop_off_button_p-vis-1')));
+      await tester.pumpAndSettle();
+
+      expect(
+        find.byKey(const Key('complete_drop_off_button_p-vis-1')),
+        findsNothing,
+      );
+      expect(
+        find.byKey(const Key('confirm_cash_button_p-vis-1')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const Key('payment_receipt_p-vis-1')),
+        findsNothing,
+      );
+
+      // 3. Confirm cash payment
+      await tester.ensureVisible(
+        find.byKey(const Key('confirm_cash_button_p-vis-1')),
+      );
+      await tester.tap(find.byKey(const Key('confirm_cash_button_p-vis-1')));
+      await tester.pumpAndSettle();
+
+      expect(
+        find.byKey(const Key('confirm_cash_button_p-vis-1')),
+        findsNothing,
+      );
+      expect(
+        find.byKey(const Key('payment_receipt_p-vis-1')),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets(
+        'correct receipt association when multiple passengers are in one trip',
+        (tester) async {
+      tester.view.physicalSize = const Size(2400, 4800);
+      addTearDown(tester.view.resetPhysicalSize);
+
+      final fakeRepo = _FakeTripRepository()
+        ..tripToReturn = TripDetailModel(
+          tripId: 'trip-multi-p',
+          rideGroupId: 'grp-1',
+          activeDriverId: 'driver-1',
+          status: 'IN_PROGRESS',
+          startedAt: DateTime.now(),
+          passengers: const [
+            TripPassengerModel(
+              id: 'tp-1',
+              passengerId: 'p-1',
+              bookingId: 'book-1',
+              status: 'COMPLETED',
+              finalRideFarePaise: 3800,
+              waitingChargePaise: 0,
+            ),
+            TripPassengerModel(
+              id: 'tp-2',
+              passengerId: 'p-2',
+              bookingId: 'book-2',
+              status: 'COMPLETED',
+              finalRideFarePaise: 4200,
+              waitingChargePaise: 0,
+            ),
+          ],
+        );
+
+      final provider = DriverActiveTripProvider(repository: fakeRepo);
+      await provider.loadTrip('trip-multi-p');
+
+      // Drop off both passengers
+      await provider.completePassengerDropOff(passengerId: 'p-1');
+      await provider.completePassengerDropOff(passengerId: 'p-2');
+
+      await tester.pumpWidget(
+        buildTestWidget(
+          tripId: 'trip-multi-p',
+          repository: fakeRepo,
+          provider: provider,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Both show their respective Confirm Cash buttons
+      expect(find.byKey(const Key('confirm_cash_button_p-1')), findsOneWidget);
+      expect(find.byKey(const Key('confirm_cash_button_p-2')), findsOneWidget);
+      expect(find.byKey(const Key('payment_receipt_p-1')), findsNothing);
+      expect(find.byKey(const Key('payment_receipt_p-2')), findsNothing);
+
+      // Confirm cash ONLY for passenger 1
+      await tester.ensureVisible(
+        find.byKey(const Key('confirm_cash_button_p-1')),
+      );
+      await tester.tap(find.byKey(const Key('confirm_cash_button_p-1')));
+      await tester.pumpAndSettle();
+
+      // Passenger 1 has receipt, Passenger 2 still has confirm cash button
+      expect(find.byKey(const Key('payment_receipt_p-1')), findsOneWidget);
+      expect(find.byKey(const Key('confirm_cash_button_p-1')), findsNothing);
+      expect(find.byKey(const Key('payment_receipt_p-2')), findsNothing);
+      expect(find.byKey(const Key('confirm_cash_button_p-2')), findsOneWidget);
     });
   });
 }

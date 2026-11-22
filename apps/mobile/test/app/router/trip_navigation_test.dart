@@ -29,6 +29,7 @@ import 'package:lastmile_mobile/features/driver/state/driver_home_provider.dart'
 import 'package:lastmile_mobile/features/driver/state/driver_onboarding_provider.dart';
 import 'package:lastmile_mobile/features/passenger/state/passenger_home_provider.dart';
 import 'package:lastmile_mobile/features/trip/data/trip_repository.dart';
+import 'package:lastmile_mobile/features/trip/models/cash_confirmation_model.dart';
 import 'package:lastmile_mobile/features/trip/models/passenger_boarding_pass.dart';
 import 'package:lastmile_mobile/features/trip/models/trip_detail_model.dart';
 import 'package:lastmile_mobile/features/trip/presentation/screens/driver_active_trip_screen.dart';
@@ -137,6 +138,31 @@ class _FakeTripRepository implements TripRepository {
       tripId: tripId,
       status: 'COMPLETED',
       completedAt: DateTime.now(),
+    );
+  }
+
+  @override
+  Future<CashConfirmationModel> confirmCash({
+    required String tripId,
+    required String tripPassengerId,
+    required int amountCollectedPaise,
+    required String idempotencyKey,
+  }) async {
+    return CashConfirmationModel(
+      collectionId: 'coll-nav',
+      tripId: tripId,
+      tripPassengerId: tripPassengerId,
+      driverId: 'drv-nav',
+      totalCashCollectedPaise: amountCollectedPaise,
+      totalCashCollected: (amountCollectedPaise / 100).toStringAsFixed(2),
+      rideFarePaise: amountCollectedPaise,
+      rideFare: (amountCollectedPaise / 100).toStringAsFixed(2),
+      waitingChargePaise: 0,
+      waitingCharge: '0.00',
+      surchargeFeesPaise: 0,
+      surchargeFees: '0.00',
+      collectedFeeIds: const [],
+      paymentStatus: 'PAID',
     );
   }
 }

@@ -8,6 +8,7 @@ import 'package:lastmile_mobile/core/network/api_exception.dart';
 import 'package:lastmile_mobile/features/booking/data/booking_repository.dart';
 import 'package:lastmile_mobile/features/booking/models/booking_details.dart';
 import 'package:lastmile_mobile/features/trip/data/trip_repository.dart';
+import 'package:lastmile_mobile/features/trip/models/cash_confirmation_model.dart';
 import 'package:lastmile_mobile/features/trip/models/passenger_boarding_pass.dart';
 import 'package:lastmile_mobile/features/trip/models/trip_detail_model.dart';
 import 'package:lastmile_mobile/features/trip/presentation/screens/passenger_active_trip_screen.dart';
@@ -90,6 +91,16 @@ class _FakeTripRepository implements TripRepository {
   @override
   Future<CompleteTripResponse> completeTrip({
     required String tripId,
+    required String idempotencyKey,
+  }) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<CashConfirmationModel> confirmCash({
+    required String tripId,
+    required String tripPassengerId,
+    required int amountCollectedPaise,
     required String idempotencyKey,
   }) {
     throw UnimplementedError();

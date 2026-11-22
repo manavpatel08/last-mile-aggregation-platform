@@ -363,5 +363,96 @@ void main() {
       expect(response.status, 'COMPLETED');
       expect(response.completedAt, isNotNull);
     });
+
+    test(
+        'confirmCash sends Idempotency-Key, payload, and parses CashConfirmationModel',
+        () async {
+      late _FakeAdapter adapter;
+      adapter = _FakeAdapter((options) async {
+        expect(options.path, '/payments/confirm-cash');
+        expect(options.method, 'POST');
+        expect(options.headers['Idempotency-Key'], 'idem-cash-key');
+        expect(options.data, {
+          'tripId': 'trip-789',
+          'tripPassengerId': 'tp-1',
+          'amountCollectedPaise': 6800,
+        });
+        return _jsonResponse({
+          'success': true,
+          'message': 'Cash payment confirmed successfully',
+          'data': {
+            'collectionId': 'coll-uuid-1',
+            'tripId': 'trip-789',
+            'tripPassengerId': 'tp-1',
+            'driverId': 'driver-profile-uuid',
+            'totalCashCollectedPaise': 6800,
+            'totalCashCollected': '68.00',
+            'rideFarePaise': 3800,
+            'rideFare': '38.00',
+            'waitingChargePaise': 0,
+            'waitingCharge': '0.00',
+            'surchargeFeesPaise': 3000,
+            'surchargeFees': '30.00',
+            'collectedFeeIds': ['fee-uuid'],
+            'paymentStatus': 'PAID',
+            'confirmedAt': '2026-11-22T02:00:00.000Z',
+            'paymentAllocations': [
+              {
+                'id': 'alloc-1',
+                'obligationType': 'RIDE_FARE',
+                'obligationEntityId': 'tp-1',
+                'allocatedAmountPaise': 3800,
+                'allocatedAmount': '38.00',
+              },
+              {
+                'id': 'alloc-2',
+                'obligationType': 'CANCELLATION_FEE_SURCHARGE',
+                'obligationEntityId': 'fee-uuid',
+                'allocatedAmountPaise': 3000,
+                'allocatedAmount': '30.00',
+              },
+            ],
+          },
+        });
+      });
+
+      final apiClient = ApiClient(
+        config: config,
+        httpClientAdapter: adapter,
+        enableDebugLogging: false,
+      );
+      final repo = ApiTripRepository(apiClient: apiClient);
+
+      final response = await repo.confirmCash(
+        tripId: 'trip-789',
+        tripPassengerId: 'tp-1',
+        amountCollectedPaise: 6800,
+        idempotencyKey: 'idem-cash-key',
+      );
+
+      expect(response.collectionId, 'coll-uuid-1');
+      expect(response.tripId, 'trip-789');
+      expect(response.tripPassengerId, 'tp-1');
+      expect(response.driverId, 'driver-profile-uuid');
+      expect(response.totalCashCollectedPaise, 6800);
+      expect(response.totalCashCollected, '68.00');
+      expect(response.rideFarePaise, 3800);
+      expect(response.rideFare, '38.00');
+      expect(response.waitingChargePaise, 0);
+      expect(response.waitingCharge, '0.00');
+      expect(response.surchargeFeesPaise, 3000);
+      expect(response.surchargeFees, '30.00');
+      expect(response.collectedFeeIds, ['fee-uuid']);
+      expect(response.paymentStatus, 'PAID');
+      expect(response.confirmedAt, isNotNull);
+      expect(response.paymentAllocations.length, 2);
+      expect(response.paymentAllocations[0].obligationType, 'RIDE_FARE');
+      expect(response.paymentAllocations[0].allocatedAmount, '38.00');
+      expect(
+        response.paymentAllocations[1].obligationType,
+        'CANCELLATION_FEE_SURCHARGE',
+      );
+      expect(response.paymentAllocations[1].allocatedAmount, '30.00');
+    });
   });
 }

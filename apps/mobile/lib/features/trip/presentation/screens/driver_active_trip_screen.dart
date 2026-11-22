@@ -631,7 +631,206 @@ class _DriverActiveTripScreenState extends State<DriverActiveTripScreen> {
                                       ),
                                     ],
                                   ),
-                                  if (provider.dropOffResult(passenger.passengerId) != null) ...[
+                                  if (provider.cashReceipt(passenger.passengerId) != null) ...[
+                                    Builder(
+                                      builder: (context) {
+                                        final receipt = provider
+                                            .cashReceipt(passenger.passengerId)!;
+                                        return Container(
+                                          key: Key(
+                                            'payment_receipt_${passenger.passengerId}',
+                                          ),
+                                          margin:
+                                              const EdgeInsets.only(top: 10),
+                                          padding: const EdgeInsets.all(12),
+                                          decoration: BoxDecoration(
+                                            color: AppColors.success
+                                                .withValues(alpha: 0.08),
+                                            borderRadius:
+                                                BorderRadius.circular(8),
+                                            border: Border.all(
+                                              color: AppColors.success
+                                                .withValues(alpha: 0.3),
+                                            ),
+                                          ),
+                                          child: Column(
+                                            crossAxisAlignment:
+                                                CrossAxisAlignment.start,
+                                            children: [
+                                              Row(
+                                                children: [
+                                                  const Icon(
+                                                    Icons.check_circle,
+                                                    color: AppColors.success,
+                                                    size: 18,
+                                                  ),
+                                                  const SizedBox(width: 6),
+                                                  Text(
+                                                    'Payment Collected',
+                                                    key: Key(
+                                                      'payment_collected_badge_${passenger.passengerId}',
+                                                    ),
+                                                    style: const TextStyle(
+                                                      color: AppColors.success,
+                                                      fontWeight:
+                                                          FontWeight.bold,
+                                                      fontSize: 13,
+                                                    ),
+                                                  ),
+                                                  const Spacer(),
+                                                  Container(
+                                                    padding:
+                                                        const EdgeInsets.symmetric(
+                                                      horizontal: 8,
+                                                      vertical: 2,
+                                                    ),
+                                                    decoration: BoxDecoration(
+                                                      color: AppColors.success
+                                                          .withValues(
+                                                        alpha: 0.15,
+                                                      ),
+                                                      borderRadius:
+                                                          BorderRadius.circular(
+                                                        4,
+                                                      ),
+                                                    ),
+                                                    child: Text(
+                                                      receipt.paymentStatus,
+                                                      key: Key(
+                                                        'receipt_status_${passenger.passengerId}',
+                                                      ),
+                                                      style: const TextStyle(
+                                                        color:
+                                                            AppColors.success,
+                                                        fontWeight:
+                                                            FontWeight.bold,
+                                                        fontSize: 11,
+                                                      ),
+                                                    ),
+                                                  ),
+                                                ],
+                                              ),
+                                              const Divider(height: 16),
+                                              Row(
+                                                mainAxisAlignment:
+                                                    MainAxisAlignment
+                                                        .spaceBetween,
+                                                children: [
+                                                  const Text(
+                                                    'Total Cash Collected:',
+                                                    style: TextStyle(
+                                                      fontWeight:
+                                                          FontWeight.bold,
+                                                      fontSize: 13,
+                                                    ),
+                                                  ),
+                                                  Text(
+                                                    '₹${receipt.totalCashCollected}',
+                                                    key: Key(
+                                                      'confirmed_cash_total_${passenger.passengerId}',
+                                                    ),
+                                                    style: const TextStyle(
+                                                      fontWeight:
+                                                          FontWeight.bold,
+                                                      fontSize: 15,
+                                                      color: AppColors.success,
+                                                    ),
+                                                  ),
+                                                ],
+                                              ),
+                                              const SizedBox(height: 6),
+                                              Text(
+                                                'Ride Fare: ₹${receipt.rideFare}',
+                                                key: Key(
+                                                  'receipt_ride_fare_${passenger.passengerId}',
+                                                ),
+                                                style: const TextStyle(
+                                                  fontSize: 12,
+                                                  color:
+                                                      AppColors.textSecondary,
+                                                ),
+                                              ),
+                                              Text(
+                                                'Waiting Charge: ₹${receipt.waitingCharge}',
+                                                key: Key(
+                                                  'receipt_waiting_charge_${passenger.passengerId}',
+                                                ),
+                                                style: const TextStyle(
+                                                  fontSize: 12,
+                                                  color:
+                                                      AppColors.textSecondary,
+                                                ),
+                                              ),
+                                              if (receipt.surchargeFeesPaise >
+                                                  0) ...[
+                                                Text(
+                                                  'Surcharge Fees: ₹${receipt.surchargeFees}',
+                                                  key: Key(
+                                                    'receipt_surcharge_fees_${passenger.passengerId}',
+                                                  ),
+                                                  style: const TextStyle(
+                                                    fontSize: 12,
+                                                    color: AppColors.warning,
+                                                    fontWeight:
+                                                        FontWeight.w500,
+                                                  ),
+                                                ),
+                                              ],
+                                              if (receipt.paymentAllocations
+                                                  .isNotEmpty) ...[
+                                                const SizedBox(height: 6),
+                                                const Text(
+                                                  'Allocations:',
+                                                  style: TextStyle(
+                                                    fontSize: 11,
+                                                    fontWeight:
+                                                        FontWeight.bold,
+                                                    color:
+                                                        AppColors.textSecondary,
+                                                  ),
+                                                ),
+                                                ...receipt.paymentAllocations
+                                                    .map(
+                                                  (alloc) => Padding(
+                                                    padding:
+                                                        const EdgeInsets.only(
+                                                      left: 4,
+                                                      top: 2,
+                                                    ),
+                                                    child: Text(
+                                                      '• ${alloc.obligationType}: ₹${alloc.allocatedAmount}',
+                                                      style: const TextStyle(
+                                                        fontSize: 11,
+                                                        color: AppColors
+                                                            .textSecondary,
+                                                      ),
+                                                    ),
+                                                  ),
+                                                ),
+                                              ],
+                                              if (receipt.confirmedAt !=
+                                                  null) ...[
+                                                const SizedBox(height: 6),
+                                                Text(
+                                                  'Confirmed at: ${receipt.confirmedAt!.toLocal().toString().split('.').first}',
+                                                  key: Key(
+                                                    'confirmed_at_text_${passenger.passengerId}',
+                                                  ),
+                                                  style: const TextStyle(
+                                                    fontSize: 11,
+                                                    color:
+                                                        AppColors.textSecondary,
+                                                  ),
+                                                ),
+                                              ],
+                                            ],
+                                          ),
+                                        );
+                                      },
+                                    ),
+                                  ] else if (provider.dropOffResult(
+                                          passenger.passengerId) !=
+                                      null) ...[
                                     const SizedBox(height: 8),
                                     Container(
                                       key: Key(
@@ -640,11 +839,14 @@ class _DriverActiveTripScreenState extends State<DriverActiveTripScreen> {
                                       padding: const EdgeInsets.all(8),
                                       decoration: BoxDecoration(
                                         color: AppColors.surface,
-                                        borderRadius: BorderRadius.circular(8),
-                                        border: Border.all(color: AppColors.border),
+                                        borderRadius:
+                                            BorderRadius.circular(8),
+                                        border:
+                                            Border.all(color: AppColors.border),
                                       ),
                                       child: Column(
-                                        crossAxisAlignment: CrossAxisAlignment.start,
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
                                         children: [
                                           Text(
                                             'Ride Fare: ₹${provider.dropOffResult(passenger.passengerId)!.rideFare}',
@@ -664,6 +866,73 @@ class _DriverActiveTripScreenState extends State<DriverActiveTripScreen> {
                                         ],
                                       ),
                                     ),
+                                    const SizedBox(height: 10),
+                                    SizedBox(
+                                      width: double.infinity,
+                                      child: ElevatedButton.icon(
+                                        key: Key(
+                                          'confirm_cash_button_${passenger.passengerId}',
+                                        ),
+                                        onPressed: provider.isConfirmingCash(
+                                                passenger.passengerId)
+                                            ? null
+                                            : () =>
+                                                provider.confirmCashCollection(
+                                                  passengerId:
+                                                      passenger.passengerId,
+                                                  repository:
+                                                      widget.repository,
+                                                ),
+                                        icon: provider.isConfirmingCash(
+                                                passenger.passengerId)
+                                            ? const SizedBox(
+                                                width: 14,
+                                                height: 14,
+                                                child:
+                                                    CircularProgressIndicator(
+                                                  strokeWidth: 2,
+                                                  color: Colors.white,
+                                                ),
+                                              )
+                                            : const Icon(
+                                                Icons.payments,
+                                                size: 16,
+                                              ),
+                                        label: Text(
+                                          provider.isConfirmingCash(
+                                                  passenger.passengerId)
+                                              ? 'Confirming Cash...'
+                                              : 'Confirm Cash Payment (₹${provider.dropOffResult(passenger.passengerId)!.totalCashToCollect})',
+                                        ),
+                                        style: ElevatedButton.styleFrom(
+                                          backgroundColor: AppColors.success,
+                                          foregroundColor: Colors.white,
+                                          visualDensity:
+                                              VisualDensity.compact,
+                                          shape: RoundedRectangleBorder(
+                                            borderRadius:
+                                                BorderRadius.circular(8),
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                    if (provider.cashError(
+                                            passenger.passengerId) !=
+                                        null) ...[
+                                      const SizedBox(height: 6),
+                                      Text(
+                                        provider.cashError(
+                                            passenger.passengerId)!,
+                                        key: Key(
+                                          'cash_error_${passenger.passengerId}',
+                                        ),
+                                        style: const TextStyle(
+                                          color: AppColors.error,
+                                          fontSize: 12,
+                                          fontWeight: FontWeight.w500,
+                                        ),
+                                      ),
+                                    ],
                                   ],
                                 ] else if (passenger.isCancelled) ...[
                                   Row(

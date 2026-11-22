@@ -70,7 +70,7 @@ void main() {
       expect(adapter.lastRequest?.headers['Authorization'], 'Bearer test-access-token');
     });
 
-    test('supports flat JSON response when data envelope is omitted', () async {
+    test('rejects flat JSON response when data envelope is omitted with FormatException', () async {
       final adapter = _FakeHttpClientAdapter((options) async {
         return ResponseBody.fromString(
           jsonEncode({
@@ -92,10 +92,17 @@ void main() {
       );
 
       final provider = ApiSocketTicketProvider(apiClient: apiClient);
-      final ticket = await provider.getTicket();
 
-      expect(ticket.ticket, 'flat-ticket-uuid');
-      expect(ticket.expiresIn, 45);
+      expect(
+        () => provider.getTicket(),
+        throwsA(
+          isA<FormatException>().having(
+            (e) => e.message,
+            'message',
+            contains('missing "data" field'),
+          ),
+        ),
+      );
     });
 
     test('propagates ApiException when backend returns 401 or error', () async {

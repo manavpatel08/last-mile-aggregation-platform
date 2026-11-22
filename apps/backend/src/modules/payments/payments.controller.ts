@@ -1,9 +1,12 @@
 import {
   Controller,
+  Get,
   Post,
   Body,
+  Param,
   HttpCode,
   HttpStatus,
+  ParseUUIDPipe,
 } from '@nestjs/common';
 import { PaymentsService } from './payments.service.js';
 import { ConfirmCashDto } from './dto/confirm-cash.dto.js';
@@ -17,6 +20,24 @@ import type { IdempotencyClaimContext } from '../../common/interceptors/idempote
 @Controller('payments')
 export class PaymentsController {
   constructor(private readonly paymentsService: PaymentsService) {}
+
+  @Roles('DRIVER')
+  @RequireDriverApproval()
+  @Get(['receipts/:tripPassengerId', 'cash-receipts/:tripPassengerId'])
+  async getCashReceipt(
+    @CurrentUser() user: { id: string },
+    @Param('tripPassengerId', new ParseUUIDPipe()) tripPassengerId: string,
+  ) {
+    const result = await this.paymentsService.getCashReceipt(
+      user.id,
+      tripPassengerId,
+    );
+    return {
+      success: true,
+      message: 'Cash collection receipt retrieved successfully',
+      data: result,
+    };
+  }
 
   @Roles('DRIVER')
   @RequireDriverApproval()

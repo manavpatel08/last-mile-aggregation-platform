@@ -101,12 +101,6 @@ export class SimulationService {
   }
 
   private getDestinationName(lat: number, lng: number): string {
-    if (Math.abs(lat - 23.1678) < 0.005 && Math.abs(lng - 72.645) < 0.005) {
-      return 'Bhaijipura Circle';
-    }
-    if (Math.abs(lat - 23.1885) < 0.005 && Math.abs(lng - 72.6288) < 0.005) {
-      return 'Kudasan Cross Road';
-    }
     return `Drop-off (${lat.toFixed(4)}, ${lng.toFixed(4)})`;
   }
 
@@ -399,8 +393,21 @@ export class SimulationService {
             otp = await this.redisService.getPassengerBoardingOtp(p.bookingId);
           }
 
-          const coords = coordMap.get(p.bookingId) || { lat: 23.1678, lng: 72.645 };
-          const destName = this.getDestinationName(coords.lat, coords.lng);
+          const coords = coordMap.get(p.bookingId);
+          const hasValidCoords =
+            coords &&
+            typeof coords.lat === 'number' &&
+            !isNaN(coords.lat) &&
+            typeof coords.lng === 'number' &&
+            !isNaN(coords.lng);
+
+          const destination = hasValidCoords
+            ? {
+                latitude: coords.lat,
+                longitude: coords.lng,
+                name: this.getDestinationName(coords.lat, coords.lng),
+              }
+            : null;
 
           return {
             id: p.id,
@@ -413,16 +420,12 @@ export class SimulationService {
             boardedAt: p.boardedAt,
             droppedOffAt: p.droppedOffAt,
             boardingOtp: otp,
-            destination: {
-              latitude: coords.lat,
-              longitude: coords.lng,
-              name: destName,
-            },
+            destination,
           };
         }),
       );
 
-      const latestRouteVersion = activeTrip.rideGroup.routeVersions[0];
+      const latestRouteVersion = activeTrip.rideGroup?.routeVersions?.[0];
 
       return {
         journeyState: activeTrip.status,
@@ -534,16 +537,25 @@ export class SimulationService {
               }
             : null,
           members: activeGroup.members.map((m) => {
-            const coords = groupCoordMap.get(m.bookingId) || { lat: 23.1678, lng: 72.645 };
+            const coords = groupCoordMap.get(m.bookingId);
+            const hasValidCoords =
+              coords &&
+              typeof coords.lat === 'number' &&
+              !isNaN(coords.lat) &&
+              typeof coords.lng === 'number' &&
+              !isNaN(coords.lng);
+
             return {
               bookingId: m.bookingId,
               passengerName: m.booking.passenger.fullName,
               allocatedFarePaise: m.allocatedFarePaise,
-              destination: {
-                latitude: coords.lat,
-                longitude: coords.lng,
-                name: this.getDestinationName(coords.lat, coords.lng),
-              },
+              destination: hasValidCoords
+                ? {
+                    latitude: coords.lat,
+                    longitude: coords.lng,
+                    name: this.getDestinationName(coords.lat, coords.lng),
+                  }
+                : null,
             };
           }),
         },
@@ -590,17 +602,26 @@ export class SimulationService {
       return {
         journeyState: 'WAITING_FOR_MATCH',
         bookings: bookings.map((b) => {
-          const coords = waitingCoordMap.get(b.id) || { lat: 23.1678, lng: 72.645 };
+          const coords = waitingCoordMap.get(b.id);
+          const hasValidCoords =
+            coords &&
+            typeof coords.lat === 'number' &&
+            !isNaN(coords.lat) &&
+            typeof coords.lng === 'number' &&
+            !isNaN(coords.lng);
+
           return {
             id: b.id,
             passengerName: b.passenger.fullName,
             status: b.status,
             createdAt: b.createdAt,
-            destination: {
-              latitude: coords.lat,
-              longitude: coords.lng,
-              name: this.getDestinationName(coords.lat, coords.lng),
-            },
+            destination: hasValidCoords
+              ? {
+                  latitude: coords.lat,
+                  longitude: coords.lng,
+                  name: this.getDestinationName(coords.lat, coords.lng),
+                }
+              : null,
           };
         }),
       };
@@ -835,6 +856,13 @@ export class SimulationService {
    */
   async updateDriverLocation(driverUserId: string, latitude: number, longitude: number) {
     this.checkEnvironmentSafety();
+
+    const demoEntities = await this.getDemoEntities();
+    if (!demoEntities.demoDriverUserId || driverUserId !== demoEntities.demoDriverUserId) {
+      throw new ForbiddenException(
+        'GPS simulation rejected: Only the provisioned demo driver user ID is permitted for simulation location updates.',
+      );
+    }
 
     await this.driversService.recordDriverLocation(driverUserId, {
       latitude,

@@ -24,6 +24,7 @@ interface SimulationControlsProps {
   autoRunning: boolean;
   lastMessage: string | null;
   journeyState: string;
+  isRouteAvailable?: boolean;
 }
 
 export const SimulationControls: React.FC<SimulationControlsProps> = ({
@@ -37,7 +38,14 @@ export const SimulationControls: React.FC<SimulationControlsProps> = ({
   autoRunning,
   lastMessage,
   journeyState,
+  isRouteAvailable = false,
 }) => {
+  const isTripActive =
+    journeyState === "ASSIGNED" ||
+    journeyState === "AT_PICKUP" ||
+    journeyState === "IN_PROGRESS";
+  const isGpsDisabled = loading || autoRunning || !isTripActive || !isRouteAvailable;
+  const isAutoRunDisabled = loading || autoRunning || (isTripActive && !isRouteAvailable);
   return (
     <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm space-y-5">
       <div className="flex items-center justify-between border-b border-slate-100 pb-3">
@@ -53,7 +61,7 @@ export const SimulationControls: React.FC<SimulationControlsProps> = ({
         {/* Auto Run Button */}
         <button
           onClick={onAutoRun}
-          disabled={loading || autoRunning}
+          disabled={isAutoRunDisabled}
           className="flex items-center space-x-1.5 px-4 py-2 bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-700 hover:to-violet-700 text-white rounded-xl text-xs font-semibold shadow-md shadow-indigo-100 transition disabled:opacity-50"
         >
           {autoRunning ? (
@@ -64,6 +72,16 @@ export const SimulationControls: React.FC<SimulationControlsProps> = ({
           <span>{autoRunning ? "Auto Journey Running..." : "Auto Run Full Journey"}</span>
         </button>
       </div>
+
+      {/* Unavailable Route Warning Banner */}
+      {isTripActive && !isRouteAvailable && (
+        <div className="flex items-center space-x-2 p-3 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-800">
+          <AlertCircle className="w-4 h-4 text-rose-600 flex-shrink-0" />
+          <span>
+            Backend route geometry is unavailable or invalid. Driver GPS simulation and auto-run are disabled.
+          </span>
+        </div>
+      )}
 
       {/* Action Buttons Grid */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
@@ -140,7 +158,7 @@ export const SimulationControls: React.FC<SimulationControlsProps> = ({
       <div className="flex flex-wrap items-center gap-3 pt-2 border-t border-slate-100">
         <button
           onClick={onSimulateGps}
-          disabled={loading || autoRunning || (journeyState !== "IN_PROGRESS" && journeyState !== "AT_PICKUP" && journeyState !== "ASSIGNED")}
+          disabled={isGpsDisabled}
           className="flex items-center space-x-1.5 px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs font-medium transition disabled:opacity-50"
         >
           <Navigation className="w-3.5 h-3.5 text-indigo-600" />

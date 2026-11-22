@@ -43,7 +43,7 @@ function getRouteWaypoints(geometry: any): Array<{ lat: number; lng: number }> {
       lng: c[0],
     }));
   }
-  return [{ lat: 23.155, lng: 72.6668 }];
+  return [];
 }
 
 export default function SimulationDashboardPage() {
@@ -223,6 +223,13 @@ export default function SimulationDashboardPage() {
       }
 
       const waypoints = getRouteWaypoints(journey?.route?.geometry);
+      if (waypoints.length === 0) {
+        setLastMessage(
+          "Route geometry is unavailable or invalid from backend. Driver GPS simulation is disabled."
+        );
+        return;
+      }
+
       waypointIndexRef.current =
         (waypointIndexRef.current + 1) % waypoints.length;
       const targetPoint = waypoints[waypointIndexRef.current];
@@ -297,6 +304,12 @@ export default function SimulationDashboardPage() {
 
       // 8. GPS movement & Drop-offs dynamically derived from backend route geometry
       const waypoints = getRouteWaypoints(activeJourney?.route?.geometry);
+      if (waypoints.length === 0) {
+        setLastMessage(
+          "Auto-run halted: Backend route geometry is unavailable or invalid. Cannot simulate driver GPS movement."
+        );
+        return;
+      }
       const midPoint = Math.max(1, Math.floor(waypoints.length / 2));
 
       // Leg 1: Travel towards first drop-off
@@ -365,6 +378,9 @@ export default function SimulationDashboardPage() {
     }
   };
 
+  const isRouteAvailable =
+    getRouteWaypoints(journey?.route?.geometry).length > 0;
+
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col">
       <Header
@@ -387,6 +403,7 @@ export default function SimulationDashboardPage() {
           autoRunning={autoRunning}
           lastMessage={lastMessage}
           journeyState={journey?.journeyState || "IDLE"}
+          isRouteAvailable={isRouteAvailable}
         />
 
         {/* Status Card */}

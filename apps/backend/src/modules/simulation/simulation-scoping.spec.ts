@@ -1,4 +1,5 @@
 import { ConfigService } from '@nestjs/config';
+import { ForbiddenException } from '@nestjs/common';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { SimulationService } from './simulation.service.js';
 
@@ -116,6 +117,14 @@ describe('Simulation Scoping & Dynamic Route Geometry (PR #53 Review Fixes)', ()
       getPassengerBoardingOtp: vi.fn().mockResolvedValue('1234'),
     };
 
+    const realtimeGatewayMock = {
+      server: {
+        to: vi.fn().mockReturnValue({
+          emit: vi.fn(),
+        }),
+      },
+    };
+
     service = new SimulationService(
       prismaMock,
       matchingServiceMock,
@@ -127,7 +136,7 @@ describe('Simulation Scoping & Dynamic Route Geometry (PR #53 Review Fixes)', ()
       authServiceMock,
       redisServiceMock,
       configService,
-      {} as any,
+      realtimeGatewayMock as any,
     );
   });
 
@@ -251,22 +260,126 @@ describe('Simulation Scoping & Dynamic Route Geometry (PR #53 Review Fixes)', ()
       expect(journey.journeyState).toBe('IN_PROGRESS');
       expect(journey.passengers).toHaveLength(2);
 
-      // Verify dynamic destination mapping (not based on passenger name string matching)
+      // Verify neutral coordinate-based label (no proximity guessing)
       expect(journey.passengers[0].destination).toEqual({
         latitude: 23.1678,
         longitude: 72.645,
-        name: 'Bhaijipura Circle',
+        name: 'Drop-off (23.1678, 72.6450)',
       });
       expect(journey.passengers[1].destination).toEqual({
         latitude: 23.1885,
         longitude: 72.6288,
-        name: 'Kudasan Cross Road',
+        name: 'Drop-off (23.1885, 72.6288)',
       });
 
       // Verify dynamic route geometry extracted from route version
       expect(journey.route.geometry).toEqual(mockRouteGeometry);
       expect(journey.route.distanceMeters).toBe(4200);
       expect(journey.route.durationSec).toBe(540);
+    });
+
+    it('getActiveJourney returns null route geometry when routeVersions is empty or routeGeometry is null', async () => {
+      prismaMock.trip.findFirst.mockResolvedValue({
+        id: 'trip-demo-1',
+        status: 'IN_PROGRESS',
+        activeDriverId: DEMO_DRIVER_PROFILE_ID,
+        driverArrivedAt: new Date(),
+        startedAt: new Date(),
+        completedAt: null,
+        activeDriver: {
+          userId: DEMO_DRIVER_USER_ID,
+          licenseNumber: 'GJ-01-DEMO-2026',
+          user: { fullName: 'Ramesh Patel' },
+          vehicles: [{ makeModel: 'Mahindra Treo' }],
+        },
+        passengers: [],
+        rideGroup: {
+          routeVersions: [],
+        },
+      });
+
+      prismaMock.$queryRaw.mockResolvedValue([]);
+
+      const journey = await service.getActiveJourney();
+
+      expect(journey.journeyState).toBe('IN_PROGRESS');
+      expect(journey.route.geometry).toBeNull();
+      expect(journey.route.distanceMeters).toBe(0);
+      expect(journey.route.durationSec).toBe(0);
+    });
+
+    it('getActiveJourney returns null destination when PostGIS returns no coordinates for a booking', async () => {
+      prismaMock.trip.findFirst.mockResolvedValue({
+        id: 'trip-demo-1',
+        status: 'IN_PROGRESS',
+        activeDriverId: DEMO_DRIVER_PROFILE_ID,
+        driverArrivedAt: new Date(),
+        startedAt: new Date(),
+        completedAt: null,
+        activeDriver: {
+          userId: DEMO_DRIVER_USER_ID,
+          licenseNumber: 'GJ-01-DEMO-2026',
+          user: { fullName: 'Ramesh Patel' },
+          vehicles: [{ makeModel: 'Mahindra Treo' }],
+        },
+        passengers: [
+          {
+            id: 'trip-pax-1',
+            passengerId: DEMO_PAX_1_ID,
+            bookingId: 'booking-pax-without-coords',
+            status: 'BOARDED',
+            finalRideFarePaise: 2500,
+            boardedAt: new Date(),
+            droppedOffAt: null,
+            passenger: { fullName: 'Aarav Sharma', email: 'demo.passenger1@pdeu.ac.in' },
+          },
+        ],
+        rideGroup: {
+          routeVersions: [
+            {
+              totalDistanceMeters: 2000,
+              totalDurationSec: 300,
+              routeGeometry: { type: 'LineString', coordinates: [[72.66, 23.15]] },
+            },
+          ],
+        },
+      });
+
+      // Query returns empty array -> No PostGIS coordinates found
+      prismaMock.$queryRaw.mockResolvedValue([]);
+
+      const journey = await service.getActiveJourney();
+
+      expect(journey.passengers).toHaveLength(1);
+      // Destination must be null without falling back to Bhaijipura or fabricated coordinates
+      expect(journey.passengers[0].destination).toBeNull();
+    });
+  });
+
+  describe('3. GPS Simulation Driver Protection: Rejects arbitrary non-demo driver user IDs', () => {
+    it('updateDriverLocation rejects non-demo driverUserId with ForbiddenException', async () => {
+      await expect(
+        service.updateDriverLocation(REAL_COMMUTER_DRIVER_ID, 23.1678, 72.645),
+      ).rejects.toThrowError(ForbiddenException);
+
+      expect(driversServiceMock.recordDriverLocation).not.toHaveBeenCalled();
+    });
+
+    it('updateDriverLocation succeeds when given the provisioned demo driver user ID', async () => {
+      prismaMock.driverProfile.findUnique.mockResolvedValue({
+        id: DEMO_DRIVER_PROFILE_ID,
+        userId: DEMO_DRIVER_USER_ID,
+      });
+
+      const res = await service.updateDriverLocation(DEMO_DRIVER_USER_ID, 23.1678, 72.645);
+
+      expect(res.success).toBe(true);
+      expect(res.latitude).toBe(23.1678);
+      expect(res.longitude).toBe(72.645);
+      expect(driversServiceMock.recordDriverLocation).toHaveBeenCalledWith(
+        DEMO_DRIVER_USER_ID,
+        expect.objectContaining({ latitude: 23.1678, longitude: 72.645 }),
+      );
     });
   });
 });

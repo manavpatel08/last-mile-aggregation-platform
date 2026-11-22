@@ -6,6 +6,9 @@ import '../core/config/app_config.dart';
 import '../core/network/api_client.dart';
 import '../core/network/auth_refresh_interceptor.dart';
 import '../core/network/auth_token_store.dart';
+import '../core/realtime/socket_client.dart';
+import '../core/realtime/socket_service.dart';
+import '../core/realtime/socket_ticket_provider.dart';
 import '../core/storage/secure_token_storage.dart';
 import '../core/theme/app_theme.dart';
 import '../features/auth/data/api_auth_repository.dart';
@@ -51,6 +54,8 @@ class LastMileApp extends StatefulWidget {
     this.bookingDetailsProvider,
     this.passengerHomeProvider,
     this.tripRepository,
+    this.socketService,
+    this.socketTicketProvider,
   });
 
   final AppConfig config;
@@ -71,6 +76,8 @@ class LastMileApp extends StatefulWidget {
   final BookingDetailsProvider? bookingDetailsProvider;
   final PassengerHomeProvider? passengerHomeProvider;
   final TripRepository? tripRepository;
+  final SocketService? socketService;
+  final SocketTicketProvider? socketTicketProvider;
 
   @override
   State<LastMileApp> createState() => _LastMileAppState();
@@ -97,6 +104,8 @@ class _LastMileAppState extends State<LastMileApp> {
   late final PassengerHomeProvider _passengerHomeProvider;
   late final bool _ownsPassengerHomeProvider;
   late final TripRepository _tripRepository;
+  late final SocketService _socketService;
+  late final bool _ownsSocketService;
   late final AuthProvider _authProvider;
   late final bool _ownsAuthProvider;
   late final ApiClient _apiClient;
@@ -105,9 +114,14 @@ class _LastMileAppState extends State<LastMileApp> {
 
   void _handleAuthChange() {
     final currentUserId = _authProvider.user?.id;
-    if (currentUserId != _lastAuthUserId || !_authProvider.isAuthenticated) {
+    if (currentUserId != _lastAuthUserId) {
       _lastAuthUserId = currentUserId;
       _driverHomeProvider.clear();
+    }
+    if (_authProvider.isAuthenticated) {
+      _socketService.connect();
+    } else {
+      _socketService.disconnect();
     }
   }
 
@@ -193,6 +207,15 @@ class _LastMileAppState extends State<LastMileApp> {
     _tripRepository =
         widget.tripRepository ?? ApiTripRepository(apiClient: _apiClient);
 
+    _ownsSocketService = widget.socketService == null;
+    _socketService = widget.socketService ??
+        RealtimeSocketService(
+          config: widget.config,
+          ticketProvider: widget.socketTicketProvider ??
+              ApiSocketTicketProvider(apiClient: _apiClient),
+          client: NoOpSocketClient(),
+        );
+
     _router = AppRouter.createRouter(
       appModeProvider: _appModeProvider,
       authProvider: _authProvider,
@@ -200,12 +223,18 @@ class _LastMileAppState extends State<LastMileApp> {
 
     _lastAuthUserId = _authProvider.user?.id;
     _authProvider.addListener(_handleAuthChange);
+    if (_authProvider.isAuthenticated) {
+      _socketService.connect();
+    }
   }
 
   @override
   void dispose() {
     _authProvider.removeListener(_handleAuthChange);
     _router.dispose();
+    if (_ownsSocketService) {
+      _socketService.dispose();
+    }
     if (_ownsAppModeProvider) {
       _appModeProvider.dispose();
     }
@@ -243,6 +272,7 @@ class _LastMileAppState extends State<LastMileApp> {
         Provider<DriverRepository>.value(value: _driverRepository),
         Provider<BookingRepository>.value(value: _bookingRepository),
         Provider<TripRepository>.value(value: _tripRepository),
+        Provider<SocketService>.value(value: _socketService),
         Provider<PassengerLocationService>.value(value: _locationService),
         ChangeNotifierProvider<AppModeProvider>.value(value: _appModeProvider),
         ChangeNotifierProvider<AuthProvider>.value(value: _authProvider),

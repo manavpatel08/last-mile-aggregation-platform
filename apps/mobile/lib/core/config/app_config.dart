@@ -29,6 +29,8 @@ class AppConfig {
     required this.apiBaseUrl,
     required this.socketBaseUrl,
     required this.appEnv,
+    this.socketNamespace = '/realtime',
+    this.socketPath = '/socket.io',
     this.initialMode = AppMode.unselected,
     this.googleClientIdIos,
     this.googleServerClientId,
@@ -49,6 +51,8 @@ class AppConfig {
       defaultValue: 'development',
     );
     const rawAppMode = String.fromEnvironment('APP_MODE');
+    const rawSocketNamespace = String.fromEnvironment('SOCKET_NAMESPACE');
+    const rawSocketPath = String.fromEnvironment('SOCKET_PATH');
     const rawGoogleClientIdIos = String.fromEnvironment('GOOGLE_CLIENT_ID_IOS');
     const rawGoogleServerClientId = String.fromEnvironment('GOOGLE_SERVER_CLIENT_ID');
     const rawAdminPortalUrl = String.fromEnvironment('ADMIN_PORTAL_URL');
@@ -69,6 +73,12 @@ class AppConfig {
     return AppConfig(
       apiBaseUrl: resolvedApiUrl,
       socketBaseUrl: resolvedSocketUrl,
+      socketNamespace: rawSocketNamespace.trim().isNotEmpty
+          ? rawSocketNamespace.trim()
+          : '/realtime',
+      socketPath: rawSocketPath.trim().isNotEmpty
+          ? rawSocketPath.trim()
+          : '/socket.io',
       appEnv: rawAppEnv.trim().isNotEmpty ? rawAppEnv.trim() : 'development',
       initialMode: AppMode.fromString(rawAppMode),
       googleClientIdIos: rawGoogleClientIdIos.trim().isNotEmpty
@@ -85,6 +95,8 @@ class AppConfig {
 
   final String apiBaseUrl;
   final String socketBaseUrl;
+  final String socketNamespace;
+  final String socketPath;
   final String appEnv;
   final AppMode initialMode;
   final String? googleClientIdIos;

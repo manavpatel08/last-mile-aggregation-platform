@@ -3,6 +3,7 @@ import {
   Logger,
   NotFoundException,
   ForbiddenException,
+  ServiceUnavailableException,
   Optional,
 } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
@@ -47,12 +48,14 @@ export class SimulationService {
       process.env.NODE_ENV ||
       'development';
     const isProd = env === 'production' || process.env.NODE_ENV === 'production';
+    const configDemo =
+      this.configService.get<boolean | string>('demoMode') ??
+      this.configService.get<boolean | string>('DEMO_MODE');
     const isDemo =
       !isProd &&
-      (this.configService.get<boolean>('demoMode', false) ||
-        this.configService.get<boolean>('DEMO_MODE', false) ||
-        process.env.DEMO_MODE === 'true' ||
-        process.env.DEMO_MODE === '1');
+      (configDemo !== undefined
+        ? configDemo === true || configDemo === 'true' || configDemo === '1'
+        : process.env.DEMO_MODE === 'true' || process.env.DEMO_MODE === '1');
 
     if (isProd || !isDemo) {
       throw new ForbiddenException(
@@ -276,6 +279,12 @@ export class SimulationService {
     const leaseKey = `lease:matching:${targetName.toLowerCase().replace(/[^a-z0-9]/g, '-')}`;
     const summary = await this.matchingService.processMatchingCycle(targetName, leaseKey);
 
+    if (summary && summary.skippedReason === 'ROUTING_UNAVAILABLE') {
+      throw new ServiceUnavailableException(
+        'Matching engine requires authoritative road-network routing, but local OSRM routing service is unavailable on port 5000. Launch OSRM (or configure OSRM_BACKEND_URL) to form ride groups.',
+      );
+    }
+
     // Trigger dispatch for formed groups immediately
     if (summary && summary.groupsFormedCount > 0 && summary.formedGroupIds.length > 0) {
       for (const groupId of summary.formedGroupIds) {
@@ -311,7 +320,7 @@ export class SimulationService {
     // 1. Check for active trip strictly scoped to demo driver or demo passengers
     const activeTrip = await this.prisma.trip.findFirst({
       where: {
-        status: { in: ['ASSIGNED', 'AT_PICKUP', 'IN_PROGRESS'] },
+        status: { in: ['CREATED', 'DRIVER_EN_ROUTE', 'ASSIGNED', 'AT_PICKUP', 'IN_PROGRESS'] },
         OR: [
           demoEntities.demoDriverProfileId
             ? { activeDriverId: demoEntities.demoDriverProfileId }
@@ -344,8 +353,13 @@ export class SimulationService {
         },
         rideGroup: {
           include: {
-            routeVersions: { orderBy: { versionNumber: 'desc' }, take: 1 },
-            stops: { orderBy: { stopOrder: 'asc' } },
+            routeVersions: {
+              orderBy: { versionNumber: 'desc' },
+              take: 1,
+              include: {
+                stops: { orderBy: { stopOrder: 'asc' } },
+              },
+            },
           },
         },
       },
@@ -428,7 +442,10 @@ export class SimulationService {
       const latestRouteVersion = activeTrip.rideGroup?.routeVersions?.[0];
 
       return {
-        journeyState: activeTrip.status,
+        journeyState:
+          activeTrip.status === 'CREATED' || activeTrip.status === 'DRIVER_EN_ROUTE'
+            ? 'ASSIGNED'
+            : activeTrip.status,
         trip: {
           id: activeTrip.id,
           status: activeTrip.status,
@@ -717,10 +734,10 @@ export class SimulationService {
       };
     }
 
-    // 2. Check for Trip in ASSIGNED strictly for demo driver / demo passengers -> Driver Arrives
+    // 2. Check for Trip in CREATED / DRIVER_EN_ROUTE / ASSIGNED strictly for demo driver / demo passengers -> Driver Arrives
     const assignedTrip = await this.prisma.trip.findFirst({
       where: {
-        status: 'ASSIGNED',
+        status: { in: ['CREATED', 'DRIVER_EN_ROUTE', 'ASSIGNED'] },
         ...(demoEntities.demoDriverProfileId
           ? { activeDriverId: demoEntities.demoDriverProfileId }
           : {}),
@@ -732,6 +749,22 @@ export class SimulationService {
     });
 
     if (assignedTrip && demoEntities.demoDriverUserId) {
+      // Ensure driver location telemetry is fresh (< 30s) at PDEU Demo Station before reporting arrival
+      const existingFix = await this.driversService.getDriverGpsFix(assignedTrip.activeDriverId);
+      const isFresh =
+        existingFix &&
+        existingFix.updatedAt &&
+        Date.now() - new Date(existingFix.updatedAt).getTime() <= 30_000;
+
+      if (!isFresh) {
+        await this.driversService.recordDriverLocation(demoEntities.demoDriverUserId, {
+          latitude: 23.155,
+          longitude: 72.6668,
+          heading: 0,
+          speed: 0,
+        });
+      }
+
       const arriveResult = await this.tripsService.reportArrival(
         demoEntities.demoDriverUserId,
         assignedTrip.id,
@@ -1127,13 +1160,21 @@ export class SimulationService {
         `;
       }
 
-      // 11. Bookings & booking status history for demo bookings
+      // 11. Bookings & dependent references for demo bookings
       if (demoBookingIds.length > 0) {
+        // 11a. Matching batch bookings referencing demo bookings (must precede bookings to satisfy RESTRICT FK)
+        await tx.$executeRaw`
+          DELETE FROM matching_batch_bookings
+          WHERE booking_id = ANY(${demoBookingIds}::uuid[]);
+        `;
+
+        // 11b. Booking status history for demo bookings
         await tx.$executeRaw`
           DELETE FROM booking_status_history
           WHERE booking_id = ANY(${demoBookingIds}::uuid[]);
         `;
 
+        // 11c. Bookings strictly for demo passengers
         await tx.$executeRaw`
           DELETE FROM bookings
           WHERE id = ANY(${demoBookingIds}::uuid[]);

@@ -31,6 +31,7 @@ export const JourneyStatusCard: React.FC<JourneyStatusCardProps> = ({
       case "DISPATCHING":
         return "bg-amber-50 text-amber-700 border-amber-200 animate-pulse";
       case "ASSIGNED":
+      case "CREATED":
         return "bg-indigo-50 text-indigo-700 border-indigo-200";
       case "AT_PICKUP":
         return "bg-cyan-50 text-cyan-700 border-cyan-200";
@@ -211,6 +212,7 @@ export const JourneyStatusCard: React.FC<JourneyStatusCardProps> = ({
           )}
 
           {(journeyState === "ASSIGNED" ||
+            journeyState === "CREATED" ||
             journeyState === "AT_PICKUP" ||
             journeyState === "IN_PROGRESS" ||
             journeyState === "COMPLETED") && (

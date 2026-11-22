@@ -464,4 +464,225 @@ describe('Simulation Scoping & Dynamic Route Geometry (PR #53 Review Fixes)', ()
       );
     });
   });
+
+  describe('4. Trip Lifecycle CREATED Status Recognition & Driver Arrival Advancements', () => {
+    const mockRouteGeometry = {
+      type: 'LineString',
+      coordinates: [
+        [72.6668, 23.155],
+        [72.6455, 23.1678],
+      ],
+    };
+
+    it('1. A Trip created with status CREATED is returned by getActiveJourney(), including route geometry', async () => {
+      prismaMock.trip.findFirst.mockImplementation(({ where }: any) => {
+        expect(where.status.in).toContain('CREATED');
+        return Promise.resolve({
+          id: 'trip-demo-created',
+          status: 'CREATED',
+          activeDriverId: DEMO_DRIVER_PROFILE_ID,
+          driverArrivedAt: null,
+          startedAt: null,
+          completedAt: null,
+          activeDriver: {
+            userId: DEMO_DRIVER_USER_ID,
+            licenseNumber: 'GJ-01-DEMO-2026',
+            user: { fullName: 'Ramesh Patel' },
+            vehicles: [{ makeModel: 'Mahindra Treo' }],
+          },
+          passengers: [
+            {
+              id: 'tp-1',
+              passengerId: DEMO_PAX_1_ID,
+              bookingId: 'booking-pax-1',
+              status: 'ASSIGNED',
+              finalRideFarePaise: 2500,
+              boardedAt: null,
+              droppedOffAt: null,
+              passenger: { fullName: 'Aarav Sharma', email: 'demo.passenger1@pdeu.ac.in' },
+            },
+          ],
+          rideGroup: {
+            routeVersions: [
+              {
+                totalDistanceMeters: 7625,
+                totalDurationSec: 720,
+                routeGeometry: mockRouteGeometry,
+              },
+            ],
+          },
+        });
+      });
+
+      prismaMock.$queryRaw.mockResolvedValue([
+        { id: 'booking-pax-1', dest_lat: 23.1678, dest_lng: 72.645 },
+      ]);
+
+      const journey = await service.getActiveJourney();
+
+      expect(journey.journeyState).toBe('ASSIGNED');
+      expect(journey.trip.status).toBe('CREATED');
+      expect(journey.route.geometry).toEqual(mockRouteGeometry);
+      expect(journey.route.distanceMeters).toBe(7625);
+    });
+
+    it('2. The driver-arrival step correctly finds and advances a Trip in CREATED status', async () => {
+      // No pending dispatch offer
+      prismaMock.driverDispatchOffer.findFirst.mockResolvedValue(null);
+
+      // findFirst for Trip in CREATED / DRIVER_EN_ROUTE / ASSIGNED
+      prismaMock.trip.findFirst.mockImplementation(({ where }: any) => {
+        if (where.status && (where.status.in || Array.isArray(where.status))) {
+          const statuses = where.status.in || where.status;
+          expect(statuses).toContain('CREATED');
+        }
+        return Promise.resolve({
+          id: 'trip-demo-created',
+          status: 'CREATED',
+          activeDriverId: DEMO_DRIVER_PROFILE_ID,
+          activeDriver: {
+            userId: DEMO_DRIVER_USER_ID,
+          },
+        });
+      });
+
+      tripsServiceMock.reportArrival.mockResolvedValue({
+        tripId: 'trip-demo-created',
+        status: 'AT_PICKUP',
+        driverArrivedAt: new Date().toISOString(),
+      });
+
+      const res = await service.progressStep();
+
+      expect(res.stepExecuted).toBe('DRIVER_ARRIVED');
+      expect(res.message).toContain('Driver arrived at PDEU Demo Station');
+      expect(tripsServiceMock.reportArrival).toHaveBeenCalledWith(
+        DEMO_DRIVER_USER_ID,
+        'trip-demo-created',
+      );
+    });
+
+    it('3. Missing or stale GPS telemetry produces a clear error rather than silently returning NO_ACTION', async () => {
+      prismaMock.driverDispatchOffer.findFirst.mockResolvedValue(null);
+
+      prismaMock.trip.findFirst.mockResolvedValue({
+        id: 'trip-demo-created',
+        status: 'CREATED',
+        activeDriverId: DEMO_DRIVER_PROFILE_ID,
+        activeDriver: {
+          userId: DEMO_DRIVER_USER_ID,
+        },
+      });
+
+      tripsServiceMock.reportArrival.mockRejectedValue(
+        new Error('Driver GPS fix is stale (>30s old). Recent telemetry required to verify pickup arrival.'),
+      );
+
+      // Must reject with the telemetry error and NOT silently return NO_ACTION
+      await expect(service.progressStep()).rejects.toThrowError(
+        'Driver GPS fix is stale (>30s old)',
+      );
+      expect(tripsServiceMock.reportArrival).toHaveBeenCalled();
+    });
+
+    it('4. The complete simulation lifecycle progresses through all states', async () => {
+      // Step 1: Offer Acceptance
+      prismaMock.driverDispatchOffer.findFirst.mockResolvedValueOnce({
+        id: 'offer-1',
+        driverId: DEMO_DRIVER_PROFILE_ID,
+        rideGroup: {
+          id: 'group-1',
+          routeVersions: [{ routeGeometry: mockRouteGeometry }],
+        },
+      });
+      dispatchServiceMock.acceptOffer.mockResolvedValueOnce({ tripId: 'trip-1' });
+
+      const step1 = await service.progressStep();
+      expect(step1.stepExecuted).toBe('OFFER_ACCEPTED');
+
+      // Step 2: Driver Arrives
+      prismaMock.driverDispatchOffer.findFirst.mockResolvedValue(null);
+      prismaMock.trip.findFirst.mockResolvedValueOnce({
+        id: 'trip-1',
+        status: 'CREATED',
+        activeDriverId: DEMO_DRIVER_PROFILE_ID,
+        activeDriver: { userId: DEMO_DRIVER_USER_ID },
+      });
+      tripsServiceMock.reportArrival.mockResolvedValueOnce({ tripId: 'trip-1', status: 'AT_PICKUP' });
+
+      const step2 = await service.progressStep();
+      expect(step2.stepExecuted).toBe('DRIVER_ARRIVED');
+
+      // Step 3: Board & Start Trip
+      prismaMock.trip.findFirst
+        .mockResolvedValueOnce(null) // for ASSIGNED / CREATED
+        .mockResolvedValueOnce({
+          id: 'trip-1',
+          status: 'AT_PICKUP',
+          activeDriverId: DEMO_DRIVER_PROFILE_ID,
+          activeDriver: { userId: DEMO_DRIVER_USER_ID },
+          passengers: [
+            {
+              id: 'tp-1',
+              passengerId: DEMO_PAX_1_ID,
+              bookingId: 'b-1',
+              status: 'WAITING',
+            },
+          ],
+        });
+      tripsServiceMock.verifyBoarding = vi.fn().mockResolvedValue({});
+      tripsServiceMock.startTrip = vi.fn().mockResolvedValue({ tripId: 'trip-1', status: 'IN_PROGRESS' });
+
+      const step3 = await service.progressStep();
+      expect(step3.stepExecuted).toBe('TRIP_STARTED');
+
+      // Step 4: Drop-off
+      prismaMock.trip.findFirst
+        .mockResolvedValueOnce(null) // for ASSIGNED
+        .mockResolvedValueOnce(null) // for AT_PICKUP
+        .mockResolvedValueOnce({
+          id: 'trip-1',
+          status: 'IN_PROGRESS',
+          activeDriverId: DEMO_DRIVER_PROFILE_ID,
+          activeDriver: { userId: DEMO_DRIVER_USER_ID },
+          passengers: [
+            {
+              id: 'tp-1',
+              passengerId: DEMO_PAX_1_ID,
+              status: 'BOARDED',
+              finalRideFarePaise: 2500,
+              waitingChargePaise: 0,
+            },
+          ],
+          rideGroup: { routeVersions: [{ routeGeometry: mockRouteGeometry }] },
+        });
+      tripsServiceMock.completePassenger = vi.fn().mockResolvedValue({});
+      prismaMock.cashCollection = { create: vi.fn().mockResolvedValue({}) };
+
+      const step4 = await service.progressStep();
+      expect(step4.stepExecuted).toBe('PASSENGER_DROPPED_OFF');
+
+      // Step 5: Complete Trip
+      prismaMock.trip.findFirst
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce({
+          id: 'trip-1',
+          status: 'IN_PROGRESS',
+          activeDriverId: DEMO_DRIVER_PROFILE_ID,
+          activeDriver: { userId: DEMO_DRIVER_USER_ID },
+          passengers: [
+            {
+              id: 'tp-1',
+              passengerId: DEMO_PAX_1_ID,
+              status: 'COMPLETED',
+            },
+          ],
+        });
+      tripsServiceMock.completeTrip = vi.fn().mockResolvedValue({ tripId: 'trip-1', status: 'COMPLETED' });
+
+      const step5 = await service.progressStep();
+      expect(step5.stepExecuted).toBe('TRIP_COMPLETED');
+    });
+  });
 });

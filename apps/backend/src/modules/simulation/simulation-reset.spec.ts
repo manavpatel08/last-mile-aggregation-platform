@@ -194,4 +194,42 @@ describe('SimulationService — Safe Reset & Isolation (Stage 11 Task 3)', () =>
     );
     expect(rideGroupDeleteCall).toBeUndefined();
   });
+
+  it('8. Reset deletes matching_batch_bookings before deleting bookings to satisfy RESTRICT foreign key', async () => {
+    const demoPaxId = 'pax-demo-1-uuid';
+    const demoBookingId = 'booking-demo-1-uuid';
+
+    prismaMock.user.findMany.mockResolvedValue([
+      { id: demoPaxId, email: 'demo.passenger1@pdeu.ac.in' },
+    ]);
+    prismaMock.driverProfile.findMany.mockResolvedValue([]);
+    prismaMock.booking.findMany.mockResolvedValue([{ id: demoBookingId }]);
+    prismaMock.groupMember.findMany.mockResolvedValue([]);
+    prismaMock.trip.findMany.mockResolvedValue([]);
+    prismaMock.driverDispatchOffer.findMany.mockResolvedValue([]);
+
+    const result = await service.resetSimulation();
+
+    expect(result.success).toBe(true);
+
+    const executeRawCalls = prismaMock.$executeRaw.mock.calls;
+
+    // Find indices of matching_batch_bookings delete and bookings delete
+    const batchBookingsDeleteIdx = executeRawCalls.findIndex((c: any) =>
+      JSON.stringify(c).includes('DELETE FROM matching_batch_bookings'),
+    );
+    const bookingsDeleteIdx = executeRawCalls.findIndex((c: any) =>
+      JSON.stringify(c).includes('DELETE FROM bookings'),
+    );
+
+    expect(batchBookingsDeleteIdx).toBeGreaterThanOrEqual(0);
+    expect(bookingsDeleteIdx).toBeGreaterThanOrEqual(0);
+
+    // INVARIANT: matching_batch_bookings must be deleted BEFORE parent bookings
+    expect(batchBookingsDeleteIdx).toBeLessThan(bookingsDeleteIdx);
+
+    // Verify it targets demoBookingIds strictly
+    const batchBookingsCall = executeRawCalls[batchBookingsDeleteIdx];
+    expect(JSON.stringify(batchBookingsCall)).toContain('booking_id = ANY');
+  });
 });

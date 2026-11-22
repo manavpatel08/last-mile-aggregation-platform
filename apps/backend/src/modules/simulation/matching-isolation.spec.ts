@@ -175,4 +175,27 @@ describe('Matching Isolation — Dedicated Demo Pickup Point (Stage 11 Task 4)',
     // Matching cycle must NOT be triggered
     expect(matchingServiceMock.processMatchingCycle).not.toHaveBeenCalled();
   });
+
+  it('8e. triggerMatching strictly throws ServiceUnavailableException when matching was skipped due to ROUTING_UNAVAILABLE', async () => {
+    prismaMock.pickupPoint.findFirst.mockResolvedValue({
+      id: DEMO_STATION_ID,
+      name: 'PDEU Demo Station',
+      isActive: true,
+    });
+
+    matchingServiceMock.processMatchingCycle.mockResolvedValue({
+      batchId: 'batch-1',
+      pickupPointId: DEMO_STATION_ID,
+      groupsFormedCount: 0,
+      formedGroupIds: [],
+      skippedReason: 'ROUTING_UNAVAILABLE',
+    });
+
+    await expect(service.triggerMatching()).rejects.toThrowError(
+      'Matching engine requires authoritative road-network routing, but local OSRM routing service is unavailable on port 5000. Launch OSRM (or configure OSRM_BACKEND_URL) to form ride groups.',
+    );
+
+    // Dispatch initiation must NOT be called for empty groups
+    expect(dispatchServiceMock.initiateDispatchForGroup).not.toHaveBeenCalled();
+  });
 });

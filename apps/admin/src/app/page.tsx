@@ -129,9 +129,10 @@ export default function SimulationDashboardPage() {
               latitude: evt.data.latitude,
               longitude: evt.data.longitude,
             });
+          } else {
+            refreshJourney();
           }
           addEvent(evt.name, evt.data, evt.time);
-          refreshJourney();
         });
       } catch (err: any) {
         console.error("Initialization error:", err);
@@ -188,9 +189,15 @@ export default function SimulationDashboardPage() {
     try {
       setLoading(true);
       const res = await triggerMatching("PDEU Demo Station");
-      setLastMessage(
-        `Matching cycle executed for PDEU Demo Station. Formed groups: ${res.data?.groupsFormedCount || 0}`
-      );
+      if (res.data?.groupsFormedCount === 0) {
+        setLastMessage(
+          `Matching cycle executed for PDEU Demo Station, but 0 groups were formed. (${res.data?.skippedReason || "No eligible candidate groups"})`
+        );
+      } else {
+        setLastMessage(
+          `Matching cycle executed for PDEU Demo Station. Formed groups: ${res.data?.groupsFormedCount || 0}`
+        );
+      }
       addEvent("matching.executed", res.data);
       await refreshJourney();
     } catch (err: any) {
@@ -277,15 +284,25 @@ export default function SimulationDashboardPage() {
       await refreshJourney();
       await delay(2000);
 
+      // Verify that matching successfully produced a dispatch group
+      if (matchedJourney?.journeyState !== "DISPATCHING") {
+        setLastMessage(
+          `Auto-run error: Matching did not produce an active dispatch group (current state: ${matchedJourney?.journeyState || "UNKNOWN"}). Trip lifecycle halted to avoid an invalid state.`
+        );
+        await resetSimulation().catch(() => {});
+        await refreshJourney().catch(() => {});
+        return;
+      }
+
       // Validate route availability before advancing trip lifecycle
       const initialWaypoints = getRouteWaypoints(matchedJourney?.route?.geometry);
       if (initialWaypoints.length === 0) {
         setLastMessage(
-          "Auto-run error: Required route geometry is missing or invalid after matching. Trip lifecycle halted before offer acceptance to avoid a partially progressed journey."
+          "Auto-run error: Required route geometry is missing or invalid for ride group. Trip lifecycle halted before offer acceptance to avoid a partially progressed journey."
         );
         // Clean reset so no partially progressed journey is left in database
-        await resetSimulation();
-        await refreshJourney();
+        await resetSimulation().catch(() => {});
+        await refreshJourney().catch(() => {});
         return;
       }
 
@@ -296,8 +313,8 @@ export default function SimulationDashboardPage() {
         setLastMessage(
           "Auto-run error: Required route geometry is missing for ride group. Trip lifecycle was not advanced."
         );
-        await resetSimulation();
-        await refreshJourney();
+        await resetSimulation().catch(() => {});
+        await refreshJourney().catch(() => {});
         return;
       }
       await refreshJourney();
@@ -368,6 +385,8 @@ export default function SimulationDashboardPage() {
       );
     } catch (err: any) {
       setLastMessage(`Auto-run error: ${err.message}`);
+      await resetSimulation().catch(() => {});
+      await refreshJourney().catch(() => {});
     } finally {
       setAutoRunning(false);
       setLoading(false);

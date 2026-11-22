@@ -42,6 +42,7 @@ export const SimulationControls: React.FC<SimulationControlsProps> = ({
 }) => {
   const isTripActive =
     journeyState === "ASSIGNED" ||
+    journeyState === "CREATED" ||
     journeyState === "AT_PICKUP" ||
     journeyState === "IN_PROGRESS";
   const isGpsDisabled = loading || autoRunning || !isTripActive || !isRouteAvailable;

@@ -37,6 +37,9 @@ export const LiveMap: React.FC<LiveMapProps> = ({
   const driverMarkerRef = useRef<L.Marker | null>(null);
   const routePolylineRef = useRef<L.Polyline | null>(null);
   const destMarkersRef = useRef<L.Marker[]>([]);
+  const lastRouteKeyRef = useRef<string>("");
+  const hasFittedBoundsRef = useRef<boolean>(false);
+  const lastPassengersKeyRef = useRef<string>("");
 
   // Origin Hub: PDEU Demo Station
   const DEMO_STATION_COORDS: [number, number] = [23.155, 72.6668];
@@ -100,7 +103,15 @@ export const LiveMap: React.FC<LiveMapProps> = ({
     driverMarkerRef.current = driverMarker;
     mapRef.current = map;
 
+    // Invalidate size once DOM layout is settled to ensure correct tile rendering
+    const timer = setTimeout(() => {
+      if (mapRef.current) {
+        mapRef.current.invalidateSize();
+      }
+    }, 150);
+
     return () => {
+      clearTimeout(timer);
       map.remove();
       mapRef.current = null;
     };
@@ -109,6 +120,16 @@ export const LiveMap: React.FC<LiveMapProps> = ({
   // Update Dynamic Destination Markers from actual booking destinations
   useEffect(() => {
     if (!mapRef.current) return;
+
+    const passengersKey = (passengers || [])
+      .map(
+        (p) =>
+          `${p.id}:${p.status}:${p.destination?.latitude},${p.destination?.longitude}`
+      )
+      .join("|");
+
+    if (passengersKey === lastPassengersKeyRef.current) return;
+    lastPassengersKeyRef.current = passengersKey;
 
     // Clear previous destination markers
     destMarkersRef.current.forEach((m) => m.remove());
@@ -143,43 +164,62 @@ export const LiveMap: React.FC<LiveMapProps> = ({
     });
   }, [passengers]);
 
-  // Update Driver Marker Position when driverGps changes
+  // Update Driver Marker Position in place when driverGps changes
+  // Preserve user pan & zoom; do NOT call panTo or setView on every GPS event
   useEffect(() => {
     if (!driverMarkerRef.current || !driverGps) return;
     const newPos: [number, number] = [driverGps.latitude, driverGps.longitude];
     driverMarkerRef.current.setLatLng(newPos);
-
-    if (mapRef.current) {
-      mapRef.current.panTo(newPos, { animate: true });
-    }
   }, [driverGps?.latitude, driverGps?.longitude]);
 
-  // Update Route Polyline when routeGeometry changes
+  // Update Route Polyline only when routeGeometry actually changes
   useEffect(() => {
     if (!mapRef.current) return;
 
-    if (routePolylineRef.current) {
-      routePolylineRef.current.remove();
-      routePolylineRef.current = null;
+    const coords = routeGeometry?.coordinates;
+    const routeKey =
+      coords && Array.isArray(coords) && coords.length > 0
+        ? `${coords.length}:${coords[0][0]},${coords[0][1]}->${coords[coords.length - 1][0]},${coords[coords.length - 1][1]}`
+        : "";
+
+    if (routeKey === lastRouteKeyRef.current) return;
+    lastRouteKeyRef.current = routeKey;
+
+    if (!routeKey) {
+      if (routePolylineRef.current) {
+        routePolylineRef.current.remove();
+        routePolylineRef.current = null;
+      }
+      hasFittedBoundsRef.current = false;
+      return;
     }
 
-    if (routeGeometry && routeGeometry.coordinates && Array.isArray(routeGeometry.coordinates)) {
-      // GeoJSON has coordinates as [longitude, latitude]
-      // Leaflet expects [latitude, longitude]
-      const latLngs: [number, number][] = routeGeometry.coordinates.map(
-        (c: [number, number]) => [c[1], c[0]]
-      );
+    // GeoJSON has coordinates as [longitude, latitude]
+    // Leaflet expects [latitude, longitude]
+    const latLngs: [number, number][] = coords.map(
+      (c: [number, number]) => [c[1], c[0]]
+    );
 
-      if (latLngs.length > 0) {
+    if (latLngs.length > 0) {
+      if (routePolylineRef.current) {
+        routePolylineRef.current.setLatLngs(latLngs);
+      } else {
         const polyline = L.polyline(latLngs, {
           color: "#4f46e5",
           weight: 5,
           opacity: 0.85,
           lineJoin: "round",
         }).addTo(mapRef.current);
-
         routePolylineRef.current = polyline;
-        mapRef.current.fitBounds(polyline.getBounds(), { padding: [40, 40] });
+      }
+
+      // Fit bounds only once when the initial route geometry is established
+      if (!hasFittedBoundsRef.current && routePolylineRef.current) {
+        mapRef.current.fitBounds(routePolylineRef.current.getBounds(), {
+          padding: [40, 40],
+          maxZoom: 15,
+        });
+        hasFittedBoundsRef.current = true;
       }
     }
   }, [routeGeometry]);

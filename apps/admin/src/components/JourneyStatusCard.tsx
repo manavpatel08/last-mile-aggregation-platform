@@ -258,9 +258,10 @@ export const JourneyStatusCard: React.FC<JourneyStatusCardProps> = ({
                       {p.fullName}
                     </td>
                     <td className="px-4 py-3 text-slate-600">
-                      {p.fullName?.includes("B")
-                        ? "Kudasan Cross Road"
-                        : "Bhaijipura Circle"}
+                      {p.destination?.name ||
+                        (p.destination?.latitude && p.destination?.longitude
+                          ? `${p.destination.latitude.toFixed(4)}, ${p.destination.longitude.toFixed(4)}`
+                          : "Drop-off Destination")}
                     </td>
                     <td className="px-4 py-3">
                       {p.boardingOtp ? (

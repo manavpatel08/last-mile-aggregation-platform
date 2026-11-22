@@ -27,7 +27,7 @@ export const Header: React.FC<HeaderProps> = ({
             Last-Mile Simulation Control Center
           </h1>
           <p className="text-xs text-slate-500">
-            PDEU Campus Shared Micro-Mobility Pilot · Stage 11 Demo
+            PDEU Demo Station · Stage 11 Demo
           </p>
         </div>
       </div>

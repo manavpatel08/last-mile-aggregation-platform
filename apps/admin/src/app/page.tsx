@@ -31,16 +31,20 @@ const LiveMap = dynamic(
   }
 );
 
-// Simulated GPS path along Gandhinagar PDEU corridor
-const GPS_WAYPOINTS = [
-  { lat: 23.155, lng: 72.6668 }, // PDEU Main Gate
-  { lat: 23.159, lng: 72.66 },
-  { lat: 23.163, lng: 72.653 },
-  { lat: 23.1678, lng: 72.645 }, // Bhaijipura Circle (Pax 1 drop)
-  { lat: 23.175, lng: 72.638 },
-  { lat: 23.182, lng: 72.632 },
-  { lat: 23.1885, lng: 72.6288 }, // Kudasan Cross Road (Pax 2 drop)
-];
+// Extract waypoints dynamically from OSRM GeoJSON LineString (no hardcoded GPS path)
+function getRouteWaypoints(geometry: any): Array<{ lat: number; lng: number }> {
+  if (
+    geometry?.coordinates &&
+    Array.isArray(geometry.coordinates) &&
+    geometry.coordinates.length > 0
+  ) {
+    return geometry.coordinates.map((c: [number, number]) => ({
+      lat: c[1],
+      lng: c[0],
+    }));
+  }
+  return [{ lat: 23.155, lng: 72.6668 }];
+}
 
 export default function SimulationDashboardPage() {
   const [adminUser, setAdminUser] = useState<any>(null);
@@ -169,7 +173,7 @@ export default function SimulationDashboardPage() {
       setLoading(true);
       const res = await createDemoBookings();
       setLastMessage(
-        "2 shared bookings created: PDEU Main Gate -> Bhaijipura Circle & Kudasan"
+        "2 shared bookings created: PDEU Demo Station -> Bhaijipura Circle & Kudasan"
       );
       addEvent("bookings.created", res.data);
       await refreshJourney();
@@ -183,9 +187,9 @@ export default function SimulationDashboardPage() {
   const handleTriggerMatching = async () => {
     try {
       setLoading(true);
-      const res = await triggerMatching("PDEU Main Gate");
+      const res = await triggerMatching("PDEU Demo Station");
       setLastMessage(
-        `Matching cycle executed. Formed groups: ${res.data?.groupsFormedCount || 0}`
+        `Matching cycle executed for PDEU Demo Station. Formed groups: ${res.data?.groupsFormedCount || 0}`
       );
       addEvent("matching.executed", res.data);
       await refreshJourney();
@@ -218,9 +222,10 @@ export default function SimulationDashboardPage() {
         return;
       }
 
+      const waypoints = getRouteWaypoints(journey?.route?.geometry);
       waypointIndexRef.current =
-        (waypointIndexRef.current + 1) % GPS_WAYPOINTS.length;
-      const targetPoint = GPS_WAYPOINTS[waypointIndexRef.current];
+        (waypointIndexRef.current + 1) % waypoints.length;
+      const targetPoint = waypoints[waypointIndexRef.current];
 
       const res = await updateDriverLocation(
         driverId,
@@ -259,14 +264,14 @@ export default function SimulationDashboardPage() {
       await delay(1500);
 
       // 3. Create Bookings
-      setLastMessage("Step 2/6: Creating shared bookings from PDEU...");
+      setLastMessage("Step 2/6: Creating shared bookings at PDEU Demo Station...");
       await createDemoBookings();
       await refreshJourney();
       await delay(1500);
 
       // 4. Trigger Matching & Dispatch
-      setLastMessage("Step 3/6: Executing matching engine & dispatching...");
-      await triggerMatching("PDEU Main Gate");
+      setLastMessage("Step 3/6: Executing matching engine at PDEU Demo Station...");
+      await triggerMatching("PDEU Demo Station");
       await refreshJourney();
       await delay(2000);
 
@@ -277,42 +282,55 @@ export default function SimulationDashboardPage() {
       await delay(1500);
 
       // 6. Driver Arrives at Hub
-      setLastMessage("Step 5/6: Driver arrives at PDEU Main Gate...");
+      setLastMessage("Step 5/6: Driver arrives at PDEU Demo Station...");
       await progressStep();
       await refreshJourney();
       await delay(1500);
 
       // 7. Verify Boarding (OTPs) & Start Trip
-      setLastMessage("Step 6/6: Verifying OTPs & departing PDEU Hub...");
+      setLastMessage("Step 6/6: Verifying OTPs & departing PDEU Demo Station...");
       await progressStep();
+      const updatedJourneyRes = await getActiveJourney();
+      const activeJourney = updatedJourneyRes.data || journey;
       await refreshJourney();
       await delay(2000);
 
-      // 8. GPS movement & Drop-offs
-      for (let i = 1; i <= 3; i++) {
-        const pt = GPS_WAYPOINTS[i];
+      // 8. GPS movement & Drop-offs dynamically derived from backend route geometry
+      const waypoints = getRouteWaypoints(activeJourney?.route?.geometry);
+      const midPoint = Math.max(1, Math.floor(waypoints.length / 2));
+
+      // Leg 1: Travel towards first drop-off
+      for (let i = 0; i < midPoint; i++) {
+        const pt = waypoints[i];
         if (driverUserIdRef.current) {
           await updateDriverLocation(driverUserIdRef.current, pt.lat, pt.lng);
         }
         await delay(1000);
       }
 
-      // First Drop-off (Bhaijipura)
-      setLastMessage("Drop-off Commuter A at Bhaijipura Circle...");
+      // First Drop-off (Autoritative destination name)
+      const p1DestName =
+        activeJourney?.passengers?.[0]?.destination?.name ||
+        "First Passenger Destination";
+      setLastMessage(`Drop-off Commuter A at ${p1DestName}...`);
       await progressStep();
       await refreshJourney();
       await delay(1500);
 
-      for (let i = 4; i < GPS_WAYPOINTS.length; i++) {
-        const pt = GPS_WAYPOINTS[i];
+      // Leg 2: Travel towards second drop-off
+      for (let i = midPoint; i < waypoints.length; i++) {
+        const pt = waypoints[i];
         if (driverUserIdRef.current) {
           await updateDriverLocation(driverUserIdRef.current, pt.lat, pt.lng);
         }
         await delay(1000);
       }
 
-      // Second Drop-off (Kudasan)
-      setLastMessage("Drop-off Commuter B at Kudasan Cross Road...");
+      // Second Drop-off (Authoritative destination name)
+      const p2DestName =
+        activeJourney?.passengers?.[1]?.destination?.name ||
+        "Second Passenger Destination";
+      setLastMessage(`Drop-off Commuter B at ${p2DestName}...`);
       await progressStep();
       await refreshJourney();
       await delay(1500);

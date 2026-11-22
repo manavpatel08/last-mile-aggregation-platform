@@ -61,6 +61,55 @@ export class SimulationService {
     }
   }
 
+  private async getDemoEntities() {
+    const demoUsers = await this.prisma.user.findMany({
+      where: {
+        email: {
+          in: [
+            'demo.passenger1@pdeu.ac.in',
+            'demo.passenger2@pdeu.ac.in',
+            'demo.driver@pdeu.ac.in',
+          ],
+        },
+      },
+      select: { id: true, email: true },
+    });
+
+    const demoPassengerIds = demoUsers
+      .filter((u) => u.email.startsWith('demo.passenger'))
+      .map((u) => u.id);
+
+    const demoDriverUser = demoUsers.find(
+      (u) => u.email === 'demo.driver@pdeu.ac.in',
+    );
+
+    let demoDriverProfileId: string | null = null;
+    if (demoDriverUser) {
+      const driverProfile = await this.prisma.driverProfile.findUnique({
+        where: { userId: demoDriverUser.id },
+        select: { id: true },
+      });
+      demoDriverProfileId = driverProfile?.id ?? null;
+    }
+
+    return {
+      demoUsers,
+      demoPassengerIds,
+      demoDriverUserId: demoDriverUser?.id ?? null,
+      demoDriverProfileId,
+    };
+  }
+
+  private getDestinationName(lat: number, lng: number): string {
+    if (Math.abs(lat - 23.1678) < 0.005 && Math.abs(lng - 72.645) < 0.005) {
+      return 'Bhaijipura Circle';
+    }
+    if (Math.abs(lat - 23.1885) < 0.005 && Math.abs(lng - 72.6288) < 0.005) {
+      return 'Kudasan Cross Road';
+    }
+    return `Drop-off (${lat.toFixed(4)}, ${lng.toFixed(4)})`;
+  }
+
   /**
    * Provisions or refreshes virtual passengers and a virtual driver.
    * Ensures driver has vehicle registered, approved, online, available, and initial GPS set.
@@ -120,7 +169,7 @@ export class SimulationService {
       isOnline: true,
     });
 
-    // Report initial GPS fix at PDEU Main Gate
+    // Report initial GPS fix at PDEU Demo Station
     await this.driversService.recordDriverLocation(drvAuth.user.id, {
       latitude: 23.155,
       longitude: 72.6668,
@@ -150,26 +199,23 @@ export class SimulationService {
   }
 
   /**
-   * Creates 2 shared commuter bookings from PDEU Demo Station (or Main Gate) along the corridor.
+   * Creates 2 shared commuter bookings from PDEU Demo Station along the corridor.
+   * Strictly requires PDEU Demo Station and fails clearly if it does not exist.
    */
   async createDemoBookings() {
     this.checkEnvironmentSafety();
 
     const agents = await this.provisionAgents();
 
-    // Prefer dedicated demo pickup station for strict pooling isolation; fall back to Main Gate
-    let pickup = await this.prisma.pickupPoint.findFirst({
+    // Strictly require PDEU Demo Station (NO fallback to PDEU Main Gate)
+    const pickup = await this.prisma.pickupPoint.findFirst({
       where: { name: 'PDEU Demo Station', isActive: true },
     });
 
     if (!pickup) {
-      pickup = await this.prisma.pickupPoint.findFirst({
-        where: { name: 'PDEU Main Gate', isActive: true },
-      });
-    }
-
-    if (!pickup) {
-      throw new NotFoundException('Pickup hub for simulation bookings not found in database');
+      throw new NotFoundException(
+        'PDEU Demo Station pickup hub not found in database. Simulation strictly requires PDEU Demo Station.',
+      );
     }
 
     // Passenger 1 -> Bhaijipura Circle (23.1678, 72.6450)
@@ -215,25 +261,25 @@ export class SimulationService {
   }
 
   /**
-   * Immediately executes matching cycle for PDEU Demo Station (or designated pickup hub).
-   * If a group is formed, triggers dispatch immediately.
+   * Immediately executes matching cycle strictly for PDEU Demo Station.
+   * Strictly requires PDEU Demo Station and fails clearly if it does not exist.
    */
-  async triggerMatching(pickupPointName?: string) {
+  async triggerMatching(pickupPointName: string = 'PDEU Demo Station') {
     this.checkEnvironmentSafety();
 
-    let targetName = pickupPointName;
-    if (!targetName) {
-      const demoPoint = await this.prisma.pickupPoint.findFirst({
-        where: { name: 'PDEU Demo Station', isActive: true },
-      });
-      targetName = demoPoint ? 'PDEU Demo Station' : 'PDEU Main Gate';
+    const targetName = pickupPointName || 'PDEU Demo Station';
+
+    const pickup = await this.prisma.pickupPoint.findFirst({
+      where: { name: targetName, isActive: true },
+    });
+
+    if (!pickup) {
+      throw new NotFoundException(
+        `Pickup hub [${targetName}] not found in database. Simulation strictly requires PDEU Demo Station.`,
+      );
     }
 
-    const leaseKey =
-      targetName === 'PDEU Demo Station'
-        ? 'lease:matching:pdeu-demo'
-        : 'lease:matching:pdeu';
-
+    const leaseKey = `lease:matching:${targetName.toLowerCase().replace(/[^a-z0-9]/g, '-')}`;
     const summary = await this.matchingService.processMatchingCycle(targetName, leaseKey);
 
     // Trigger dispatch for formed groups immediately
@@ -252,18 +298,45 @@ export class SimulationService {
 
   /**
    * Authoritative snapshot of the active simulation journey.
+   * Strictly scoped to verified demo driver and demo passengers.
    */
   async getActiveJourney() {
     this.checkEnvironmentSafety();
 
-    // 1. Check for active trip
+    const demoEntities = await this.getDemoEntities();
+    if (
+      !demoEntities.demoDriverProfileId &&
+      demoEntities.demoPassengerIds.length === 0
+    ) {
+      return {
+        journeyState: 'IDLE',
+        message: 'No simulation agents provisioned. Click "Setup Agents".',
+      };
+    }
+
+    // 1. Check for active trip strictly scoped to demo driver or demo passengers
     const activeTrip = await this.prisma.trip.findFirst({
       where: {
         status: { in: ['ASSIGNED', 'AT_PICKUP', 'IN_PROGRESS'] },
+        OR: [
+          demoEntities.demoDriverProfileId
+            ? { activeDriverId: demoEntities.demoDriverProfileId }
+            : undefined,
+          demoEntities.demoPassengerIds.length > 0
+            ? {
+                passengers: {
+                  some: { passengerId: { in: demoEntities.demoPassengerIds } },
+                },
+              }
+            : undefined,
+        ].filter(Boolean) as any,
       },
       orderBy: { createdAt: 'desc' },
       include: {
         passengers: {
+          where: {
+            passengerId: { in: demoEntities.demoPassengerIds },
+          },
           include: {
             passenger: { select: { id: true, fullName: true, email: true } },
             booking: { select: { id: true } },
@@ -288,8 +361,32 @@ export class SimulationService {
       // Get driver GPS fix from Redis
       const gpsFix = await this.driversService.getDriverGpsFix(activeTrip.activeDriverId);
 
+      // Query destination coordinates from bookings table
+      const bookingIds = activeTrip.passengers.map((p) => p.bookingId);
+      const bookingCoords = await this.prisma.$queryRaw<
+        Array<{
+          id: string;
+          dest_lat: number;
+          dest_lng: number;
+        }>
+      >`
+        SELECT
+          b.id,
+          ST_Y(b.destination_location) as dest_lat,
+          ST_X(b.destination_location) as dest_lng
+        FROM bookings b
+        WHERE b.id = ANY(${bookingIds}::uuid[])
+      `;
+
+      const coordMap = new Map(
+        bookingCoords.map((c) => [
+          c.id,
+          { lat: Number(c.dest_lat), lng: Number(c.dest_lng) },
+        ]),
+      );
+
       // Fetch boarding passes / OTPs
-      const passengersWithOtp = await Promise.all(
+      const passengersWithOtpAndDest = await Promise.all(
         activeTrip.passengers.map(async (p) => {
           let otp: string | null = null;
           try {
@@ -301,6 +398,10 @@ export class SimulationService {
           } catch {
             otp = await this.redisService.getPassengerBoardingOtp(p.bookingId);
           }
+
+          const coords = coordMap.get(p.bookingId) || { lat: 23.1678, lng: 72.645 };
+          const destName = this.getDestinationName(coords.lat, coords.lng);
+
           return {
             id: p.id,
             passengerId: p.passengerId,
@@ -312,6 +413,11 @@ export class SimulationService {
             boardedAt: p.boardedAt,
             droppedOffAt: p.droppedOffAt,
             boardingOtp: otp,
+            destination: {
+              latitude: coords.lat,
+              longitude: coords.lng,
+              name: destName,
+            },
           };
         }),
       );
@@ -335,7 +441,7 @@ export class SimulationService {
           vehicle: activeTrip.activeDriver.vehicles[0]?.makeModel || 'E-Rickshaw',
           currentGps: gpsFix,
         },
-        passengers: passengersWithOtp,
+        passengers: passengersWithOtpAndDest,
         route: {
           distanceMeters: latestRouteVersion?.totalDistanceMeters || 0,
           durationSec: latestRouteVersion?.totalDurationSec || 0,
@@ -344,10 +450,17 @@ export class SimulationService {
       };
     }
 
-    // 2. Check for active RideGroup in dispatch
+    // 2. Check for active RideGroup in dispatch strictly scoped to demo passengers
     const activeGroup = await this.prisma.rideGroup.findFirst({
       where: {
         status: { in: ['READY_FOR_DISPATCH', 'DISPATCHING'] },
+        members: {
+          some: {
+            booking: {
+              passengerId: { in: demoEntities.demoPassengerIds },
+            },
+          },
+        },
       },
       orderBy: { createdAt: 'desc' },
       include: {
@@ -361,7 +474,12 @@ export class SimulationService {
           },
         },
         dispatchOffers: {
-          where: { status: 'PENDING' },
+          where: {
+            status: 'PENDING',
+            ...(demoEntities.demoDriverProfileId
+              ? { driverId: demoEntities.demoDriverProfileId }
+              : {}),
+          },
           take: 1,
           include: {
             driver: {
@@ -378,6 +496,30 @@ export class SimulationService {
         activeGroup.dispatchOffers && activeGroup.dispatchOffers.length > 0
           ? activeGroup.dispatchOffers[0]
           : null;
+
+      const groupBookingIds = activeGroup.members.map((m) => m.bookingId);
+      const groupCoords = await this.prisma.$queryRaw<
+        Array<{
+          id: string;
+          dest_lat: number;
+          dest_lng: number;
+        }>
+      >`
+        SELECT
+          b.id,
+          ST_Y(b.destination_location) as dest_lat,
+          ST_X(b.destination_location) as dest_lng
+        FROM bookings b
+        WHERE b.id = ANY(${groupBookingIds}::uuid[])
+      `;
+
+      const groupCoordMap = new Map(
+        groupCoords.map((c) => [
+          c.id,
+          { lat: Number(c.dest_lat), lng: Number(c.dest_lng) },
+        ]),
+      );
+
       return {
         journeyState: 'DISPATCHING',
         rideGroup: {
@@ -391,19 +533,28 @@ export class SimulationService {
                 expiresAt: pendingOffer.expiresAt,
               }
             : null,
-          members: activeGroup.members.map((m) => ({
-            bookingId: m.bookingId,
-            passengerName: m.booking.passenger.fullName,
-            allocatedFarePaise: m.allocatedFarePaise,
-          })),
+          members: activeGroup.members.map((m) => {
+            const coords = groupCoordMap.get(m.bookingId) || { lat: 23.1678, lng: 72.645 };
+            return {
+              bookingId: m.bookingId,
+              passengerName: m.booking.passenger.fullName,
+              allocatedFarePaise: m.allocatedFarePaise,
+              destination: {
+                latitude: coords.lat,
+                longitude: coords.lng,
+                name: this.getDestinationName(coords.lat, coords.lng),
+              },
+            };
+          }),
         },
       };
     }
 
-    // 3. Check for waiting bookings
+    // 3. Check for waiting bookings strictly belonging to demo passengers
     const bookings = await this.prisma.booking.findMany({
       where: {
         status: { in: ['REQUESTED', 'MATCHING'] },
+        passengerId: { in: demoEntities.demoPassengerIds },
       },
       orderBy: { createdAt: 'desc' },
       take: 4,
@@ -413,76 +564,159 @@ export class SimulationService {
     });
 
     if (bookings.length > 0) {
+      const waitingBookingIds = bookings.map((b) => b.id);
+      const waitingCoords = await this.prisma.$queryRaw<
+        Array<{
+          id: string;
+          dest_lat: number;
+          dest_lng: number;
+        }>
+      >`
+        SELECT
+          b.id,
+          ST_Y(b.destination_location) as dest_lat,
+          ST_X(b.destination_location) as dest_lng
+        FROM bookings b
+        WHERE b.id = ANY(${waitingBookingIds}::uuid[])
+      `;
+
+      const waitingCoordMap = new Map(
+        waitingCoords.map((c) => [
+          c.id,
+          { lat: Number(c.dest_lat), lng: Number(c.dest_lng) },
+        ]),
+      );
+
       return {
         journeyState: 'WAITING_FOR_MATCH',
-        bookings: bookings.map((b) => ({
-          id: b.id,
-          passengerName: b.passenger.fullName,
-          status: b.status,
-          createdAt: b.createdAt,
-        })),
+        bookings: bookings.map((b) => {
+          const coords = waitingCoordMap.get(b.id) || { lat: 23.1678, lng: 72.645 };
+          return {
+            id: b.id,
+            passengerName: b.passenger.fullName,
+            status: b.status,
+            createdAt: b.createdAt,
+            destination: {
+              latitude: coords.lat,
+              longitude: coords.lng,
+              name: this.getDestinationName(coords.lat, coords.lng),
+            },
+          };
+        }),
       };
     }
 
     return {
       journeyState: 'IDLE',
-      message: 'No active simulation journey. Click "Prepare Demo Agents" or "Create Bookings".',
+      message: 'No active simulation journey. Click "Setup Agents" or "Book Rides".',
     };
   }
 
   /**
    * Advances the simulation to the next logical state.
+   * Strictly scoped to demo driver, demo passengers, and their groups/trips.
+   * Never selects or advances unrelated commuter journeys.
    */
   async progressStep() {
     this.checkEnvironmentSafety();
 
-    // 1. Check for pending offer -> Driver Accepts
+    const demoEntities = await this.getDemoEntities();
+    if (
+      !demoEntities.demoDriverProfileId &&
+      demoEntities.demoPassengerIds.length === 0
+    ) {
+      return {
+        stepExecuted: 'NO_ACTION',
+        message: 'No simulation agents provisioned.',
+      };
+    }
+
+    // 1. Check for pending offer strictly for demo driver or demo group -> Driver Accepts
     const pendingOffer = await this.prisma.driverDispatchOffer.findFirst({
-      where: { status: 'PENDING' },
+      where: {
+        status: 'PENDING',
+        OR: [
+          demoEntities.demoDriverProfileId
+            ? { driverId: demoEntities.demoDriverProfileId }
+            : undefined,
+          {
+            rideGroup: {
+              members: {
+                some: {
+                  booking: {
+                    passengerId: { in: demoEntities.demoPassengerIds },
+                  },
+                },
+              },
+            },
+          },
+        ].filter(Boolean) as any,
+      },
       include: { driver: true },
     });
 
-    if (pendingOffer) {
+    if (pendingOffer && demoEntities.demoDriverUserId) {
       const acceptResult = await this.dispatchService.acceptOffer(
-        pendingOffer.driver.userId,
+        demoEntities.demoDriverUserId,
         pendingOffer.id,
       );
       return {
         stepExecuted: 'OFFER_ACCEPTED',
-        message: 'Driver accepted dispatch offer; Trip created',
+        message: 'Driver Ramesh accepted dispatch offer; Trip created',
         tripId: acceptResult.tripId,
       };
     }
 
-    // 2. Check for Trip in ASSIGNED -> Driver Arrives at Pickup
+    // 2. Check for Trip in ASSIGNED strictly for demo driver / demo passengers -> Driver Arrives
     const assignedTrip = await this.prisma.trip.findFirst({
-      where: { status: 'ASSIGNED' },
+      where: {
+        status: 'ASSIGNED',
+        ...(demoEntities.demoDriverProfileId
+          ? { activeDriverId: demoEntities.demoDriverProfileId }
+          : {}),
+        passengers: {
+          some: { passengerId: { in: demoEntities.demoPassengerIds } },
+        },
+      },
       include: { activeDriver: true },
     });
 
-    if (assignedTrip) {
+    if (assignedTrip && demoEntities.demoDriverUserId) {
       const arriveResult = await this.tripsService.reportArrival(
-        assignedTrip.activeDriver.userId,
+        demoEntities.demoDriverUserId,
         assignedTrip.id,
       );
       return {
         stepExecuted: 'DRIVER_ARRIVED',
-        message: 'Driver arrived at PDEU Main Gate Hub',
+        message: 'Driver arrived at PDEU Demo Station Hub',
         data: arriveResult,
       };
     }
 
-    // 3. Check for Trip in AT_PICKUP -> Board Passengers and Start Trip
+    // 3. Check for Trip in AT_PICKUP strictly for demo driver / passengers -> Board and Start
     const pickupTrip = await this.prisma.trip.findFirst({
-      where: { status: 'AT_PICKUP' },
+      where: {
+        status: 'AT_PICKUP',
+        ...(demoEntities.demoDriverProfileId
+          ? { activeDriverId: demoEntities.demoDriverProfileId }
+          : {}),
+        passengers: {
+          some: { passengerId: { in: demoEntities.demoPassengerIds } },
+        },
+      },
       include: {
         activeDriver: true,
-        passengers: { where: { status: 'WAITING' } },
+        passengers: {
+          where: {
+            status: 'WAITING',
+            passengerId: { in: demoEntities.demoPassengerIds },
+          },
+        },
       },
     });
 
-    if (pickupTrip) {
-      // Verify boarding for all waiting passengers
+    if (pickupTrip && demoEntities.demoDriverUserId) {
+      // Verify boarding strictly for waiting demo passengers
       for (const p of pickupTrip.passengers) {
         let otp = await this.redisService.getPassengerBoardingOtp(p.bookingId);
         if (!otp) {
@@ -494,7 +728,7 @@ export class SimulationService {
         }
 
         await this.tripsService.verifyBoarding(
-          pickupTrip.activeDriver.userId,
+          demoEntities.demoDriverUserId,
           pickupTrip.id,
           { passengerId: p.passengerId, otp: otp! },
         );
@@ -502,23 +736,33 @@ export class SimulationService {
 
       // Start the trip
       const startResult = await this.tripsService.startTrip(
-        pickupTrip.activeDriver.userId,
+        demoEntities.demoDriverUserId,
         pickupTrip.id,
       );
 
       return {
         stepExecuted: 'TRIP_STARTED',
-        message: 'All passengers boarded via OTP; Trip departs PDEU Main Gate',
+        message: 'All passengers boarded via OTP; Trip departs PDEU Demo Station',
         data: startResult,
       };
     }
 
-    // 4. Check for Trip in IN_PROGRESS -> Step GPS, drop off, and complete
+    // 4. Check for Trip in IN_PROGRESS strictly for demo driver / passengers -> Step GPS, drop off
     const inProgressTrip = await this.prisma.trip.findFirst({
-      where: { status: 'IN_PROGRESS' },
+      where: {
+        status: 'IN_PROGRESS',
+        ...(demoEntities.demoDriverProfileId
+          ? { activeDriverId: demoEntities.demoDriverProfileId }
+          : {}),
+        passengers: {
+          some: { passengerId: { in: demoEntities.demoPassengerIds } },
+        },
+      },
       include: {
         activeDriver: true,
-        passengers: true,
+        passengers: {
+          where: { passengerId: { in: demoEntities.demoPassengerIds } },
+        },
         rideGroup: {
           include: {
             routeVersions: { orderBy: { versionNumber: 'desc' }, take: 1 },
@@ -527,8 +771,8 @@ export class SimulationService {
       },
     });
 
-    if (inProgressTrip) {
-      // Find uncompleted passengers
+    if (inProgressTrip && demoEntities.demoDriverUserId) {
+      // Find uncompleted demo passengers
       const uncompleted = inProgressTrip.passengers.filter((p) => p.status === 'BOARDED');
 
       if (uncompleted.length > 0) {
@@ -536,7 +780,7 @@ export class SimulationService {
 
         // 1. Drop off passenger
         await this.tripsService.completePassenger(
-          inProgressTrip.activeDriver.userId,
+          demoEntities.demoDriverUserId,
           inProgressTrip.id,
           nextPassenger.passengerId,
         );
@@ -569,7 +813,7 @@ export class SimulationService {
 
       // All passengers dropped off -> Complete Trip
       const completeResult = await this.tripsService.completeTrip(
-        inProgressTrip.activeDriver.userId,
+        demoEntities.demoDriverUserId,
         inProgressTrip.id,
       );
 
@@ -582,7 +826,7 @@ export class SimulationService {
 
     return {
       stepExecuted: 'NO_ACTION',
-      message: 'No pending action in current journey state.',
+      message: 'No pending simulation action in current journey state.',
     };
   }
 

@@ -73,7 +73,7 @@ export async function createDemoBookings() {
   return apiRequest("/admin/simulation/create-bookings", { method: "POST" });
 }
 
-export async function triggerMatching(pickupPointName: string = "PDEU Main Gate") {
+export async function triggerMatching(pickupPointName: string = "PDEU Demo Station") {
   return apiRequest("/admin/simulation/trigger-matching", {
     method: "POST",
     body: JSON.stringify({ pickupPointName }),

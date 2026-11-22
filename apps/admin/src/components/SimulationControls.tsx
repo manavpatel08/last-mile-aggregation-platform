@@ -97,7 +97,7 @@ export const SimulationControls: React.FC<SimulationControlsProps> = ({
             </span>
           </div>
           <span className="text-[11px] text-slate-500 leading-snug">
-            Request 2 shared corridor bookings from PDEU Main Gate
+            Request 2 shared corridor bookings from PDEU Demo Station
           </span>
         </button>
 
@@ -114,7 +114,7 @@ export const SimulationControls: React.FC<SimulationControlsProps> = ({
             </span>
           </div>
           <span className="text-[11px] text-slate-500 leading-snug">
-            Run batch matching cycle, build route version & offer to driver
+            Run batch matching cycle for PDEU Demo Station & offer to driver
           </span>
         </button>
 

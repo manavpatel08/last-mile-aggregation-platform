@@ -134,11 +134,45 @@ describe('Matching Isolation — Dedicated Demo Pickup Point (Stage 11 Task 4)',
     // Verify matching is triggered specifically for PDEU Demo Station with its dedicated lease key
     expect(matchingServiceMock.processMatchingCycle).toHaveBeenCalledWith(
       'PDEU Demo Station',
-      'lease:matching:pdeu-demo',
+      'lease:matching:pdeu-demo-station',
     );
 
     // Verify dispatch is initiated immediately for formed demo group
     expect(dispatchServiceMock.initiateDispatchForGroup).toHaveBeenCalledWith('group-demo-1');
     expect(res?.groupsFormedCount).toBe(1);
+  });
+
+  it('8c. createDemoBookings strictly fails with NotFoundException if PDEU Demo Station does not exist (no fallback to Main Gate)', async () => {
+    // Only PDEU Main Gate exists in DB
+    prismaMock.pickupPoint.findFirst.mockImplementation(({ where }: any) => {
+      if (where.name === 'PDEU Main Gate') {
+        return Promise.resolve({ id: MAIN_GATE_ID, name: 'PDEU Main Gate', isActive: true });
+      }
+      return Promise.resolve(null);
+    });
+
+    await expect(service.createDemoBookings()).rejects.toThrowError(
+      'PDEU Demo Station pickup hub not found in database',
+    );
+
+    // Fares service must NOT be called for quotes
+    expect(faresServiceMock.generateQuote).not.toHaveBeenCalled();
+  });
+
+  it('8d. triggerMatching strictly fails with NotFoundException if PDEU Demo Station does not exist', async () => {
+    // Only PDEU Main Gate exists in DB
+    prismaMock.pickupPoint.findFirst.mockImplementation(({ where }: any) => {
+      if (where.name === 'PDEU Main Gate') {
+        return Promise.resolve({ id: MAIN_GATE_ID, name: 'PDEU Main Gate', isActive: true });
+      }
+      return Promise.resolve(null);
+    });
+
+    await expect(service.triggerMatching()).rejects.toThrowError(
+      'Pickup hub [PDEU Demo Station] not found in database',
+    );
+
+    // Matching cycle must NOT be triggered
+    expect(matchingServiceMock.processMatchingCycle).not.toHaveBeenCalled();
   });
 });

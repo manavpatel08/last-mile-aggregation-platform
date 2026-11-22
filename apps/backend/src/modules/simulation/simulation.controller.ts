@@ -44,7 +44,7 @@ export class SimulationController {
   @Post('trigger-matching')
   @HttpCode(HttpStatus.OK)
   async triggerMatching(@Body() dto?: TriggerMatchingDto) {
-    const pickupPointName = dto?.pickupPointName || 'PDEU Main Gate';
+    const pickupPointName = dto?.pickupPointName || 'PDEU Demo Station';
     const summary = await this.simulationService.triggerMatching(pickupPointName);
     return {
       success: true,

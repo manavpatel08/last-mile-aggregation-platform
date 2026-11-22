@@ -363,5 +363,193 @@ void main() {
       expect(() => SyncActiveBooking.fromJson(badBookingVersion),
           throwsA(isA<FormatException>()));
     });
+
+    test('SyncPassengerState and SyncDriverState preserve valid explicit-null activeBooking and activeTrip', () {
+      final passengerJson = {
+        'activeBooking': null,
+        'activeGroup': null,
+        'activeTrip': null,
+        'outstandingCancellationFees': [],
+      };
+      final pState = SyncPassengerState.fromJson(passengerJson);
+      expect(pState.activeBooking, isNull);
+      expect(pState.activeGroup, isNull);
+      expect(pState.activeTrip, isNull);
+      expect(pState.outstandingCancellationFees, isEmpty);
+
+      final driverJson = {
+        'driverProfile': {
+          'id': 'drv-1',
+          'verificationStatus': 'APPROVED',
+          'operationalStatus': 'AVAILABLE',
+          'isOnline': true,
+        },
+        'activeOffer': null,
+        'activeTrip': null,
+      };
+      final dState = SyncDriverState.fromJson(driverJson);
+      expect(dState.activeOffer, isNull);
+      expect(dState.activeTrip, isNull);
+    });
+
+    test('SyncPassengerState and SyncDriverState parse valid map values', () {
+      final passengerJson = {
+        'activeBooking': {
+          'id': 'bk-1',
+          'status': 'CONFIRMED',
+          'passengerId': 'p-1',
+          'pickupPointId': 'zone-1',
+          'fareQuotePaise': 3500,
+          'createdAt': '2026-11-22T10:00:00.000Z',
+          'updatedAt': '2026-11-22T10:05:00.000Z',
+          'entityVersion': 1,
+        },
+        'activeTrip': {
+          'id': 'tr-1',
+          'status': 'IN_PROGRESS',
+          'tripVersion': 1,
+          'activeDriverId': 'd-1',
+          'farePaise': 3500,
+        },
+      };
+      final pState = SyncPassengerState.fromJson(passengerJson);
+      expect(pState.activeBooking?.id, 'bk-1');
+      expect(pState.activeTrip?.id, 'tr-1');
+    });
+
+    test('SyncPassengerState rejects non-null non-map values for activeBooking with FormatException', () {
+      expect(
+        () => SyncPassengerState.fromJson({'activeBooking': 'booking-uuid'}),
+        throwsA(isA<FormatException>()),
+      );
+      expect(
+        () => SyncPassengerState.fromJson({'activeBooking': ['booking-1']}),
+        throwsA(isA<FormatException>()),
+      );
+      expect(
+        () => SyncPassengerState.fromJson({'activeBooking': 12345}),
+        throwsA(isA<FormatException>()),
+      );
+      expect(
+        () => SyncPassengerState.fromJson({'activeBooking': true}),
+        throwsA(isA<FormatException>()),
+      );
+    });
+
+    test('SyncPassengerState rejects non-null non-map values for activeTrip with FormatException', () {
+      expect(
+        () => SyncPassengerState.fromJson({'activeTrip': 'trip-uuid'}),
+        throwsA(isA<FormatException>()),
+      );
+      expect(
+        () => SyncPassengerState.fromJson({'activeTrip': 999}),
+        throwsA(isA<FormatException>()),
+      );
+      expect(
+        () => SyncPassengerState.fromJson({'activeTrip': ['item']}),
+        throwsA(isA<FormatException>()),
+      );
+    });
+
+    test('SyncPassengerState rejects non-null non-map values for activeGroup with FormatException', () {
+      expect(
+        () => SyncPassengerState.fromJson({'activeGroup': 'group-uuid'}),
+        throwsA(isA<FormatException>()),
+      );
+      expect(
+        () => SyncPassengerState.fromJson({'activeGroup': 42}),
+        throwsA(isA<FormatException>()),
+      );
+    });
+
+    test('SyncPassengerActiveTrip rejects non-null non-map driverLocation with FormatException', () {
+      final badTrip = {
+        'id': 'tr-1',
+        'status': 'IN_PROGRESS',
+        'tripVersion': 1,
+        'activeDriverId': 'd-1',
+        'farePaise': 3500,
+        'driverLocation': 'latitude: 23, longitude: 72',
+      };
+      expect(
+        () => SyncPassengerActiveTrip.fromJson(badTrip),
+        throwsA(isA<FormatException>()),
+      );
+    });
+
+    test('SyncDriverState rejects non-null non-map activeOffer and activeTrip with FormatException', () {
+      final validProfile = {
+        'id': 'drv-1',
+        'verificationStatus': 'APPROVED',
+        'operationalStatus': 'AVAILABLE',
+        'isOnline': true,
+      };
+
+      expect(
+        () => SyncDriverState.fromJson({
+          'driverProfile': validProfile,
+          'activeOffer': 'offer-string',
+        }),
+        throwsA(isA<FormatException>()),
+      );
+
+      expect(
+        () => SyncDriverState.fromJson({
+          'driverProfile': validProfile,
+          'activeTrip': 12345,
+        }),
+        throwsA(isA<FormatException>()),
+      );
+    });
+
+    test('SyncResponseDto rejects non-null non-map passengerState and driverState with FormatException', () {
+      expect(
+        () => SyncResponseDto.fromJson({
+          'success': true,
+          'serverTimestamp': '2026-11-22T12:00:00.000Z',
+          'role': 'PASSENGER',
+          'reconciled': true,
+          'passengerState': 'invalid-state-string',
+        }),
+        throwsA(isA<FormatException>()),
+      );
+
+      expect(
+        () => SyncResponseDto.fromJson({
+          'success': true,
+          'serverTimestamp': '2026-11-22T12:00:00.000Z',
+          'role': 'DRIVER',
+          'reconciled': true,
+          'driverState': ['invalid-list'],
+        }),
+        throwsA(isA<FormatException>()),
+      );
+    });
+
+    test('Sync nested collections reject non-map items with FormatException', () {
+      final badManifestTrip = {
+        'id': 'tr-1',
+        'status': 'IN_PROGRESS',
+        'tripVersion': 1,
+        'rideGroupId': 'grp-1',
+        'passengerManifest': [
+          'not-a-map',
+        ],
+      };
+      expect(
+        () => SyncDriverActiveTrip.fromJson(badManifestTrip),
+        throwsA(isA<FormatException>()),
+      );
+
+      final badFeesState = {
+        'outstandingCancellationFees': [
+          'not-a-map',
+        ],
+      };
+      expect(
+        () => SyncPassengerState.fromJson(badFeesState),
+        throwsA(isA<FormatException>()),
+      );
+    });
   });
 }

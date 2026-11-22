@@ -53,6 +53,23 @@ bool _requireBool(dynamic val, String fieldName) {
   return val;
 }
 
+Map<String, dynamic>? _optionalMap(dynamic val, String fieldName) {
+  if (val == null) return null;
+  if (val is Map<String, dynamic>) return val;
+  if (val is Map) return Map<String, dynamic>.from(val);
+  throw FormatException(
+    'Sync parsing error: "$fieldName" must be a JSON object (Map) or null, got: ${val.runtimeType}',
+  );
+}
+
+Map<String, dynamic> _requireMap(dynamic val, String fieldName) {
+  if (val is Map<String, dynamic>) return val;
+  if (val is Map) return Map<String, dynamic>.from(val);
+  throw FormatException(
+    'Sync parsing error: "$fieldName" must be a JSON object (Map), got: ${val.runtimeType}',
+  );
+}
+
 /// Request body for `POST /api/v1/sync`.
 @immutable
 class SyncRequestDto {
@@ -177,11 +194,11 @@ class SyncPassengerActiveTrip {
   factory SyncPassengerActiveTrip.fromJson(Map<String, dynamic> json) {
     final driverId = _requireString(json['activeDriverId'], 'activeTrip.activeDriverId');
 
-    final rawLoc = json['driverLocation'];
+    final locMap = _optionalMap(json['driverLocation'], 'activeTrip.driverLocation');
     DriverLocationBroadcastData? location;
-    if (rawLoc is Map<String, dynamic>) {
-      final rawLat = rawLoc['latitude'];
-      final rawLng = rawLoc['longitude'];
+    if (locMap != null) {
+      final rawLat = locMap['latitude'];
+      final rawLng = locMap['longitude'];
       if (rawLat is! num || rawLng is! num) {
         throw const FormatException('Sync passenger activeTrip: driverLocation latitude/longitude must be numbers');
       }
@@ -190,7 +207,7 @@ class SyncPassengerActiveTrip {
       if (lat < -90.0 || lat > 90.0 || lng < -180.0 || lng > 180.0) {
         throw const FormatException('Sync passenger activeTrip: driverLocation coordinates out of bounds');
       }
-      final updatedAt = _requireTimestamp(rawLoc['updatedAt'], 'activeTrip.driverLocation.updatedAt');
+      final updatedAt = _requireTimestamp(locMap['updatedAt'], 'activeTrip.driverLocation.updatedAt');
       location = DriverLocationBroadcastData(
         driverId: driverId,
         latitude: lat,
@@ -263,9 +280,9 @@ class SyncPassengerState {
   final List<SyncOutstandingFee> outstandingCancellationFees;
 
   factory SyncPassengerState.fromJson(Map<String, dynamic> json) {
-    final rawBooking = json['activeBooking'];
-    final rawGroup = json['activeGroup'];
-    final rawTrip = json['activeTrip'];
+    final bookingMap = _optionalMap(json['activeBooking'], 'SyncPassengerState.activeBooking');
+    final groupMap = _optionalMap(json['activeGroup'], 'SyncPassengerState.activeGroup');
+    final tripMap = _optionalMap(json['activeTrip'], 'SyncPassengerState.activeTrip');
     final rawFees = json['outstandingCancellationFees'];
 
     if (rawFees != null && rawFees is! List) {
@@ -274,17 +291,11 @@ class SyncPassengerState {
     final feeList = rawFees as List? ?? [];
 
     return SyncPassengerState(
-      activeBooking: rawBooking is Map<String, dynamic>
-          ? SyncActiveBooking.fromJson(rawBooking)
-          : null,
-      activeGroup: rawGroup is Map<String, dynamic>
-          ? SyncActiveGroup.fromJson(rawGroup)
-          : null,
-      activeTrip: rawTrip is Map<String, dynamic>
-          ? SyncPassengerActiveTrip.fromJson(rawTrip)
-          : null,
+      activeBooking: bookingMap != null ? SyncActiveBooking.fromJson(bookingMap) : null,
+      activeGroup: groupMap != null ? SyncActiveGroup.fromJson(groupMap) : null,
+      activeTrip: tripMap != null ? SyncPassengerActiveTrip.fromJson(tripMap) : null,
       outstandingCancellationFees: feeList
-          .map((f) => SyncOutstandingFee.fromJson(Map<String, dynamic>.from(f as Map)))
+          .map((f) => SyncOutstandingFee.fromJson(_requireMap(f, 'outstandingCancellationFees[]')))
           .toList(),
     );
   }
@@ -404,7 +415,7 @@ class SyncDriverActiveTrip {
       rideGroupId: _requireString(json['rideGroupId'], 'driverActiveTrip.rideGroupId'),
       currentStopOrder: stopOrder,
       passengerManifest: manifestList
-          .map((p) => SyncPassengerManifestItem.fromJson(Map<String, dynamic>.from(p as Map)))
+          .map((p) => SyncPassengerManifestItem.fromJson(_requireMap(p, 'passengerManifest[]')))
           .toList(),
     );
   }
@@ -424,22 +435,14 @@ class SyncDriverState {
   final SyncDriverActiveTrip? activeTrip;
 
   factory SyncDriverState.fromJson(Map<String, dynamic> json) {
-    final rawProfile = json['driverProfile'];
-    if (rawProfile is! Map<String, dynamic> && rawProfile is! Map) {
-      throw const FormatException('SyncDriverState: missing or invalid "driverProfile"');
-    }
-
-    final rawOffer = json['activeOffer'];
-    final rawTrip = json['activeTrip'];
+    final profileMap = _requireMap(json['driverProfile'], 'SyncDriverState.driverProfile');
+    final offerMap = _optionalMap(json['activeOffer'], 'SyncDriverState.activeOffer');
+    final tripMap = _optionalMap(json['activeTrip'], 'SyncDriverState.activeTrip');
 
     return SyncDriverState(
-      driverProfile: SyncDriverProfile.fromJson(Map<String, dynamic>.from(rawProfile as Map)),
-      activeOffer: rawOffer is Map<String, dynamic> || rawOffer is Map
-          ? SyncActiveOffer.fromJson(Map<String, dynamic>.from(rawOffer as Map))
-          : null,
-      activeTrip: rawTrip is Map<String, dynamic> || rawTrip is Map
-          ? SyncDriverActiveTrip.fromJson(Map<String, dynamic>.from(rawTrip as Map))
-          : null,
+      driverProfile: SyncDriverProfile.fromJson(profileMap),
+      activeOffer: offerMap != null ? SyncActiveOffer.fromJson(offerMap) : null,
+      activeTrip: tripMap != null ? SyncDriverActiveTrip.fromJson(tripMap) : null,
     );
   }
 }
@@ -464,20 +467,16 @@ class SyncResponseDto {
   final SyncDriverState? driverState;
 
   factory SyncResponseDto.fromJson(Map<String, dynamic> json) {
-    final rawPass = json['passengerState'];
-    final rawDriver = json['driverState'];
+    final passMap = _optionalMap(json['passengerState'], 'SyncResponseDto.passengerState');
+    final driverMap = _optionalMap(json['driverState'], 'SyncResponseDto.driverState');
 
     return SyncResponseDto(
       success: _requireBool(json['success'], 'SyncResponseDto.success'),
       serverTimestamp: _requireTimestamp(json['serverTimestamp'], 'SyncResponseDto.serverTimestamp'),
       role: _requireString(json['role'], 'SyncResponseDto.role'),
       reconciled: _requireBool(json['reconciled'], 'SyncResponseDto.reconciled'),
-      passengerState: rawPass is Map<String, dynamic> || rawPass is Map
-          ? SyncPassengerState.fromJson(Map<String, dynamic>.from(rawPass as Map))
-          : null,
-      driverState: rawDriver is Map<String, dynamic> || rawDriver is Map
-          ? SyncDriverState.fromJson(Map<String, dynamic>.from(rawDriver as Map))
-          : null,
+      passengerState: passMap != null ? SyncPassengerState.fromJson(passMap) : null,
+      driverState: driverMap != null ? SyncDriverState.fromJson(driverMap) : null,
     );
   }
 }

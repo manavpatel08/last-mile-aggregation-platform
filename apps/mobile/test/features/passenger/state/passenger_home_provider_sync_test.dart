@@ -95,11 +95,12 @@ void main() {
       expect(provider.outstandingFees.length, 1);
     });
 
-    test('non-null sync activeBooking triggers REST refresh if status changed',
+    test('meaningful booking change is detected even when entity version remains unchanged',
         () async {
       provider.updateActiveBooking(authoritativeBookingResponse);
       expect(provider.activeBooking?.status, 'CONFIRMED');
 
+      // Server activeGroup.groupVersion remains 2, but booking status moved to IN_PROGRESS
       final updatedSyncBooking = SyncActiveBooking(
         id: 'booking-1',
         status: 'IN_PROGRESS',
@@ -108,7 +109,7 @@ void main() {
         fareQuotePaise: 3500,
         createdAt: DateTime.parse('2026-11-22T10:00:00.000Z'),
         updatedAt: DateTime.parse('2026-11-22T10:10:00.000Z'),
-        entityVersion: 3,
+        entityVersion: 2, // unchanged version
       );
 
       repository.bookingToReturn = BookingResponse(
@@ -119,6 +120,7 @@ void main() {
         agreedFareCeiling: '35.00',
         maxWaitDeadline: DateTime.parse('2026-11-22T10:15:00.000Z'),
         createdAt: DateTime.parse('2026-11-22T10:00:00.000Z'),
+        updatedAt: DateTime.parse('2026-11-22T10:10:00.000Z'),
       );
 
       final state = SyncPassengerState(
@@ -131,6 +133,36 @@ void main() {
 
       expect(repository.getActiveBookingCalls, 1);
       expect(provider.activeBooking?.status, 'IN_PROGRESS');
+      expect(provider.lastSyncedBookingEntityVersion, 2);
+    });
+
+    test('successful REST refresh leaves local reconciliation state consistent',
+        () async {
+      expect(provider.activeBooking, isNull);
+      expect(repository.getActiveBookingCalls, 0);
+
+      final state = SyncPassengerState(
+        activeBooking: sampleSyncBooking,
+        activeTrip: sampleActiveTrip,
+        outstandingCancellationFees: sampleFees,
+      );
+
+      // First sync triggers initial REST refresh
+      provider.handleSyncResponse(state, repository: repository);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(repository.getActiveBookingCalls, 1);
+      expect(provider.activeBooking?.bookingId, 'booking-1');
+      expect(provider.lastSyncedBookingUpdatedAt, DateTime.parse('2026-11-22T10:05:00.000Z'));
+      expect(provider.lastSyncedBookingEntityVersion, 2);
+
+      // Subsequent identical sync snapshot should NOT trigger a second REST refresh
+      provider.handleSyncResponse(state, repository: repository);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(repository.getActiveBookingCalls, 1);
+      expect(provider.lastSyncedBookingUpdatedAt, DateTime.parse('2026-11-22T10:05:00.000Z'));
+      expect(provider.lastSyncedBookingEntityVersion, 2);
     });
 
     test('no unnecessary refresh when the authoritative booking snapshot is unchanged',

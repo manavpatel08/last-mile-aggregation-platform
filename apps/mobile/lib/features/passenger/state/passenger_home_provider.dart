@@ -109,29 +109,36 @@ class PassengerHomeProvider extends ChangeNotifier {
         : (_lastSyncedBookingUpdatedAt != null &&
             incoming.updatedAt.isAfter(_lastSyncedBookingUpdatedAt!));
 
-    final bool isVersionChanged = _lastSyncedBookingEntityVersion != null &&
-        incoming.entityVersion != _lastSyncedBookingEntityVersion;
-
     final bool isPickupPointChanged = _activeBooking?.pickupPointId != null &&
         _activeBooking!.pickupPointId != incoming.pickupPointId;
 
+    // Meaningful authoritative fields determine whether a REST refresh is required.
+    // Entity version is derived from activeGroup.groupVersion on the server and is
+    // not relied upon alone to trigger booking refreshes.
     final bool needsRefresh = isDifferentBooking ||
         isStatusChanged ||
         isServerUpdatedAtNewer ||
-        isVersionChanged ||
         isPickupPointChanged;
 
     _lastSyncedBookingUpdatedAt = incoming.updatedAt;
     _lastSyncedBookingEntityVersion = incoming.entityVersion;
 
     if (needsRefresh && repository != null) {
-      loadActiveBooking(repository);
+      loadActiveBooking(
+        repository,
+        syncedUpdatedAt: incoming.updatedAt,
+        syncedVersion: incoming.entityVersion,
+      );
     } else {
       notifyListeners();
     }
   }
 
-  Future<void> loadActiveBooking(BookingRepository bookingRepository) async {
+  Future<void> loadActiveBooking(
+    BookingRepository bookingRepository, {
+    DateTime? syncedUpdatedAt,
+    int? syncedVersion,
+  }) async {
     _isLoadingActiveBooking = true;
     _activeBookingError = null;
     notifyListeners();
@@ -141,6 +148,11 @@ class PassengerHomeProvider extends ChangeNotifier {
       _activeBooking = booking;
       if (booking?.updatedAt != null) {
         _lastSyncedBookingUpdatedAt = booking!.updatedAt;
+      } else if (syncedUpdatedAt != null) {
+        _lastSyncedBookingUpdatedAt = syncedUpdatedAt;
+      }
+      if (syncedVersion != null) {
+        _lastSyncedBookingEntityVersion = syncedVersion;
       }
     } catch (e) {
       _activeBookingError = e.toString();

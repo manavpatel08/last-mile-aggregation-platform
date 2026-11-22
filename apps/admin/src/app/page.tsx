@@ -216,12 +216,6 @@ export default function SimulationDashboardPage() {
 
   const handleSimulateGps = async () => {
     try {
-      const driverId = driverUserIdRef.current || journey?.driver?.userId;
-      if (!driverId) {
-        setLastMessage("Cannot simulate GPS: No driver assigned yet.");
-        return;
-      }
-
       const waypoints = getRouteWaypoints(journey?.route?.geometry);
       if (waypoints.length === 0) {
         setLastMessage(
@@ -235,7 +229,6 @@ export default function SimulationDashboardPage() {
       const targetPoint = waypoints[waypointIndexRef.current];
 
       const res = await updateDriverLocation(
-        driverId,
         targetPoint.lat,
         targetPoint.lng
       );
@@ -279,12 +272,34 @@ export default function SimulationDashboardPage() {
       // 4. Trigger Matching & Dispatch
       setLastMessage("Step 3/6: Executing matching engine at PDEU Demo Station...");
       await triggerMatching("PDEU Demo Station");
+      const matchedJourneyRes = await getActiveJourney();
+      const matchedJourney = matchedJourneyRes.data;
       await refreshJourney();
       await delay(2000);
 
+      // Validate route availability before advancing trip lifecycle
+      const initialWaypoints = getRouteWaypoints(matchedJourney?.route?.geometry);
+      if (initialWaypoints.length === 0) {
+        setLastMessage(
+          "Auto-run error: Required route geometry is missing or invalid after matching. Trip lifecycle halted before offer acceptance to avoid a partially progressed journey."
+        );
+        // Clean reset so no partially progressed journey is left in database
+        await resetSimulation();
+        await refreshJourney();
+        return;
+      }
+
       // 5. Driver Accepts Offer
       setLastMessage("Step 4/6: Driver Ramesh accepts dispatch offer...");
-      await progressStep();
+      const acceptRes = await progressStep();
+      if (acceptRes.data?.stepExecuted === "ROUTE_GEOMETRY_MISSING") {
+        setLastMessage(
+          "Auto-run error: Required route geometry is missing for ride group. Trip lifecycle was not advanced."
+        );
+        await resetSimulation();
+        await refreshJourney();
+        return;
+      }
       await refreshJourney();
       await delay(1500);
 
@@ -315,9 +330,7 @@ export default function SimulationDashboardPage() {
       // Leg 1: Travel towards first drop-off
       for (let i = 0; i < midPoint; i++) {
         const pt = waypoints[i];
-        if (driverUserIdRef.current) {
-          await updateDriverLocation(driverUserIdRef.current, pt.lat, pt.lng);
-        }
+        await updateDriverLocation(pt.lat, pt.lng);
         await delay(1000);
       }
 
@@ -333,9 +346,7 @@ export default function SimulationDashboardPage() {
       // Leg 2: Travel towards second drop-off
       for (let i = midPoint; i < waypoints.length; i++) {
         const pt = waypoints[i];
-        if (driverUserIdRef.current) {
-          await updateDriverLocation(driverUserIdRef.current, pt.lat, pt.lng);
-        }
+        await updateDriverLocation(pt.lat, pt.lng);
         await delay(1000);
       }
 

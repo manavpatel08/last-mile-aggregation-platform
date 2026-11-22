@@ -500,6 +500,8 @@ export class SimulationService {
           ? activeGroup.dispatchOffers[0]
           : null;
 
+      const latestRouteVersion = activeGroup.routeVersions?.[0];
+
       const groupBookingIds = activeGroup.members.map((m) => m.bookingId);
       const groupCoords = await this.prisma.$queryRaw<
         Array<{
@@ -558,6 +560,11 @@ export class SimulationService {
                 : null,
             };
           }),
+        },
+        route: {
+          distanceMeters: latestRouteVersion?.totalDistanceMeters || 0,
+          durationSec: latestRouteVersion?.totalDurationSec || 0,
+          geometry: latestRouteVersion?.routeGeometry || null,
         },
       };
     }
@@ -673,10 +680,32 @@ export class SimulationService {
           },
         ].filter(Boolean) as any,
       },
-      include: { driver: true },
+      include: {
+        driver: true,
+        rideGroup: {
+          include: {
+            routeVersions: { orderBy: { versionNumber: 'desc' }, take: 1 },
+          },
+        },
+      },
     });
 
     if (pendingOffer && demoEntities.demoDriverUserId) {
+      // Validate route availability on the group before accepting offer and advancing trip lifecycle
+      const latestRoute = pendingOffer.rideGroup?.routeVersions?.[0];
+      const hasValidGeometry =
+        latestRoute?.routeGeometry &&
+        Array.isArray((latestRoute.routeGeometry as any)?.coordinates) &&
+        (latestRoute.routeGeometry as any).coordinates.length > 0;
+
+      if (!hasValidGeometry) {
+        return {
+          stepExecuted: 'ROUTE_GEOMETRY_MISSING',
+          message:
+            'Cannot advance trip lifecycle: Required route geometry is missing or invalid for ride group.',
+        };
+      }
+
       const acceptResult = await this.dispatchService.acceptOffer(
         demoEntities.demoDriverUserId,
         pendingOffer.id,
@@ -852,17 +881,20 @@ export class SimulationService {
   }
 
   /**
-   * Updates driver location and broadcasts to the admin socket room.
+   * Updates demo driver location and broadcasts to the admin socket room.
+   * Resolves the provisioned demo driver server-side and updates only that driver.
    */
-  async updateDriverLocation(driverUserId: string, latitude: number, longitude: number) {
+  async updateDriverLocation(latitude: number, longitude: number) {
     this.checkEnvironmentSafety();
 
     const demoEntities = await this.getDemoEntities();
-    if (!demoEntities.demoDriverUserId || driverUserId !== demoEntities.demoDriverUserId) {
+    if (!demoEntities.demoDriverUserId) {
       throw new ForbiddenException(
-        'GPS simulation rejected: Only the provisioned demo driver user ID is permitted for simulation location updates.',
+        'GPS simulation rejected: Provisioned demo driver not found. Setup agents before updating location.',
       );
     }
+
+    const driverUserId = demoEntities.demoDriverUserId;
 
     await this.driversService.recordDriverLocation(driverUserId, {
       latitude,
@@ -885,7 +917,7 @@ export class SimulationService {
       });
     }
 
-    return { success: true, latitude, longitude };
+    return { success: true, driverUserId, latitude, longitude };
   }
 
   /**

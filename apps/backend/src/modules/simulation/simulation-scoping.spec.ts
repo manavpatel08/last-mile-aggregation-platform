@@ -354,26 +354,108 @@ describe('Simulation Scoping & Dynamic Route Geometry (PR #53 Review Fixes)', ()
       // Destination must be null without falling back to Bhaijipura or fabricated coordinates
       expect(journey.passengers[0].destination).toBeNull();
     });
+
+    it('getActiveJourney returns authoritative route geometry in DISPATCHING state', async () => {
+      const mockRouteGeometry = {
+        type: 'LineString',
+        coordinates: [
+          [72.6668, 23.155],
+          [72.6455, 23.1678],
+        ],
+      };
+
+      prismaMock.trip.findFirst.mockResolvedValue(null);
+      prismaMock.rideGroup.findFirst.mockResolvedValue({
+        id: 'group-demo-dispatching',
+        status: 'DISPATCHING',
+        members: [
+          {
+            bookingId: 'booking-pax-1',
+            allocatedFarePaise: 2500,
+            booking: {
+              passenger: { fullName: 'Aarav Sharma' },
+            },
+          },
+        ],
+        dispatchOffers: [
+          {
+            id: 'offer-1',
+            driverId: DEMO_DRIVER_PROFILE_ID,
+            expiresAt: new Date(),
+            driver: {
+              user: { fullName: 'Ramesh Patel' },
+            },
+          },
+        ],
+        routeVersions: [
+          {
+            totalDistanceMeters: 3500,
+            totalDurationSec: 420,
+            routeGeometry: mockRouteGeometry,
+          },
+        ],
+      });
+
+      prismaMock.$queryRaw.mockResolvedValue([
+        { id: 'booking-pax-1', dest_lat: 23.1678, dest_lng: 72.645 },
+      ]);
+
+      const journey = await service.getActiveJourney();
+
+      expect(journey.journeyState).toBe('DISPATCHING');
+      expect(journey.route.geometry).toEqual(mockRouteGeometry);
+      expect(journey.route.distanceMeters).toBe(3500);
+      expect(journey.route.durationSec).toBe(420);
+    });
+
+    it('progressStep halts with ROUTE_GEOMETRY_MISSING and does not advance trip lifecycle if group route geometry is missing', async () => {
+      prismaMock.driverDispatchOffer.findFirst.mockResolvedValue({
+        id: 'offer-no-route',
+        driverId: DEMO_DRIVER_PROFILE_ID,
+        rideGroup: {
+          id: 'group-no-route',
+          routeVersions: [], // No route version generated
+        },
+      });
+
+      const res = await service.progressStep();
+
+      expect(res.stepExecuted).toBe('ROUTE_GEOMETRY_MISSING');
+      expect(res.message).toContain('Required route geometry is missing or invalid');
+      // acceptOffer must NOT be called; trip must NOT be created
+      expect(dispatchServiceMock.acceptOffer).not.toHaveBeenCalled();
+    });
   });
 
-  describe('3. GPS Simulation Driver Protection: Rejects arbitrary non-demo driver user IDs', () => {
-    it('updateDriverLocation rejects non-demo driverUserId with ForbiddenException', async () => {
-      await expect(
-        service.updateDriverLocation(REAL_COMMUTER_DRIVER_ID, 23.1678, 72.645),
-      ).rejects.toThrowError(ForbiddenException);
+  describe('3. GPS Simulation Driver Protection: Server-side resolution without frontend driverUserId', () => {
+    it('updateDriverLocation throws ForbiddenException if demo driver is not provisioned', async () => {
+      // User query returns no demo driver
+      prismaMock.user.findMany.mockResolvedValueOnce([
+        {
+          id: DEMO_PAX_1_ID,
+          email: 'demo.passenger1@pdeu.ac.in',
+          driverProfile: null,
+        },
+      ]);
+
+      await expect(service.updateDriverLocation(23.1678, 72.645)).rejects.toThrowError(
+        ForbiddenException,
+      );
 
       expect(driversServiceMock.recordDriverLocation).not.toHaveBeenCalled();
     });
 
-    it('updateDriverLocation succeeds when given the provisioned demo driver user ID', async () => {
+    it('updateDriverLocation server-side resolves the provisioned demo driver and updates only that driver', async () => {
       prismaMock.driverProfile.findUnique.mockResolvedValue({
         id: DEMO_DRIVER_PROFILE_ID,
         userId: DEMO_DRIVER_USER_ID,
       });
 
-      const res = await service.updateDriverLocation(DEMO_DRIVER_USER_ID, 23.1678, 72.645);
+      // Endpoint does not accept driverUserId; server automatically resolves DEMO_DRIVER_USER_ID
+      const res = await service.updateDriverLocation(23.1678, 72.645);
 
       expect(res.success).toBe(true);
+      expect(res.driverUserId).toBe(DEMO_DRIVER_USER_ID);
       expect(res.latitude).toBe(23.1678);
       expect(res.longitude).toBe(72.645);
       expect(driversServiceMock.recordDriverLocation).toHaveBeenCalledWith(

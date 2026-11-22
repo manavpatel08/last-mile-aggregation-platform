@@ -9,6 +9,7 @@ import {
 } from '@nestjs/common';
 import { SimulationService } from './simulation.service.js';
 import { TriggerMatchingDto } from './dto/trigger-matching.dto.js';
+import { UpdateSimulationLocationDto } from './dto/update-location.dto.js';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard.js';
 import { RolesGuard } from '../../common/guards/roles.guard.js';
 import { Roles } from '../../common/decorators/roles.decorator.js';
@@ -74,13 +75,10 @@ export class SimulationController {
 
   @Post('location')
   @HttpCode(HttpStatus.OK)
-  async updateLocation(
-    @Body() body: { driverUserId: string; latitude: number; longitude: number },
-  ) {
+  async updateLocation(@Body() dto: UpdateSimulationLocationDto) {
     const data = await this.simulationService.updateDriverLocation(
-      body.driverUserId,
-      body.latitude,
-      body.longitude,
+      dto.latitude,
+      dto.longitude,
     );
     return {
       success: true,

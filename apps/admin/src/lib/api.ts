@@ -89,13 +89,12 @@ export async function progressStep() {
 }
 
 export async function updateDriverLocation(
-  driverUserId: string,
   latitude: number,
   longitude: number
 ) {
   return apiRequest("/admin/simulation/location", {
     method: "POST",
-    body: JSON.stringify({ driverUserId, latitude, longitude }),
+    body: JSON.stringify({ latitude, longitude }),
   });
 }
 

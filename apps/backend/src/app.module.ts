@@ -25,6 +25,7 @@ import { DispatchModule } from './modules/dispatch/dispatch.module.js';
 import { OutboxModule } from './infrastructure/outbox/outbox.module.js';
 import { RealtimeModule } from './modules/realtime/realtime.module.js';
 import { SyncModule } from './modules/sync/sync.module.js';
+import { SimulationModule } from './modules/simulation/simulation.module.js';
 import { JwtAuthGuard } from './common/guards/jwt-auth.guard.js';
 import { RolesGuard } from './common/guards/roles.guard.js';
 import { DriverApprovalGuard } from './common/guards/driver-approval.guard.js';
@@ -63,6 +64,7 @@ import { IdempotencyInterceptor } from './common/interceptors/idempotency.interc
     OutboxModule,
     RealtimeModule,
     SyncModule,
+    SimulationModule,
   ],
   controllers: [AppController],
   providers: [

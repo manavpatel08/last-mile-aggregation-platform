@@ -4,6 +4,7 @@ import {
   NotFoundException,
   OnModuleInit,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../../infrastructure/prisma/prisma.service.js';
 
 export interface PickupPointRecord {
@@ -27,7 +28,10 @@ export interface ServiceRegionRecord {
 export class LocationsService implements OnModuleInit {
   private readonly logger = new Logger(LocationsService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly configService: ConfigService,
+  ) {}
 
   async onModuleInit() {
     await this.bootstrapDefaults();
@@ -36,9 +40,23 @@ export class LocationsService implements OnModuleInit {
   /**
    * Automatically bootstrap the default Gandhinagar Service Region,
    * PDEU Main Gate pickup point, and pilot tariff v1 if not present.
+   * Admin account and dedicated demo pickup point are strictly gated by DEMO_MODE in non-prod.
    */
   async bootstrapDefaults(): Promise<void> {
     try {
+      const env =
+        this.configService.get<string>('environment') ||
+        process.env.NODE_ENV ||
+        'development';
+      const isProd = env === 'production' || process.env.NODE_ENV === 'production';
+      const isDemo =
+        !isProd &&
+        (this.configService.get<boolean>('demoMode', false) ||
+          this.configService.get<boolean>('DEMO_MODE', false) ||
+          process.env.DEMO_MODE === 'true' ||
+          process.env.DEMO_MODE === '1');
+
+      // 1. Authoritative production defaults
       await this.prisma.$executeRaw`
         DO $$
         DECLARE
@@ -86,6 +104,57 @@ export class LocationsService implements OnModuleInit {
         END $$;
       `;
       this.logger.log('Authoritative service zones, pickup hubs, and tariff v1 verified.');
+
+      // 2. Demo Admin & Isolated Demo Station: STRICTLY in non-production with DEMO_MODE enabled
+      if (isDemo) {
+        await this.prisma.$executeRaw`
+          DO $$
+          DECLARE
+            v_zone_id UUID;
+          BEGIN
+            SELECT id INTO v_zone_id FROM service_zones WHERE name = 'Gandhinagar Service Region';
+
+            -- Dedicated Demo Station for isolated demo pooling
+            IF NOT EXISTS (SELECT 1 FROM pickup_points WHERE name = 'PDEU Demo Station') THEN
+              INSERT INTO pickup_points (id, service_zone_id, name, center_point, radius_meters, is_active)
+              VALUES (
+                gen_random_uuid(),
+                v_zone_id,
+                'PDEU Demo Station',
+                ST_SetSRID(ST_MakePoint(72.6668, 23.1550), 4326),
+                150,
+                true
+              );
+            END IF;
+
+            -- Demo Platform Administrator
+            IF NOT EXISTS (SELECT 1 FROM users WHERE email = 'admin@pdeu.ac.in') THEN
+              INSERT INTO users (id, email, full_name, role, is_active)
+              VALUES (
+                '00000000-0000-0000-0000-000000000001'::uuid,
+                'admin@pdeu.ac.in',
+                'Platform Administrator',
+                'ADMIN',
+                true
+              );
+              INSERT INTO user_roles (id, user_id, role_name)
+              VALUES (
+                gen_random_uuid(),
+                '00000000-0000-0000-0000-000000000001'::uuid,
+                'ADMIN'
+              );
+              INSERT INTO auth_identities (id, user_id, provider, provider_sub)
+              VALUES (
+                gen_random_uuid(),
+                '00000000-0000-0000-0000-000000000001'::uuid,
+                'GOOGLE',
+                'admin-google-sub-001'
+              );
+            END IF;
+          END $$;
+        `;
+        this.logger.log('Demo ADMIN account and PDEU Demo Station provisioned in demo mode.');
+      }
     } catch (err) {
       this.logger.error(
         'Failed to bootstrap default location data',

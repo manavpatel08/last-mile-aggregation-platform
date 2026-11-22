@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 import 'package:lastmile_mobile/app/app.dart';
 import 'package:lastmile_mobile/core/config/app_config.dart';
 import 'package:lastmile_mobile/core/network/auth_token_store.dart';
+import 'package:lastmile_mobile/core/realtime/models/realtime_event.dart';
 import 'package:lastmile_mobile/core/realtime/socket_client.dart';
 import 'package:lastmile_mobile/core/realtime/socket_service.dart';
 import 'package:lastmile_mobile/core/storage/secure_token_storage.dart';
@@ -44,6 +45,36 @@ class _SpySocketService implements SocketService {
     disconnectCallCount++;
     _state = SocketConnectionState.disconnected;
   }
+
+  @override
+  Stream<StandardRealtimeEvent> get eventStream => const Stream.empty();
+
+  @override
+  Future<bool> subscribeTrip(String tripId) async => true;
+
+  @override
+  Future<bool> unsubscribeTrip(String tripId) async => true;
+
+  @override
+  Future<bool> subscribeBooking(String bookingId) async => true;
+
+  @override
+  Future<bool> unsubscribeBooking(String bookingId) async => true;
+
+  @override
+  Future<bool> subscribeGroup(String groupId) async => true;
+
+  @override
+  Future<bool> unsubscribeGroup(String groupId) async => true;
+
+  @override
+  Future<bool> emitLocationUpdate(DriverLocationUpdatePayload payload) async => true;
+
+  @override
+  void onEvent(String eventName, void Function(StandardRealtimeEvent event) handler) {}
+
+  @override
+  void offEvent(String eventName, [void Function(StandardRealtimeEvent event)? handler]) {}
 
   @override
   void dispose() {

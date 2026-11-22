@@ -289,5 +289,62 @@ void main() {
       expect(ticketProvider.ticketCallCount, 1);
       expect(client.connectCallCount, 1);
     });
+
+    test('12. active room subscriptions are restored upon reconnection', () async {
+      await service.connect();
+
+      final subSuccess = await service.subscribeTrip('trip-999');
+      expect(subSuccess, isTrue);
+
+      final subscribeEventsBefore = client.emittedEvents
+          .where((e) => e.key == 'subscribe:trip')
+          .map((e) => (e.value as Map)['tripId']?.toString())
+          .toList();
+      expect(subscribeEventsBefore, contains('trip-999'));
+
+      // Unexpected disconnect
+      client.simulateDisconnect();
+      await Future<void>.delayed(Duration.zero);
+      expect(service.state, SocketConnectionState.reconnecting);
+
+      // Wait for reconnect timer to fire
+      await Future<void>.delayed(const Duration(milliseconds: 25));
+      expect(service.state, SocketConnectionState.connected);
+
+      // Resubscription was sent automatically for the active room
+      final subscribeEventsAfter = client.emittedEvents
+          .where((e) => e.key == 'subscribe:trip')
+          .map((e) => (e.value as Map)['tripId']?.toString())
+          .toList();
+      expect(subscribeEventsAfter.where((id) => id == 'trip-999').length, 2);
+    });
+
+    test('13. forbidden room subscription ACK drops room from active subscriptions', () async {
+      await service.connect();
+
+      // Configure ACK handler to return FORBIDDEN for forbidden-trip
+      client.setAckHandler('subscribe:trip', (data) {
+        final tripId = (data as Map)['tripId']?.toString();
+        if (tripId == 'forbidden-trip') {
+          return {'success': false, 'error': 'FORBIDDEN', 'message': 'Access denied'};
+        }
+        return {'success': true};
+      });
+
+      final subSuccess = await service.subscribeTrip('forbidden-trip');
+      expect(subSuccess, isFalse);
+
+      // Disconnect and reconnect
+      client.simulateDisconnect();
+      await Future<void>.delayed(const Duration(milliseconds: 25));
+      expect(service.state, SocketConnectionState.connected);
+
+      // Because it was forbidden, it was NOT resubscribed on reconnect
+      final resubscribedRooms = client.emittedEvents
+          .where((e) => e.key == 'subscribe:trip')
+          .map((e) => (e.value as Map)['tripId']?.toString())
+          .toList();
+      expect(resubscribedRooms.where((id) => id == 'forbidden-trip').length, 1);
+    });
   });
 }

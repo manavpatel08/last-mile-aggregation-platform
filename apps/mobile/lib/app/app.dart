@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:material_ui/material_ui.dart';
 import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
@@ -6,9 +7,13 @@ import '../core/config/app_config.dart';
 import '../core/network/api_client.dart';
 import '../core/network/auth_refresh_interceptor.dart';
 import '../core/network/auth_token_store.dart';
+import '../core/realtime/io_socket_client.dart';
+import '../core/realtime/models/realtime_event.dart';
 import '../core/realtime/socket_client.dart';
 import '../core/realtime/socket_service.dart';
 import '../core/realtime/socket_ticket_provider.dart';
+import '../core/realtime/sync_repository.dart';
+import '../core/realtime/sync_service.dart';
 import '../core/storage/secure_token_storage.dart';
 import '../core/theme/app_theme.dart';
 import '../features/auth/data/api_auth_repository.dart';
@@ -56,6 +61,9 @@ class LastMileApp extends StatefulWidget {
     this.tripRepository,
     this.socketService,
     this.socketTicketProvider,
+    this.socketClient,
+    this.syncRepository,
+    this.syncService,
   });
 
   final AppConfig config;
@@ -78,12 +86,15 @@ class LastMileApp extends StatefulWidget {
   final TripRepository? tripRepository;
   final SocketService? socketService;
   final SocketTicketProvider? socketTicketProvider;
+  final SocketClient? socketClient;
+  final SyncRepository? syncRepository;
+  final SyncService? syncService;
 
   @override
   State<LastMileApp> createState() => _LastMileAppState();
 }
 
-class _LastMileAppState extends State<LastMileApp> {
+class _LastMileAppState extends State<LastMileApp> with WidgetsBindingObserver {
   late final AppModeProvider _appModeProvider;
   late final bool _ownsAppModeProvider;
   late final AuthTokenStore _tokenStore;
@@ -104,8 +115,16 @@ class _LastMileAppState extends State<LastMileApp> {
   late final PassengerHomeProvider _passengerHomeProvider;
   late final bool _ownsPassengerHomeProvider;
   late final TripRepository _tripRepository;
+  late final SocketClient _socketClient;
   late final SocketService _socketService;
   late final bool _ownsSocketService;
+  late final DriverLocationTracker _driverLocationTracker;
+  late final bool _ownsDriverLocationTracker;
+  late final SyncRepository _syncRepository;
+  late final SyncService _syncService;
+  late final bool _ownsSyncService;
+  StreamSubscription<StandardRealtimeEvent>? _eventSubscription;
+  StreamSubscription? _syncSubscription;
   late final AuthProvider _authProvider;
   late final bool _ownsAuthProvider;
   late final ApiClient _apiClient;
@@ -126,8 +145,15 @@ class _LastMileAppState extends State<LastMileApp> {
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _driverLocationTracker.updateAppLifecycle(state);
+    _syncService.onAppLifecycleStateChanged(state);
+  }
+
+  @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _ownsAppModeProvider = widget.appModeProvider == null;
     _appModeProvider =
         widget.appModeProvider ??
@@ -173,11 +199,36 @@ class _LastMileAppState extends State<LastMileApp> {
     _driverOnboardingProvider = widget.driverOnboardingProvider ??
         DriverOnboardingProvider(driverRepository: _driverRepository);
 
+    _ownsSocketService = widget.socketService == null;
+    _socketClient = widget.socketClient ?? IOSocketClient();
+    _socketService = widget.socketService ??
+        RealtimeSocketService(
+          config: widget.config,
+          ticketProvider: widget.socketTicketProvider ??
+              ApiSocketTicketProvider(apiClient: _apiClient),
+          client: _socketClient,
+        );
+
+    _ownsDriverLocationTracker = widget.driverLocationTracker == null;
+    _driverLocationTracker = widget.driverLocationTracker ??
+        GeolocatorDriverLocationTracker(
+          socketService: _socketService,
+        );
+
     _ownsDriverHomeProvider = widget.driverHomeProvider == null;
     _driverHomeProvider = widget.driverHomeProvider ??
         DriverHomeProvider(
           driverRepository: _driverRepository,
-          locationTracker: widget.driverLocationTracker,
+          locationTracker: _driverLocationTracker,
+        );
+
+    _syncRepository = widget.syncRepository ??
+        ApiSyncRepository(apiClient: _apiClient);
+    _ownsSyncService = widget.syncService == null;
+    _syncService = widget.syncService ??
+        SyncService(
+          syncRepository: _syncRepository,
+          socketService: _socketService,
         );
 
     _bookingRepository = widget.bookingRepository ??
@@ -207,14 +258,34 @@ class _LastMileAppState extends State<LastMileApp> {
     _tripRepository =
         widget.tripRepository ?? ApiTripRepository(apiClient: _apiClient);
 
-    _ownsSocketService = widget.socketService == null;
-    _socketService = widget.socketService ??
-        RealtimeSocketService(
-          config: widget.config,
-          ticketProvider: widget.socketTicketProvider ??
-              ApiSocketTicketProvider(apiClient: _apiClient),
-          client: NoOpSocketClient(),
-        );
+    _syncSubscription = _syncService.syncStream.listen((response) {
+      _passengerHomeProvider.handleSyncResponse(
+        response.passengerState,
+        repository: _bookingRepository,
+      );
+      _driverHomeProvider.handleSyncResponse(response.driverState);
+    });
+
+    _eventSubscription = _socketService.eventStream.listen((event) {
+      if (event.event == 'booking.status.updated') {
+        if (event.data is Map) {
+          _passengerHomeProvider.onBookingStatusUpdated(
+            Map<String, dynamic>.from(event.data as Map),
+          );
+        }
+      } else if (event.event == 'driver.offer.withdrawn') {
+        if (event.data is Map) {
+          final offerId = (event.data as Map)['offerId']?.toString();
+          if (offerId != null) {
+            _driverHomeProvider.onOfferWithdrawn(offerId);
+          }
+        }
+      } else if (event.event == 'driver.offer.created') {
+        if (_driverHomeProvider.status?.verificationStatus == 'APPROVED') {
+          _driverHomeProvider.loadOffers(repository: _driverRepository);
+        }
+      }
+    });
 
     _router = AppRouter.createRouter(
       appModeProvider: _appModeProvider,
@@ -230,10 +301,19 @@ class _LastMileAppState extends State<LastMileApp> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _eventSubscription?.cancel();
+    _syncSubscription?.cancel();
     _authProvider.removeListener(_handleAuthChange);
     _router.dispose();
+    if (_ownsSyncService) {
+      _syncService.dispose();
+    }
     if (_ownsSocketService) {
       _socketService.dispose();
+    }
+    if (_ownsDriverLocationTracker) {
+      _driverLocationTracker.dispose();
     }
     if (_ownsAppModeProvider) {
       _appModeProvider.dispose();
@@ -272,7 +352,10 @@ class _LastMileAppState extends State<LastMileApp> {
         Provider<DriverRepository>.value(value: _driverRepository),
         Provider<BookingRepository>.value(value: _bookingRepository),
         Provider<TripRepository>.value(value: _tripRepository),
+        Provider<DriverLocationTracker>.value(value: _driverLocationTracker),
         Provider<SocketService>.value(value: _socketService),
+        Provider<SyncRepository>.value(value: _syncRepository),
+        ChangeNotifierProvider<SyncService>.value(value: _syncService),
         Provider<PassengerLocationService>.value(value: _locationService),
         ChangeNotifierProvider<AppModeProvider>.value(value: _appModeProvider),
         ChangeNotifierProvider<AuthProvider>.value(value: _authProvider),

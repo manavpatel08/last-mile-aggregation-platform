@@ -72,19 +72,61 @@ class CashConfirmationModel {
   });
 
   factory CashConfirmationModel.fromJson(Map<String, dynamic> json) {
-    final rawAllocations = json['paymentAllocations'] as List? ?? [];
+    final rawCollectionId = json['collectionId'];
+    if (rawCollectionId is! String || rawCollectionId.trim().isEmpty) {
+      throw const FormatException(
+        'CashConfirmationModel: missing or empty "collectionId"',
+      );
+    }
+    final rawTripId = json['tripId'];
+    if (rawTripId is! String || rawTripId.trim().isEmpty) {
+      throw const FormatException(
+        'CashConfirmationModel: missing or empty "tripId"',
+      );
+    }
+    final rawTripPassengerId = json['tripPassengerId'];
+    if (rawTripPassengerId is! String || rawTripPassengerId.trim().isEmpty) {
+      throw const FormatException(
+        'CashConfirmationModel: missing or empty "tripPassengerId"',
+      );
+    }
+    final rawDriverId = json['driverId'];
+    if (rawDriverId is! String || rawDriverId.trim().isEmpty) {
+      throw const FormatException(
+        'CashConfirmationModel: missing or empty "driverId"',
+      );
+    }
+    final rawTotalCashCollected = json['totalCashCollected'];
+    if (rawTotalCashCollected is! String || rawTotalCashCollected.trim().isEmpty) {
+      throw const FormatException(
+        'CashConfirmationModel: missing or empty "totalCashCollected"',
+      );
+    }
+    final rawRideFare = json['rideFare'];
+    if (rawRideFare is! String || rawRideFare.trim().isEmpty) {
+      throw const FormatException(
+        'CashConfirmationModel: missing or empty "rideFare"',
+      );
+    }
+    final rawAllocations = json['paymentAllocations'];
+    if (rawAllocations is! List) {
+      throw const FormatException(
+        'CashConfirmationModel: missing or invalid "paymentAllocations" list',
+      );
+    }
+
     final rawFeeIds = json['collectedFeeIds'] as List? ?? [];
 
     return CashConfirmationModel(
-      collectionId: json['collectionId'] as String? ?? '',
-      tripId: json['tripId'] as String? ?? '',
-      tripPassengerId: json['tripPassengerId'] as String? ?? '',
-      driverId: json['driverId'] as String? ?? '',
+      collectionId: rawCollectionId.trim(),
+      tripId: rawTripId.trim(),
+      tripPassengerId: rawTripPassengerId.trim(),
+      driverId: rawDriverId.trim(),
       totalCashCollectedPaise:
           (json['totalCashCollectedPaise'] as num?)?.toInt() ?? 0,
-      totalCashCollected: json['totalCashCollected'] as String? ?? '0.00',
+      totalCashCollected: rawTotalCashCollected.trim(),
       rideFarePaise: (json['rideFarePaise'] as num?)?.toInt() ?? 0,
-      rideFare: json['rideFare'] as String? ?? '0.00',
+      rideFare: rawRideFare.trim(),
       waitingChargePaise: (json['waitingChargePaise'] as num?)?.toInt() ?? 0,
       waitingCharge: json['waitingCharge'] as String? ?? '0.00',
       surchargeFeesPaise: (json['surchargeFeesPaise'] as num?)?.toInt() ?? 0,
@@ -96,7 +138,7 @@ class CashConfirmationModel {
           : null,
       paymentAllocations: rawAllocations
           .map((a) =>
-              PaymentAllocationModel.fromJson(a as Map<String, dynamic>))
+              PaymentAllocationModel.fromJson(Map<String, dynamic>.from(a as Map)))
           .toList(),
     );
   }

@@ -3,6 +3,7 @@ import 'package:flutter/widgets.dart';
 import 'package:uuid/uuid.dart';
 
 import '../../../core/network/api_exception.dart';
+import '../../../core/realtime/models/sync_models.dart';
 import '../data/driver_repository.dart';
 import '../models/accept_offer_response.dart';
 import '../models/driver_dispatch_offer.dart';
@@ -523,6 +524,36 @@ class DriverHomeProvider extends ChangeNotifier {
       sessionUser: sessionUser,
     );
     if (_isCurrentSession(sessionGen, sessionUser)) {
+      notifyListeners();
+    }
+  }
+
+  /// Realtime offer withdrawn handler.
+  void onOfferWithdrawn(String offerId) {
+    if (_offers.any((o) => o.id == offerId)) {
+      _offers = _offers.where((o) => o.id != offerId).toList();
+      if (_offers.isEmpty) {
+        _inboxState = DispatchInboxState.empty;
+      }
+      notifyListeners();
+    }
+  }
+
+  /// Handles authoritative driver state updates from `POST /api/v1/sync`.
+  void handleSyncResponse(SyncDriverState? syncState) {
+    if (syncState == null) return;
+    if (syncState.activeOffer == null && _offers.isNotEmpty) {
+      _offers = const [];
+      _inboxState = DispatchInboxState.empty;
+      notifyListeners();
+    }
+    if (syncState.activeTrip != null) {
+      _activeTripId = syncState.activeTrip?.id;
+      _locationTracker.setActiveTripId(_activeTripId);
+      notifyListeners();
+    } else if (_activeTripId != null) {
+      _activeTripId = null;
+      _locationTracker.setActiveTripId(null);
       notifyListeners();
     }
   }

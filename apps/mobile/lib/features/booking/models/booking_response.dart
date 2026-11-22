@@ -16,6 +16,7 @@ class BookingResponse {
     this.cancellationReason,
     this.cancelledAt,
     this.createdAt,
+    this.updatedAt,
     this.passengerPickupLocation,
     this.destinationLocation,
   });
@@ -50,6 +51,11 @@ class BookingResponse {
       createdAt: json['createdAt'] != null
           ? DateTime.tryParse(json['createdAt'] as String)
           : null,
+      updatedAt: json['updatedAt'] != null
+          ? DateTime.tryParse(json['updatedAt'] as String)
+          : (json['updated_at'] != null
+              ? DateTime.tryParse(json['updated_at'] as String)
+              : null),
       passengerPickupLocation: json['passengerPickupLocation'] != null
           ? BookingLocation.fromJson(
               json['passengerPickupLocation'] as Map<String, dynamic>,
@@ -76,6 +82,7 @@ class BookingResponse {
   final String? cancellationReason;
   final DateTime? cancelledAt;
   final DateTime? createdAt;
+  final DateTime? updatedAt;
   final BookingLocation? passengerPickupLocation;
   final BookingLocation? destinationLocation;
 

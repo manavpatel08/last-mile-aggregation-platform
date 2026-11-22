@@ -27,6 +27,7 @@ class DriverActiveTripProvider extends ChangeNotifier {
   final Map<String, String> _lastAttemptedOtps = {};
   final Map<String, CompletePassengerResponse> _completedDropOffs = {};
   final Map<String, CashConfirmationModel> _confirmedCashReceipts = {};
+  final Set<String> _confirmedPaymentPassengerIds = <String>{};
   String? _generalError;
   String? _generalSuccess;
   String? _currentTripId;
@@ -71,10 +72,24 @@ class DriverActiveTripProvider extends ChangeNotifier {
   CompletePassengerResponse? dropOffResult(String passengerId) =>
       _completedDropOffs[passengerId];
 
+  Map<String, CashConfirmationModel> get confirmedCashReceipts =>
+      Map.unmodifiable(_confirmedCashReceipts);
+
   CashConfirmationModel? cashReceipt(String passengerId) =>
       _confirmedCashReceipts[passengerId];
 
+  @visibleForTesting
+  void recordCashReceipt(String passengerId, CashConfirmationModel receipt) {
+    _confirmedCashReceipts[passengerId] = receipt;
+    notifyListeners();
+  }
+
   bool isCashCollected(String passengerId) =>
+      _confirmedCashReceipts.containsKey(passengerId) ||
+      _confirmedPaymentPassengerIds.contains(passengerId);
+
+  bool isPaymentConfirmed(String passengerId) =>
+      _confirmedPaymentPassengerIds.contains(passengerId) ||
       _confirmedCashReceipts.containsKey(passengerId);
 
   @visibleForTesting
@@ -574,6 +589,77 @@ class DriverActiveTripProvider extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Realtime event handler for `passenger.boarded`.
+  void onPassengerBoarded(String passengerId) {
+    if (_trip == null) return;
+    final updated = _trip!.passengers.map((p) {
+      if (p.passengerId == passengerId || p.id == passengerId) {
+        return p.copyWith(status: 'BOARDED');
+      }
+      return p;
+    }).toList();
+    _trip = _trip!.copyWith(passengers: updated);
+    notifyListeners();
+  }
+
+  /// Realtime event handler for `passenger.dropped_off`.
+  void onPassengerDroppedOff(String passengerId) {
+    if (_trip == null) return;
+    final updated = _trip!.passengers.map((p) {
+      if (p.passengerId == passengerId || p.id == passengerId) {
+        return p.copyWith(status: 'COMPLETED');
+      }
+      return p;
+    }).toList();
+    _trip = _trip!.copyWith(passengers: updated);
+    notifyListeners();
+  }
+
+  /// Realtime event handler for `passenger.no_show`.
+  void onPassengerNoShow(String passengerId) {
+    if (_trip == null) return;
+    final updated = _trip!.passengers.map((p) {
+      if (p.passengerId == passengerId || p.id == passengerId) {
+        return p.copyWith(status: 'NO_SHOW');
+      }
+      return p;
+    }).toList();
+    _trip = _trip!.copyWith(passengers: updated);
+    notifyListeners();
+  }
+
+  /// Realtime event handler for `trip.status.updated`.
+  void onTripStatusUpdated(String status) {
+    if (_trip == null) return;
+    _trip = _trip!.copyWith(status: status);
+    notifyListeners();
+  }
+
+  /// Realtime event handler for `trip.completed`.
+  void onTripCompleted() {
+    if (_trip == null) return;
+    _trip = _trip!.copyWith(status: 'COMPLETED');
+    notifyListeners();
+  }
+
+  /// Realtime event handler for `payment.confirmed`.
+  /// Treats incoming socket payload strictly as payment-status confirmation.
+  /// Does not parse partial socket data into CashConfirmationModel or overwrite full receipts.
+  void onPaymentConfirmed(Map<String, dynamic> data) {
+    final tpId = data['tripPassengerId']?.toString();
+    final passId = data['passengerId']?.toString();
+    bool changed = false;
+    if (tpId != null && tpId.isNotEmpty) {
+      if (_confirmedPaymentPassengerIds.add(tpId)) changed = true;
+    }
+    if (passId != null && passId.isNotEmpty) {
+      if (_confirmedPaymentPassengerIds.add(passId)) changed = true;
+    }
+    if (changed) {
+      notifyListeners();
+    }
+  }
+
   void clear() {
     _trip = null;
     _isLoadingTrip = false;
@@ -587,6 +673,7 @@ class DriverActiveTripProvider extends ChangeNotifier {
     _cashErrors.clear();
     _completedDropOffs.clear();
     _confirmedCashReceipts.clear();
+    _confirmedPaymentPassengerIds.clear();
     _idempotencyKeys.clear();
     _lastAttemptedOtps.clear();
     _generalError = null;

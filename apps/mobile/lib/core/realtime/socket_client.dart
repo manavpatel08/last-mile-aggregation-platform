@@ -12,9 +12,6 @@ enum SocketConnectionState {
 /// Abstract transport client interface isolating the underlying Socket.IO library.
 abstract interface class SocketClient {
   /// Whether this client represents an active socket transport.
-  ///
-  /// For placeholder/no-op clients (e.g. before the native socket library is
-  /// linked), this returns false to prevent unneeded ticket acquisition.
   bool get isEnabled;
 
   /// Whether the socket is currently connected to the server.
@@ -36,6 +33,18 @@ abstract interface class SocketClient {
 
   /// Disconnects the socket transport.
   void disconnect();
+
+  /// Emits an event with optional data without expecting an acknowledgment.
+  void emit(String event, [dynamic data]);
+
+  /// Emits an event with data and awaits an acknowledgment from the server.
+  Future<dynamic> emitWithAck(String event, dynamic data);
+
+  /// Registers a listener for an incoming server event.
+  void on(String event, void Function(dynamic data) handler);
+
+  /// Removes an event listener.
+  void off(String event, [void Function(dynamic data)? handler]);
 
   /// Releases resources.
   void dispose();
@@ -71,12 +80,26 @@ class NoOpSocketClient implements SocketClient {
   void disconnect() {}
 
   @override
+  void emit(String event, [dynamic data]) {}
+
+  @override
+  Future<dynamic> emitWithAck(String event, dynamic data) async {
+    return {'success': false, 'error': 'NO_OP_CLIENT'};
+  }
+
+  @override
+  void on(String event, void Function(dynamic data) handler) {}
+
+  @override
+  void off(String event, [void Function(dynamic data)? handler]) {}
+
+  @override
   void dispose() {
     _controller.close();
   }
 }
 
-/// Testable fake client simulating socket transport behavior, disconnects, and errors.
+/// Testable fake client simulating socket transport behavior, disconnects, emits, and ACKs.
 class FakeSocketClient implements SocketClient {
   FakeSocketClient({
     SocketConnectionState initialState = SocketConnectionState.disconnected,
@@ -87,6 +110,10 @@ class FakeSocketClient implements SocketClient {
   final bool isEnabled;
 
   final _controller = StreamController<SocketConnectionState>.broadcast();
+  final Map<String, List<void Function(dynamic)>> _listeners = {};
+  final List<MapEntry<String, dynamic>> emittedEvents = [];
+  final Map<String, dynamic Function(dynamic data)> _ackHandlers = {};
+
   SocketConnectionState _state;
 
   String? lastUri;
@@ -127,6 +154,47 @@ class FakeSocketClient implements SocketClient {
     setState(SocketConnectionState.disconnected);
   }
 
+  @override
+  void emit(String event, [dynamic data]) {
+    emittedEvents.add(MapEntry(event, data));
+  }
+
+  @override
+  Future<dynamic> emitWithAck(String event, dynamic data) async {
+    emittedEvents.add(MapEntry(event, data));
+    final handler = _ackHandlers[event];
+    if (handler != null) {
+      return handler(data);
+    }
+    return {'success': true};
+  }
+
+  void setAckHandler(String event, dynamic Function(dynamic data) handler) {
+    _ackHandlers[event] = handler;
+  }
+
+  @override
+  void on(String event, void Function(dynamic data) handler) {
+    _listeners.putIfAbsent(event, () => []).add(handler);
+  }
+
+  @override
+  void off(String event, [void Function(dynamic data)? handler]) {
+    if (handler == null) {
+      _listeners.remove(event);
+    } else {
+      _listeners[event]?.remove(handler);
+    }
+  }
+
+  /// Simulates an incoming server event broadcast.
+  void simulateEvent(String event, dynamic data) {
+    final handlers = List<void Function(dynamic)>.from(_listeners[event] ?? const []);
+    for (final handler in handlers) {
+      handler(data);
+    }
+  }
+
   void setState(SocketConnectionState newState) {
     _state = newState;
     if (!_controller.isClosed) {
@@ -145,6 +213,7 @@ class FakeSocketClient implements SocketClient {
   @override
   void dispose() {
     isDisposed = true;
+    _listeners.clear();
     _controller.close();
   }
 }

@@ -1,9 +1,13 @@
+import 'dart:async';
 import 'package:material_ui/material_ui.dart';
 import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
 
 import '../../../../app/router/app_routes.dart';
+import '../../../../core/realtime/models/realtime_event.dart';
+import '../../../../core/realtime/socket_service.dart';
 import '../../../../core/theme/app_colors.dart';
+import '../../../driver/services/driver_location_tracker.dart';
 import '../../data/trip_repository.dart';
 import '../../state/driver_active_trip_provider.dart';
 
@@ -29,6 +33,56 @@ class _DriverActiveTripScreenState extends State<DriverActiveTripScreen> {
   late final DriverActiveTripProvider _provider;
   bool _ownsProvider = false;
   final Map<String, TextEditingController> _otpControllers = {};
+  StreamSubscription<StandardRealtimeEvent>? _eventSubscription;
+  SocketService? _socketService;
+  DriverLocationTracker? _locationTracker;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_socketService == null) {
+      try {
+        _socketService = Provider.of<SocketService>(context, listen: false);
+        _setupRealtime();
+      } catch (_) {}
+    }
+    if (_locationTracker == null) {
+      try {
+        _locationTracker =
+            Provider.of<DriverLocationTracker>(context, listen: false);
+        _locationTracker?.setActiveTripId(widget.tripId);
+      } catch (_) {}
+    }
+  }
+
+  void _setupRealtime() {
+    final socket = _socketService;
+    if (socket == null) return;
+    socket.subscribeTrip(widget.tripId);
+    _eventSubscription?.cancel();
+    _eventSubscription = socket.eventStream.listen((event) {
+      if (!mounted) return;
+      if (event.event == 'passenger.boarded') {
+        final pId = event.data is Map ? event.data['passengerId'] : null;
+        if (pId != null) _provider.onPassengerBoarded(pId.toString());
+      } else if (event.event == 'trip.status.updated') {
+        _provider.onTripStatusUpdated('IN_PROGRESS');
+      } else if (event.event == 'passenger.dropped_off') {
+        final pId = event.data is Map ? event.data['passengerId'] : null;
+        if (pId != null) _provider.onPassengerDroppedOff(pId.toString());
+      } else if (event.event == 'passenger.no_show') {
+        final pId = event.data is Map ? event.data['passengerId'] : null;
+        if (pId != null) _provider.onPassengerNoShow(pId.toString());
+      } else if (event.event == 'trip.completed') {
+        _provider.onTripCompleted();
+        _locationTracker?.setActiveTripId(null);
+      } else if (event.event == 'payment.confirmed') {
+        if (event.data is Map) {
+          _provider.onPaymentConfirmed(Map<String, dynamic>.from(event.data));
+        }
+      }
+    });
+  }
 
   @override
   void initState() {
@@ -50,6 +104,9 @@ class _DriverActiveTripScreenState extends State<DriverActiveTripScreen> {
 
   @override
   void dispose() {
+    _socketService?.unsubscribeTrip(widget.tripId);
+    _eventSubscription?.cancel();
+    _locationTracker?.setActiveTripId(null);
     for (final controller in _otpControllers.values) {
       controller.dispose();
     }

@@ -2,6 +2,8 @@ import 'dart:async';
 import 'package:flutter/widgets.dart';
 import 'package:geolocator/geolocator.dart';
 
+import '../../../core/realtime/models/realtime_event.dart';
+import '../../../core/realtime/socket_service.dart';
 import '../data/driver_repository.dart';
 
 /// Platform abstraction for location services, isolating native [Geolocator]
@@ -45,6 +47,10 @@ abstract class DriverLocationTracker {
   /// Immediately stops GPS telemetry reporting.
   void stopTracking();
 
+  /// Updates the active trip context.
+  /// When non-null, telemetry switches to 4s cadence; when null, 10s idle cadence.
+  void setActiveTripId(String? tripId);
+
   /// Updates current application lifecycle state to enforce foreground-only reporting.
   void updateAppLifecycle(AppLifecycleState state);
 
@@ -73,6 +79,9 @@ class NoOpDriverLocationTracker implements DriverLocationTracker {
   void stopTracking() {}
 
   @override
+  void setActiveTripId(String? tripId) {}
+
+  @override
   void updateAppLifecycle(AppLifecycleState state) {}
 
   @override
@@ -93,19 +102,29 @@ class NoOpDriverLocationTracker implements DriverLocationTracker {
 /// 6. Guards against overlapping in-flight location fixes.
 /// 7. Every tracking session is strictly isolated by [_currentSessionId] and [_inFlightOperationId]
 ///    to eliminate stop/restart race conditions.
+/// 8. Single periodic timer: switches seamlessly between 10s idle and 4s in-trip cadence.
+/// 9. Streams telemetry over Socket.IO when connected, suppressing duplicate REST calls.
+///    Falls back to REST sequentially if socket is disconnected or emit fails/times out.
 class GeolocatorDriverLocationTracker implements DriverLocationTracker {
   GeolocatorDriverLocationTracker({
-    this.reportInterval = const Duration(seconds: 10),
+    Duration? reportInterval,
+    Duration? idleInterval,
+    this.inTripInterval = const Duration(seconds: 4),
     LocationPlatformService? platformService,
-  }) : _platformService = platformService ?? const GeolocatorPlatformService();
+    this.socketService,
+  })  : idleInterval = idleInterval ?? reportInterval ?? const Duration(seconds: 10),
+        _platformService = platformService ?? const GeolocatorPlatformService();
 
-  final Duration reportInterval;
+  final Duration idleInterval;
+  final Duration inTripInterval;
   final LocationPlatformService _platformService;
+  final SocketService? socketService;
 
   DriverRepository? _repository;
   Timer? _timer;
   bool _isTracking = false;
   AppLifecycleState _lifecycleState = AppLifecycleState.resumed;
+  String? _activeTripId;
 
   // Session & Operation Isolation (prevents stop/restart race)
   int _currentSessionId = 0;
@@ -122,6 +141,16 @@ class GeolocatorDriverLocationTracker implements DriverLocationTracker {
   LocationPermission? get lastPermission => _lastPermission;
   bool get lastLocationServiceEnabled => _lastLocationServiceEnabled;
   bool get isReportingLocation => _inFlightOperationId != null;
+  String? get activeTripId => _activeTripId;
+
+  @override
+  void setActiveTripId(String? tripId) {
+    if (_activeTripId == tripId) return;
+    _activeTripId = tripId;
+    if (_isTracking && _lifecycleState == AppLifecycleState.resumed) {
+      _startPeriodicTimer(_currentSessionId);
+    }
+  }
 
   @override
   void startTracking({required DriverRepository repository}) {
@@ -140,6 +169,7 @@ class GeolocatorDriverLocationTracker implements DriverLocationTracker {
     _currentSessionId++;
     _inFlightOperationId = null;
     _isTracking = false;
+    _activeTripId = null;
     _cancelTimer();
     _repository = null;
   }
@@ -169,7 +199,8 @@ class GeolocatorDriverLocationTracker implements DriverLocationTracker {
 
   void _startPeriodicTimer(int sessionId) {
     _cancelTimer();
-    _timer = Timer.periodic(reportInterval, (_) {
+    final interval = _activeTripId != null ? inTripInterval : idleInterval;
+    _timer = Timer.periodic(interval, (_) {
       _reportCurrentFix(sessionId);
     });
   }
@@ -247,12 +278,33 @@ class GeolocatorDriverLocationTracker implements DriverLocationTracker {
         return;
       }
 
-      await _repository!.reportLocation(
-        latitude: position.latitude,
-        longitude: position.longitude,
-        heading: position.heading >= 0 ? position.heading : null,
-        speed: position.speed >= 0 ? position.speed : null,
-      );
+      // Sequential transport dispatch: Socket first, fallback to REST on failure/timeout
+      bool socketDelivered = false;
+      final socket = socketService;
+      if (socket != null && socket.isConnected) {
+        try {
+          final payload = DriverLocationUpdatePayload(
+            latitude: position.latitude,
+            longitude: position.longitude,
+            heading: position.heading >= 0 ? position.heading : null,
+            speed: position.speed >= 0 ? position.speed : null,
+            tripId: _activeTripId,
+          );
+          socketDelivered = await socket.emitLocationUpdate(payload);
+        } catch (_) {
+          socketDelivered = false;
+        }
+      }
+
+      // Suppress REST if socket acknowledged; otherwise sequential REST fallback
+      if (!socketDelivered && _repository != null) {
+        await _repository!.reportLocation(
+          latitude: position.latitude,
+          longitude: position.longitude,
+          heading: position.heading >= 0 ? position.heading : null,
+          speed: position.speed >= 0 ? position.speed : null,
+        );
+      }
     } catch (_) {
       // Safe telemetry absorption: network/GPS failure absorbed safely
     } finally {
@@ -281,9 +333,17 @@ class FakeDriverLocationTracker implements DriverLocationTracker {
   int lifecycleUpdateCount = 0;
   int retryPermissionCallCount = 0;
   AppLifecycleState lastLifecycleState = AppLifecycleState.resumed;
+  String? activeTripId;
+  int setActiveTripIdCallCount = 0;
 
   @override
   bool get isTracking => _isTracking;
+
+  @override
+  void setActiveTripId(String? tripId) {
+    setActiveTripIdCallCount++;
+    activeTripId = tripId;
+  }
 
   @override
   void startTracking({required DriverRepository repository}) {
@@ -296,6 +356,7 @@ class FakeDriverLocationTracker implements DriverLocationTracker {
   void stopTracking() {
     stopCallCount++;
     _isTracking = false;
+    activeTripId = null;
     lastRepository = null;
   }
 

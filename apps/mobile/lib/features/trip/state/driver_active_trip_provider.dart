@@ -574,6 +574,72 @@ class DriverActiveTripProvider extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Realtime event handler for `passenger.boarded`.
+  void onPassengerBoarded(String passengerId) {
+    if (_trip == null) return;
+    final updated = _trip!.passengers.map((p) {
+      if (p.passengerId == passengerId || p.id == passengerId) {
+        return p.copyWith(status: 'BOARDED');
+      }
+      return p;
+    }).toList();
+    _trip = _trip!.copyWith(passengers: updated);
+    notifyListeners();
+  }
+
+  /// Realtime event handler for `passenger.dropped_off`.
+  void onPassengerDroppedOff(String passengerId) {
+    if (_trip == null) return;
+    final updated = _trip!.passengers.map((p) {
+      if (p.passengerId == passengerId || p.id == passengerId) {
+        return p.copyWith(status: 'COMPLETED');
+      }
+      return p;
+    }).toList();
+    _trip = _trip!.copyWith(passengers: updated);
+    notifyListeners();
+  }
+
+  /// Realtime event handler for `passenger.no_show`.
+  void onPassengerNoShow(String passengerId) {
+    if (_trip == null) return;
+    final updated = _trip!.passengers.map((p) {
+      if (p.passengerId == passengerId || p.id == passengerId) {
+        return p.copyWith(status: 'NO_SHOW');
+      }
+      return p;
+    }).toList();
+    _trip = _trip!.copyWith(passengers: updated);
+    notifyListeners();
+  }
+
+  /// Realtime event handler for `trip.status.updated`.
+  void onTripStatusUpdated(String status) {
+    if (_trip == null) return;
+    _trip = _trip!.copyWith(status: status);
+    notifyListeners();
+  }
+
+  /// Realtime event handler for `trip.completed`.
+  void onTripCompleted() {
+    if (_trip == null) return;
+    _trip = _trip!.copyWith(status: 'COMPLETED');
+    notifyListeners();
+  }
+
+  /// Realtime event handler for `payment.confirmed`.
+  void onPaymentConfirmed(Map<String, dynamic> data) {
+    final tpId = data['tripPassengerId'] as String?;
+    final passId = data['passengerId'] as String?;
+    final targetId = passId ?? tpId;
+    if (targetId != null && !_confirmedCashReceipts.containsKey(targetId)) {
+      try {
+        _confirmedCashReceipts[targetId] = CashConfirmationModel.fromJson(data);
+        notifyListeners();
+      } catch (_) {}
+    }
+  }
+
   void clear() {
     _trip = null;
     _isLoadingTrip = false;

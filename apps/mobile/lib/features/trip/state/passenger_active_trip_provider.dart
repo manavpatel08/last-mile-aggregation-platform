@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart';
 
 import '../../../core/network/api_exception.dart';
+import '../../../core/realtime/models/realtime_event.dart';
 import '../../booking/data/booking_repository.dart';
 import '../data/trip_repository.dart';
 import '../models/passenger_boarding_pass.dart';
@@ -18,14 +19,20 @@ class PassengerActiveTripProvider extends ChangeNotifier {
   TripRepository? _repository;
   BookingRepository? _bookingRepository;
   PassengerBoardingPass? _boardingPass;
+  DriverLocationBroadcastData? _driverLocation;
   bool _isLoading = false;
   String? _errorMessage;
   String? _currentBookingId;
+  bool _isPaymentConfirmed = false;
+  Map<String, dynamic>? _lastPaymentReceipt;
 
   PassengerBoardingPass? get boardingPass => _boardingPass;
+  DriverLocationBroadcastData? get driverLocation => _driverLocation;
   bool get isLoading => _isLoading;
   String? get errorMessage => _errorMessage;
   String? get currentBookingId => _currentBookingId;
+  bool get isPaymentConfirmed => _isPaymentConfirmed;
+  Map<String, dynamic>? get lastPaymentReceipt => _lastPaymentReceipt;
 
   bool get hasBoardingPass => _boardingPass != null;
   bool get isDriverArrived => _boardingPass?.isDriverArrived ?? false;
@@ -136,9 +143,65 @@ class PassengerActiveTripProvider extends ChangeNotifier {
     }
   }
 
+  /// Updates driver location telemetry received from `driver.location.updated`.
+  void onDriverLocationUpdated(DriverLocationBroadcastData data) {
+    _driverLocation = data;
+    notifyListeners();
+  }
+
+  /// Handles `driver.arrived` event.
+  void onDriverArrived() {
+    if (_boardingPass != null) {
+      _boardingPass = _boardingPass!.copyWith(bookingStatus: 'DRIVER_ARRIVED');
+      notifyListeners();
+    }
+  }
+
+  /// Handles `passenger.boarded` event.
+  void onPassengerBoarded() {
+    if (_boardingPass != null) {
+      _boardingPass = _boardingPass!.copyWith(bookingStatus: 'BOARDED');
+      notifyListeners();
+    }
+  }
+
+  /// Handles `trip.status.updated` event.
+  void onTripStatusUpdated(String status) {
+    if (_boardingPass != null) {
+      _boardingPass = _boardingPass!.copyWith(bookingStatus: status);
+      notifyListeners();
+    }
+  }
+
+  /// Handles `payment.confirmed` event.
+  void onPaymentConfirmed(Map<String, dynamic> data) {
+    _isPaymentConfirmed = true;
+    _lastPaymentReceipt = data;
+    notifyListeners();
+  }
+
+  /// Handles `trip.completed` event.
+  void onTripCompleted() {
+    if (_boardingPass != null) {
+      _boardingPass = _boardingPass!.copyWith(bookingStatus: 'COMPLETED');
+      notifyListeners();
+    }
+  }
+
+  /// Handles `trip.cancelled` event.
+  void onTripCancelled() {
+    if (_boardingPass != null) {
+      _boardingPass = _boardingPass!.copyWith(bookingStatus: 'CANCELLED');
+      notifyListeners();
+    }
+  }
+
   /// Clears state when leaving the active trip screen.
   void clear() {
     _boardingPass = null;
+    _driverLocation = null;
+    _isPaymentConfirmed = false;
+    _lastPaymentReceipt = null;
     _isLoading = false;
     _errorMessage = null;
     _currentBookingId = null;

@@ -1,5 +1,6 @@
 import 'package:flutter/foundation.dart';
 
+import '../../../core/realtime/models/sync_models.dart';
 import '../../booking/data/booking_repository.dart';
 import '../../booking/models/booking_response.dart';
 
@@ -50,6 +51,25 @@ class PassengerHomeProvider extends ChangeNotifier {
   void updateActiveBooking(BookingResponse? booking) {
     _activeBooking = booking;
     notifyListeners();
+  }
+
+  /// Handles incoming `booking.status.updated` realtime events.
+  void onBookingStatusUpdated(Map<String, dynamic> data) {
+    final status = data['status'] as String?;
+    if (status == 'CANCELLED' || status == 'EXPIRED') {
+      _activeBooking = null;
+      notifyListeners();
+    }
+  }
+
+  /// Handles authoritative passenger state updates from `POST /api/v1/sync`.
+  void handleSyncResponse(SyncPassengerState? state) {
+    if (state == null || state.activeBooking == null) {
+      if (_activeBooking != null) {
+        _activeBooking = null;
+        notifyListeners();
+      }
+    }
   }
 
   Future<void> loadActiveBooking(BookingRepository bookingRepository) async {

@@ -1,6 +1,9 @@
+import 'dart:async';
 import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 
+import '../../../../core/realtime/models/realtime_event.dart';
+import '../../../../core/realtime/socket_service.dart';
 import '../../../../core/theme/app_colors.dart';
 import '../../../booking/data/booking_repository.dart';
 import '../../data/trip_repository.dart';
@@ -30,6 +33,60 @@ class PassengerActiveTripScreen extends StatefulWidget {
 class _PassengerActiveTripScreenState extends State<PassengerActiveTripScreen> {
   late final PassengerActiveTripProvider _provider;
   bool _ownsProvider = false;
+  StreamSubscription<StandardRealtimeEvent>? _eventSubscription;
+  SocketService? _socketService;
+  String? _subscribedTripId;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_socketService == null) {
+      try {
+        _socketService = Provider.of<SocketService>(context, listen: false);
+        _setupRealtime();
+      } catch (_) {}
+    }
+  }
+
+  void _setupRealtime() {
+    final socket = _socketService;
+    if (socket == null) return;
+    socket.subscribeBooking(widget.bookingId);
+    _eventSubscription?.cancel();
+    _eventSubscription = socket.eventStream.listen((event) {
+      if (!mounted) return;
+      if (event.event == 'driver.location.updated') {
+        final data = event.data;
+        if (data is Map<String, dynamic> || data is Map) {
+          final loc = DriverLocationBroadcastData.fromJson(
+            Map<String, dynamic>.from(data),
+          );
+          _provider.onDriverLocationUpdated(loc);
+        }
+      } else if (event.event == 'driver.arrived') {
+        _provider.onDriverArrived();
+      } else if (event.event == 'passenger.boarded') {
+        _provider.onPassengerBoarded();
+      } else if (event.event == 'trip.status.updated') {
+        _provider.onTripStatusUpdated('IN_PROGRESS');
+      } else if (event.event == 'payment.confirmed') {
+        if (event.data is Map) {
+          _provider.onPaymentConfirmed(Map<String, dynamic>.from(event.data));
+        }
+      } else if (event.event == 'trip.completed') {
+        _provider.onTripCompleted();
+      } else if (event.event == 'trip.cancelled') {
+        _provider.onTripCancelled();
+      }
+    });
+  }
+
+  void _checkTripSubscription(String? tripId) {
+    if (tripId != null && tripId.isNotEmpty && tripId != _subscribedTripId) {
+      _subscribedTripId = tripId;
+      _socketService?.subscribeTrip(tripId);
+    }
+  }
 
   @override
   void initState() {
@@ -70,6 +127,11 @@ class _PassengerActiveTripScreenState extends State<PassengerActiveTripScreen> {
 
   @override
   void dispose() {
+    _eventSubscription?.cancel();
+    if (_subscribedTripId != null) {
+      _socketService?.unsubscribeTrip(_subscribedTripId!);
+    }
+    _socketService?.unsubscribeBooking(widget.bookingId);
     if (_ownsProvider) {
       _provider.dispose();
     }
@@ -232,9 +294,81 @@ class _PassengerActiveTripScreenState extends State<PassengerActiveTripScreen> {
                     );
                   }
 
+                  _checkTripSubscription(pass.tripId);
+
                   return ListView(
                     padding: const EdgeInsets.all(16),
                     children: [
+                      // Live Telemetry Banner
+                      if (provider.driverLocation != null) ...[
+                        Card(
+                          key: const Key('live_driver_location_card'),
+                          elevation: 2,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: ListTile(
+                            leading: const Icon(
+                              Icons.gps_fixed,
+                              color: AppColors.success,
+                            ),
+                            title: const Text(
+                              'Live Vehicle Location',
+                              style: TextStyle(
+                                fontWeight: FontWeight.bold,
+                                fontSize: 14,
+                              ),
+                            ),
+                            subtitle: Text(
+                              'Lat: ${provider.driverLocation!.latitude.toStringAsFixed(4)}, Lon: ${provider.driverLocation!.longitude.toStringAsFixed(4)}',
+                              style: const TextStyle(fontSize: 12),
+                            ),
+                            trailing: const Text(
+                              'Live',
+                              style: TextStyle(
+                                color: AppColors.success,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 16),
+                      ],
+
+                      // Payment Confirmed Notice
+                      if (provider.isPaymentConfirmed) ...[
+                        Container(
+                          key: const Key('payment_confirmed_banner'),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 16,
+                            vertical: 12,
+                          ),
+                          decoration: BoxDecoration(
+                            color: AppColors.success.withValues(alpha: 0.12),
+                            borderRadius: BorderRadius.circular(10),
+                            border: Border.all(
+                              color: AppColors.success.withValues(alpha: 0.4),
+                            ),
+                          ),
+                          child: const Row(
+                            children: [
+                              Icon(Icons.check_circle, color: AppColors.success),
+                              SizedBox(width: 12),
+                              Expanded(
+                                child: Text(
+                                  'Cash Payment Confirmed by Driver',
+                                  style: TextStyle(
+                                    fontWeight: FontWeight.bold,
+                                    color: AppColors.success,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(height: 16),
+                      ],
+
                       // Status Banner
                       Container(
                         padding: const EdgeInsets.symmetric(

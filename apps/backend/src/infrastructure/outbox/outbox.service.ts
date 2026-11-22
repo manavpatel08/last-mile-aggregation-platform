@@ -3,11 +3,13 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  Optional,
   forwardRef,
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { DispatchService } from '../../modules/dispatch/dispatch.service.js';
+import { RealtimeService } from '../../modules/realtime/realtime.service.js';
 import {
   GroupFormedPayload,
   DispatchOfferCreatedPayload,
@@ -32,6 +34,9 @@ export class OutboxService {
     private readonly prisma: PrismaService,
     @Inject(forwardRef(() => DispatchService))
     private readonly dispatchService: DispatchService,
+    @Optional()
+    @Inject(forwardRef(() => RealtimeService))
+    private readonly realtimeService?: RealtimeService,
   ) {}
 
   /**
@@ -334,7 +339,7 @@ export class OutboxService {
             OR
             (status = 'PROCESSING' AND published_at < NOW() - INTERVAL '30 seconds')
           )
-            ${filter?.eventType ? Prisma.sql`AND event_type = ${filter.eventType}` : Prisma.sql`AND event_type IN ('GROUP_FORMED', 'DISPATCH_OFFER_CREATED')`}
+            ${filter?.eventType ? Prisma.sql`AND event_type = ${filter.eventType}` : Prisma.empty}
             ${filter?.aggregateId ? Prisma.sql`AND aggregate_id = ${filter.aggregateId}::uuid` : Prisma.empty}
           ORDER BY
             CASE
@@ -533,6 +538,12 @@ export class OutboxService {
             },
           });
 
+          this.realtimeService
+            ?.broadcastOutboxEvent(row)
+            .catch((err: any) =>
+              this.logger.warn(`Failed to broadcast GROUP_FORMED: ${err?.message}`),
+            );
+
           summary.publishedCount++;
           summary.groupFormedHandledCount++;
         } else if (
@@ -636,6 +647,12 @@ export class OutboxService {
               lastError: null,
             },
           });
+
+          this.realtimeService
+            ?.broadcastOutboxEvent(row)
+            .catch((err: any) =>
+              this.logger.warn(`Failed to broadcast GROUP_FORMED: ${err?.message}`),
+            );
 
           summary.publishedCount++;
           summary.dispatchOfferCreatedHandledCount =
@@ -910,6 +927,12 @@ export class OutboxService {
             },
           });
 
+          this.realtimeService
+            ?.broadcastOutboxEvent(row)
+            .catch((err: any) =>
+              this.logger.warn(`Failed to broadcast ${row.event_type}: ${err?.message}`),
+            );
+
           summary.publishedCount++;
           if (isRejection) {
             summary.dispatchOfferRejectedHandledCount =
@@ -919,20 +942,44 @@ export class OutboxService {
               (summary.dispatchOfferExpiredHandledCount ?? 0) + 1;
           }
         } else {
-          // Unsupported or unhandled event type: DO NOT mark PUBLISHED!
-          this.logger.debug(
-            `Outbox event ${row.id} has unhandled event type '${row.event_type}'; unclaiming to PENDING without acknowledgment`,
-          );
-          try {
+          // If RealtimeService can broadcast this domain event, broadcast and mark PUBLISHED
+          let broadcastSucceeded = false;
+          if (this.realtimeService) {
+            try {
+              broadcastSucceeded = await this.realtimeService.broadcastOutboxEvent(row);
+            } catch (broadcastErr: any) {
+              this.logger.warn(
+                `Failed to broadcast outbox event ${row.id} (${row.event_type}): ${broadcastErr?.message}`,
+              );
+            }
+          }
+
+          if (broadcastSucceeded) {
             await this.prisma.outboxEvent.update({
               where: { id: row.id },
               data: {
-                status: 'PENDING',
-                publishedAt: null,
+                status: 'PUBLISHED',
+                publishedAt: new Date(),
+                lastError: null,
               },
             });
-          } catch {
-            // Engine may be disconnecting during shutdown
+            summary.publishedCount++;
+          } else {
+            // Unsupported or unhandled event type: DO NOT mark PUBLISHED!
+            this.logger.debug(
+              `Outbox event ${row.id} has unhandled event type '${row.event_type}'; unclaiming to PENDING without acknowledgment`,
+            );
+            try {
+              await this.prisma.outboxEvent.update({
+                where: { id: row.id },
+                data: {
+                  status: 'PENDING',
+                  publishedAt: null,
+                },
+              });
+            } catch {
+              // Engine may be disconnecting during shutdown
+            }
           }
         }
       } catch (err: any) {

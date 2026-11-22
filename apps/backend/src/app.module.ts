@@ -1,7 +1,8 @@
 import { Module } from '@nestjs/common';
 import { APP_GUARD, APP_INTERCEPTOR } from '@nestjs/core';
 import { ConfigModule } from '@nestjs/config';
-import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
+import { ThrottlerModule } from '@nestjs/throttler';
+import { AppThrottlerGuard } from './common/guards/app-throttler.guard.js';
 import { AppController } from './app.controller.js';
 import { AppService } from './app.service.js';
 import configuration from './config/configuration.js';
@@ -22,6 +23,8 @@ import { PaymentsModule } from './modules/payments/payments.module.js';
 import { MatchingModule } from './modules/matching/matching.module.js';
 import { DispatchModule } from './modules/dispatch/dispatch.module.js';
 import { OutboxModule } from './infrastructure/outbox/outbox.module.js';
+import { RealtimeModule } from './modules/realtime/realtime.module.js';
+import { SyncModule } from './modules/sync/sync.module.js';
 import { JwtAuthGuard } from './common/guards/jwt-auth.guard.js';
 import { RolesGuard } from './common/guards/roles.guard.js';
 import { DriverApprovalGuard } from './common/guards/driver-approval.guard.js';
@@ -58,13 +61,15 @@ import { IdempotencyInterceptor } from './common/interceptors/idempotency.interc
     MatchingModule,
     DispatchModule,
     OutboxModule,
+    RealtimeModule,
+    SyncModule,
   ],
   controllers: [AppController],
   providers: [
     AppService,
     {
       provide: APP_GUARD,
-      useClass: ThrottlerGuard,
+      useClass: AppThrottlerGuard,
     },
     {
       provide: APP_GUARD,

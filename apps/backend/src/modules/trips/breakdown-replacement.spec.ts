@@ -228,7 +228,7 @@ describe('Stage 9: Driver Breakdown & Replacement Dispatch', () => {
     await prisma.vehicle.create({
       data: {
         driverProfileId: profile.id,
-        registrationNumber: `GJ-18-S9-${Math.floor(1000 + Math.random() * 9000)}`,
+        registrationNumber: `GJ-18-${suffix}`,
         makeModel: 'Mahindra Treo',
         passengerCapacity: capacity,
         isActive: true,
@@ -871,9 +871,9 @@ describe('Stage 9: Driver Breakdown & Replacement Dispatch', () => {
   });
 
   it('12. Rejection by Candidate #1 marks attempt REJECTED and cascades immediately to Candidate #2', async () => {
-    const { user: repUser1 } =
+    const { user: repUser1, profile: repProfile1 } =
       await createTestDriver('rej1', 'AVAILABLE', true, 4);
-    const { user: _repUser2 } =
+    const { user: repUser2 } =
       await createTestDriver('rej2', 'AVAILABLE', true, 4);
 
     const p1 = await createTestPassengerAndBooking('CONFIRMED', 3000);
@@ -907,9 +907,12 @@ describe('Stage 9: Driver Breakdown & Replacement Dispatch', () => {
     });
     expect(firstAttempt).not.toBeNull();
 
-    // repUser1 rejects the offer
+    const offeredDriverId = breakdown.activeOffer?.driverId;
+    const rejectingUserId = offeredDriverId === repProfile1.id ? repUser1.id : repUser2.id;
+
+    // The offered driver rejects the offer
     const rejectRes = await tripsService.rejectReplacementOffer(
-      repUser1.id,
+      rejectingUserId,
       trip.id,
       firstAttempt!.id,
     );
@@ -1055,8 +1058,10 @@ describe('Stage 9: Driver Breakdown & Replacement Dispatch', () => {
   });
 
   it('15. Driver who was not offered replacement cannot accept it', async () => {
-    const { user: _driverAUser } = await createTestDriver('offered-a', 'AVAILABLE', true, 4);
-    const { user: driverBUser } = await createTestDriver('unoffered-b', 'AVAILABLE', true, 4);
+    const { user: driverAUser, profile: driverAProfile } =
+      await createTestDriver('offered-a', 'AVAILABLE', true, 4);
+    const { user: driverBUser } =
+      await createTestDriver('unoffered-b', 'AVAILABLE', true, 4);
 
     const p1 = await createTestPassengerAndBooking('CONFIRMED', 3000);
     const { trip, originalDriverUser } = await createActiveTripWithPassengers([p1], 'IN_PROGRESS');
@@ -1072,9 +1077,12 @@ describe('Stage 9: Driver Breakdown & Replacement Dispatch', () => {
 
     expect(breakdown.activeOffer?.driverId).toBeDefined();
 
-    // driverBUser attempts to accept the offer made to Candidate #1 (driverA)
+    const offeredDriverId = breakdown.activeOffer?.driverId;
+    const unofferedUser = offeredDriverId === driverAProfile.id ? driverBUser : driverAUser;
+
+    // Unofficially unoffered user attempts to accept the offer
     await expect(
-      tripsService.acceptReplacementTrip(driverBUser.id, trip.id),
+      tripsService.acceptReplacementTrip(unofferedUser.id, trip.id),
     ).rejects.toThrow(ForbiddenException);
   });
 
@@ -1320,5 +1328,318 @@ describe('Stage 9: Driver Breakdown & Replacement Dispatch', () => {
     await expect(processor.process(fakeJob as any)).rejects.toThrow(
       'TripsService unavailable; cannot process replacement timeout job job-replacement-timeout-1',
     );
+  });
+
+  it('22. Acceptance racing with timeout: exactly one winner, consistent database state', async () => {
+    await createTestDriver('race-to-drv', 'AVAILABLE', true, 4);
+    // Create an extra candidate so if timeout wins, cascade can find Candidate #2
+    await createTestDriver('race-to-backup', 'AVAILABLE', true, 4);
+
+    const p1 = await createTestPassengerAndBooking('CONFIRMED', 3000);
+    const { trip, originalDriverUser } =
+      await createActiveTripWithPassengers([p1], 'IN_PROGRESS');
+
+    const breakdown = await tripsService.reportBreakdown(
+      originalDriverUser.id,
+      trip.id,
+      {
+        incidentLocation: { latitude: 23.1600, longitude: 72.6700 },
+        reason: 'Alternator race test',
+      },
+    );
+
+    const activeAttempt = await prisma.replacementDispatchAttempt.findFirst({
+      where: { tripIncidentId: breakdown.incidentId, status: 'ACTIVE' },
+    });
+    expect(activeAttempt).not.toBeNull();
+
+    const offerEvent = await prisma.outboxEvent.findFirst({
+      where: {
+        aggregateId: breakdown.incidentId,
+        eventType: 'REPLACEMENT_OFFER_DISPATCHED',
+      },
+    });
+    expect(offerEvent).not.toBeNull();
+    const offeredDriverId = (offerEvent!.payload as any).driverId;
+    const offeredProfile = await prisma.driverProfile.findUnique({
+      where: { id: offeredDriverId },
+      include: { user: true },
+    });
+    expect(offeredProfile).not.toBeNull();
+    const actingUser = offeredProfile!.user;
+
+    // Simultaneously trigger acceptance and timeout
+    const [acceptRes, timeoutRes] = await Promise.allSettled([
+      tripsService.acceptReplacementTrip(actingUser.id, trip.id, activeAttempt!.id),
+      tripsService.handleReplacementTimeout({
+        tripId: trip.id,
+        incidentId: breakdown.incidentId,
+        attemptId: activeAttempt!.id,
+        attemptNumber: activeAttempt!.attemptNumber,
+        driverId: offeredProfile!.id,
+      }),
+    ]);
+
+    if (acceptRes.status === 'fulfilled') {
+      // Acceptance won
+      expect(acceptRes.value.status).toBe('IN_PROGRESS');
+      expect(acceptRes.value.activeDriverId).toBe(offeredProfile!.id);
+
+      // Timeout handler must NOT have cascaded
+      expect(timeoutRes.status).toBe('fulfilled');
+      if (timeoutRes.status === 'fulfilled') {
+        expect(timeoutRes.value.cascaded).toBe(false);
+      }
+
+      const finalTrip = await prisma.trip.findUnique({ where: { id: trip.id } });
+      expect(finalTrip!.status).toBe('IN_PROGRESS');
+      expect(finalTrip!.activeDriverId).toBe(offeredProfile!.id);
+
+      const finalAttempt = await prisma.replacementDispatchAttempt.findUnique({
+        where: { id: activeAttempt!.id },
+      });
+      expect(finalAttempt!.status).toBe('ACCEPTED');
+    } else {
+      // Timeout won
+      expect(timeoutRes.status).toBe('fulfilled');
+      if (timeoutRes.status === 'fulfilled') {
+        expect(timeoutRes.value.cascaded).toBe(true);
+      }
+
+      // Acceptance must have failed due to attempt no longer being active
+      expect(acceptRes.reason).toBeInstanceOf(BadRequestException);
+
+      const finalAttempt = await prisma.replacementDispatchAttempt.findUnique({
+        where: { id: activeAttempt!.id },
+      });
+      expect(finalAttempt!.status).toBe('EXPIRED');
+    }
+  });
+
+  it('23. Acceptance racing with rejection: exactly one winner, no contradictory state', async () => {
+    await createTestDriver('race-rej-drv', 'AVAILABLE', true, 4);
+    await createTestDriver('race-rej-backup', 'AVAILABLE', true, 4);
+
+    const p1 = await createTestPassengerAndBooking('CONFIRMED', 3000);
+    const { trip, originalDriverUser } =
+      await createActiveTripWithPassengers([p1], 'IN_PROGRESS');
+
+    const breakdown = await tripsService.reportBreakdown(
+      originalDriverUser.id,
+      trip.id,
+      {
+        incidentLocation: { latitude: 23.1600, longitude: 72.6700 },
+        reason: 'Transmission race test',
+      },
+    );
+
+    const activeAttempt = await prisma.replacementDispatchAttempt.findFirst({
+      where: { tripIncidentId: breakdown.incidentId, status: 'ACTIVE' },
+    });
+    expect(activeAttempt).not.toBeNull();
+
+    // Determine which driver was actually offered this attempt
+    const offerEvent = await prisma.outboxEvent.findFirst({
+      where: {
+        aggregateId: breakdown.incidentId,
+        eventType: 'REPLACEMENT_OFFER_DISPATCHED',
+      },
+    });
+    expect(offerEvent).not.toBeNull();
+    const offeredDriverId = (offerEvent!.payload as any).driverId;
+    const offeredProfile = await prisma.driverProfile.findUnique({
+      where: { id: offeredDriverId },
+      include: { user: true },
+    });
+    expect(offeredProfile).not.toBeNull();
+    const actingUser = offeredProfile!.user;
+
+    // Simultaneously trigger acceptance and rejection by the offered driver
+    const [acceptRes, rejectRes] = await Promise.allSettled([
+      tripsService.acceptReplacementTrip(actingUser.id, trip.id, activeAttempt!.id),
+      tripsService.rejectReplacementOffer(actingUser.id, trip.id, activeAttempt!.id),
+    ]);
+
+    const fulfilledCount = [acceptRes, rejectRes].filter((r) => r.status === 'fulfilled').length;
+    const rejectedCount = [acceptRes, rejectRes].filter((r) => r.status === 'rejected').length;
+
+    // Exactly one operation wins
+    expect(fulfilledCount).toBe(1);
+    expect(rejectedCount).toBe(1);
+
+    if (acceptRes.status === 'fulfilled') {
+      expect(acceptRes.value.status).toBe('IN_PROGRESS');
+      const finalTrip = await prisma.trip.findUnique({ where: { id: trip.id } });
+      expect(finalTrip!.status).toBe('IN_PROGRESS');
+      expect(finalTrip!.activeDriverId).toBe(offeredProfile!.id);
+
+      const finalAttempt = await prisma.replacementDispatchAttempt.findUnique({
+        where: { id: activeAttempt!.id },
+      });
+      expect(finalAttempt!.status).toBe('ACCEPTED');
+    } else {
+      expect(rejectRes.status).toBe('fulfilled');
+      const finalAttempt = await prisma.replacementDispatchAttempt.findUnique({
+        where: { id: activeAttempt!.id },
+      });
+      expect(finalAttempt!.status).toBe('REJECTED');
+    }
+  });
+
+  it('24. Stale timeout after successful acceptance cannot cascade or alter resumed trip', async () => {
+    const { user: repDriverUser, profile: repDriverProfile } =
+      await createTestDriver('stale-to-drv', 'AVAILABLE', true, 4);
+    await createTestDriver('stale-to-unused', 'AVAILABLE', true, 4);
+
+    const p1 = await createTestPassengerAndBooking('CONFIRMED', 3000);
+    const { trip, originalDriverUser } =
+      await createActiveTripWithPassengers([p1], 'IN_PROGRESS');
+
+    const breakdown = await tripsService.reportBreakdown(
+      originalDriverUser.id,
+      trip.id,
+      {
+        incidentLocation: { latitude: 23.1600, longitude: 72.6700 },
+        reason: 'Water pump failure',
+      },
+    );
+
+    const activeAttempt = await prisma.replacementDispatchAttempt.findFirst({
+      where: { tripIncidentId: breakdown.incidentId, status: 'ACTIVE' },
+    });
+
+    // 1. Acceptance succeeds
+    const acceptRes = await tripsService.acceptReplacementTrip(
+      repDriverUser.id,
+      trip.id,
+      activeAttempt!.id,
+    );
+    expect(acceptRes.status).toBe('IN_PROGRESS');
+
+    // 2. Delayed/stale timeout fires after trip is already IN_PROGRESS
+    const staleTimeoutRes = await tripsService.handleReplacementTimeout({
+      tripId: trip.id,
+      incidentId: breakdown.incidentId,
+      attemptId: activeAttempt!.id,
+      attemptNumber: activeAttempt!.attemptNumber,
+      driverId: repDriverProfile.id,
+    });
+
+    // Stale timeout must be rejected without cascading
+    expect(staleTimeoutRes.cascaded).toBe(false);
+
+    // Trip remains IN_PROGRESS with replacement driver
+    const finalTrip = await prisma.trip.findUnique({ where: { id: trip.id } });
+    expect(finalTrip!.status).toBe('IN_PROGRESS');
+    expect(finalTrip!.activeDriverId).toBe(repDriverProfile.id);
+
+    // Total attempts must remain 1 (no spurious attempt 2 created)
+    const attempts = await prisma.replacementDispatchAttempt.findMany({
+      where: { tripIncidentId: breakdown.incidentId },
+    });
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0].status).toBe('ACCEPTED');
+  });
+
+  it('25. Duplicate timeout processing does not cause duplicate cascades or attempts', async () => {
+    const { profile: repDriverProfile } =
+      await createTestDriver('dup-to-drv1', 'AVAILABLE', true, 4);
+    await createTestDriver('dup-to-drv2', 'AVAILABLE', true, 4);
+    await createTestDriver('dup-to-drv3', 'AVAILABLE', true, 4);
+
+    const p1 = await createTestPassengerAndBooking('CONFIRMED', 3000);
+    const { trip, originalDriverUser } =
+      await createActiveTripWithPassengers([p1], 'IN_PROGRESS');
+
+    const breakdown = await tripsService.reportBreakdown(
+      originalDriverUser.id,
+      trip.id,
+      {
+        incidentLocation: { latitude: 23.1600, longitude: 72.6700 },
+        reason: 'Clutch plate burnt',
+      },
+    );
+
+    const firstAttempt = await prisma.replacementDispatchAttempt.findFirst({
+      where: { tripIncidentId: breakdown.incidentId, status: 'ACTIVE' },
+    });
+
+    // 1. First timeout processes and cascades to Attempt #2
+    const firstTimeoutRes = await tripsService.handleReplacementTimeout({
+      tripId: trip.id,
+      incidentId: breakdown.incidentId,
+      attemptId: firstAttempt!.id,
+      attemptNumber: firstAttempt!.attemptNumber,
+      driverId: repDriverProfile.id,
+    });
+    expect(firstTimeoutRes.cascaded).toBe(true);
+
+    // 2. Duplicate timeout job fires for the same already-expired attempt #1
+    const dupTimeoutRes = await tripsService.handleReplacementTimeout({
+      tripId: trip.id,
+      incidentId: breakdown.incidentId,
+      attemptId: firstAttempt!.id,
+      attemptNumber: firstAttempt!.attemptNumber,
+      driverId: repDriverProfile.id,
+    });
+    expect(dupTimeoutRes.cascaded).toBe(false);
+    expect(dupTimeoutRes.reason).toContain('ATTEMPT_NOT_ACTIVE');
+
+    // Total attempts must be exactly 2 (Attempt 1 EXPIRED, Attempt 2 ACTIVE; no Attempt 3)
+    const allAttempts = await prisma.replacementDispatchAttempt.findMany({
+      where: { tripIncidentId: breakdown.incidentId },
+      orderBy: { attemptNumber: 'asc' },
+    });
+    expect(allAttempts).toHaveLength(2);
+    expect(allAttempts[0].status).toBe('EXPIRED');
+    expect(allAttempts[1].status).toBe('ACTIVE');
+  });
+
+  it('26. Only one replacement assignment can ever be created for an incident', async () => {
+    const { user: repDriverUser1, profile: repDriverProfile1 } =
+      await createTestDriver('one-assign-drv1', 'AVAILABLE', true, 4);
+    const { user: repDriverUser2, profile: repDriverProfile2 } =
+      await createTestDriver('one-assign-drv2', 'AVAILABLE', true, 4);
+
+    const p1 = await createTestPassengerAndBooking('CONFIRMED', 3000);
+    const { trip, originalDriverUser } =
+      await createActiveTripWithPassengers([p1], 'IN_PROGRESS');
+
+    const breakdown = await tripsService.reportBreakdown(
+      originalDriverUser.id,
+      trip.id,
+      {
+        incidentLocation: { latitude: 23.1600, longitude: 72.6700 },
+        reason: 'Differential lock jammed',
+      },
+    );
+
+    const activeAttempt = await prisma.replacementDispatchAttempt.findFirst({
+      where: { tripIncidentId: breakdown.incidentId, status: 'ACTIVE' },
+    });
+
+    // Concurrent acceptances
+    const [res1, res2] = await Promise.allSettled([
+      tripsService.acceptReplacementTrip(repDriverUser1.id, trip.id, activeAttempt!.id),
+      tripsService.acceptReplacementTrip(repDriverUser2.id, trip.id, activeAttempt!.id),
+    ]);
+
+    const fulfilled = [res1, res2].filter((r) => r.status === 'fulfilled');
+    const rejected = [res1, res2].filter((r) => r.status === 'rejected');
+
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+
+    // Exactly one assignment row exists in the database
+    const assignments = await prisma.replacementDriverAssignment.findMany({
+      where: { tripIncidentId: breakdown.incidentId, status: 'ASSIGNED' },
+    });
+    expect(assignments).toHaveLength(1);
+
+    // Exactly one driver is reserved
+    const p1InDb = await prisma.driverProfile.findUnique({ where: { id: repDriverProfile1.id } });
+    const p2InDb = await prisma.driverProfile.findUnique({ where: { id: repDriverProfile2.id } });
+    const reservedCount = [p1InDb, p2InDb].filter((p) => p!.operationalStatus === 'RESERVED').length;
+    expect(reservedCount).toBe(1);
   });
 });

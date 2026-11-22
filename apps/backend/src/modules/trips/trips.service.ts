@@ -2745,32 +2745,83 @@ export class TripsService {
   ) {
     const expiresAt = new Date(Date.now() + 20000); // 20s timeout per spec
 
-    const attempt = await this.prisma.replacementDispatchAttempt.create({
-      data: {
-        tripIncidentId: incidentId,
-        attemptNumber,
-        status: 'ACTIVE',
-      },
+    const dispatchTxResult = await this.prisma.$transaction(async (tx) => {
+      // 1. Lock trip row
+      const trips = await tx.$queryRaw<
+        Array<{ id: string; status: string }>
+      >`
+        SELECT id, status FROM trips WHERE id = ${tripId}::uuid FOR UPDATE;
+      `;
+
+      if (!trips || trips.length === 0 || trips[0].status !== 'INTERRUPTED') {
+        this.logger.warn(
+          `Cannot dispatch replacement offer: trip ${tripId} is not in status INTERRUPTED (current: ${trips?.[0]?.status})`,
+        );
+        return null;
+      }
+
+      // 2. Lock incident row
+      const incidents = await tx.$queryRaw<
+        Array<{ id: string; status: string }>
+      >`
+        SELECT id, status
+        FROM trip_incidents
+        WHERE id = ${incidentId}::uuid AND status = 'REPORTED'
+        FOR UPDATE;
+      `;
+
+      if (!incidents || incidents.length === 0) {
+        this.logger.warn(
+          `Cannot dispatch replacement offer: incident ${incidentId} is not in status REPORTED`,
+        );
+        return null;
+      }
+
+      // 3. Ensure no active attempt already exists
+      const existingActive = await tx.replacementDispatchAttempt.findFirst({
+        where: { tripIncidentId: incidentId, status: 'ACTIVE' },
+      });
+
+      if (existingActive) {
+        this.logger.warn(
+          `Cannot dispatch replacement offer: an ACTIVE attempt (${existingActive.id}) already exists for incident ${incidentId}`,
+        );
+        return null;
+      }
+
+      const attempt = await tx.replacementDispatchAttempt.create({
+        data: {
+          tripIncidentId: incidentId,
+          attemptNumber,
+          status: 'ACTIVE',
+        },
+      });
+
+      // Record outbox event
+      await tx.outboxEvent.create({
+        data: {
+          eventType: 'REPLACEMENT_OFFER_DISPATCHED',
+          aggregateType: 'TRIP_INCIDENT',
+          aggregateId: incidentId,
+          payload: {
+            tripId,
+            incidentId,
+            attemptId: attempt.id,
+            attemptNumber,
+            driverId: candidate.driverId,
+            driverName: candidate.driverName,
+            etaSeconds: candidate.etaSeconds,
+            expiresAt: expiresAt.toISOString(),
+          },
+        },
+      });
+
+      return attempt;
     });
 
-    // Record outbox event
-    await this.prisma.outboxEvent.create({
-      data: {
-        eventType: 'REPLACEMENT_OFFER_DISPATCHED',
-        aggregateType: 'TRIP_INCIDENT',
-        aggregateId: incidentId,
-        payload: {
-          tripId,
-          incidentId,
-          attemptId: attempt.id,
-          attemptNumber,
-          driverId: candidate.driverId,
-          driverName: candidate.driverName,
-          etaSeconds: candidate.etaSeconds,
-          expiresAt: expiresAt.toISOString(),
-        },
-      },
-    });
+    if (!dispatchTxResult) {
+      return null;
+    }
 
     // Schedule 20s timeout in BullMQ if queue is available
     if (this.dispatchQueue) {
@@ -2780,13 +2831,13 @@ export class TripsService {
           {
             tripId,
             incidentId,
-            attemptId: attempt.id,
+            attemptId: dispatchTxResult.id,
             attemptNumber,
             driverId: candidate.driverId,
           },
           {
             delay: 20000,
-            jobId: `replacement-timeout-${attempt.id}`,
+            jobId: `replacement-timeout-${dispatchTxResult.id}`,
             removeOnComplete: 100,
             removeOnFail: 50,
           },
@@ -2799,7 +2850,7 @@ export class TripsService {
     }
 
     return {
-      attemptId: attempt.id,
+      attemptId: dispatchTxResult.id,
       attemptNumber,
       driverId: candidate.driverId,
       etaSeconds: candidate.etaSeconds,
@@ -2843,50 +2894,124 @@ export class TripsService {
         });
       }
 
-      const incident = await tx.tripIncident.findFirst({
-        where: { tripId, status: 'REPORTED' },
-        orderBy: { reportedAt: 'desc' },
-      });
+      // 2. Lock active incident row with SELECT ... FOR UPDATE
+      const incidents = await tx.$queryRaw<
+        Array<{ id: string; status: string }>
+      >`
+        SELECT id, status
+        FROM trip_incidents
+        WHERE trip_id = ${tripId}::uuid AND status = 'REPORTED'
+        ORDER BY reported_at DESC
+        LIMIT 1
+        FOR UPDATE;
+      `;
 
-      if (!incident) {
+      if (!incidents || incidents.length === 0) {
         throw new BadRequestException({
           errorCode: 'NO_ACTIVE_INCIDENT',
           message: 'No active breakdown incident found for this trip.',
         });
       }
 
-      // Find active attempt
-      const attempt = await tx.replacementDispatchAttempt.findFirst({
+      const incident = incidents[0];
+
+      // 3. Find and validate active attempt inside transaction
+      let attempt: {
+        id: string;
+        tripIncidentId: string;
+        attemptNumber: number;
+        status: string;
+      } | null = null;
+
+      if (attemptId) {
+        attempt = await tx.replacementDispatchAttempt.findUnique({
+          where: { id: attemptId },
+        });
+
+        if (!attempt || attempt.tripIncidentId !== incident.id) {
+          throw new NotFoundException({
+            errorCode: 'ATTEMPT_NOT_FOUND',
+            message: `Replacement dispatch attempt with ID ${attemptId} not found for this incident.`,
+          });
+        }
+
+        if (attempt.status !== 'ACTIVE') {
+          throw new BadRequestException({
+            errorCode: 'ATTEMPT_NOT_ACTIVE',
+            message: `Replacement attempt ${attemptId} is not ACTIVE (current status: '${attempt.status}').`,
+          });
+        }
+      } else {
+        attempt = await tx.replacementDispatchAttempt.findFirst({
+          where: {
+            tripIncidentId: incident.id,
+            status: 'ACTIVE',
+          },
+          orderBy: { attemptNumber: 'desc' },
+        });
+
+        if (!attempt) {
+          throw new BadRequestException({
+            errorCode: 'NO_ACTIVE_REPLACEMENT_OFFER',
+            message: 'No active replacement offer found for this trip.',
+          });
+        }
+      }
+
+      // 4. Validate caller ownership
+      const outboxEvents = await tx.outboxEvent.findMany({
         where: {
-          tripIncidentId: incident.id,
-          status: 'ACTIVE',
-          ...(attemptId ? { id: attemptId } : {}),
+          aggregateId: incident.id,
+          eventType: 'REPLACEMENT_OFFER_DISPATCHED',
         },
         orderBy: { createdAt: 'desc' },
       });
 
-      if (attempt) {
-        await tx.replacementDispatchAttempt.update({
-          where: { id: attempt.id },
-          data: { status: 'REJECTED' },
-        });
+      const matchingEvent = outboxEvents.find((evt) => {
+        const p =
+          typeof evt.payload === 'string'
+            ? JSON.parse(evt.payload)
+            : (evt.payload as any);
+        return p?.attemptId === attempt!.id;
+      });
 
-        await tx.outboxEvent.create({
-          data: {
-            eventType: 'REPLACEMENT_OFFER_REJECTED',
-            aggregateType: 'TRIP_INCIDENT',
-            aggregateId: incident.id,
-            payload: {
-              tripId,
-              incidentId: incident.id,
-              attemptId: attempt.id,
-              attemptNumber: attempt.attemptNumber,
-              driverId: driver.id,
-              rejectedAt: new Date().toISOString(),
-            },
-          },
-        });
+      if (matchingEvent) {
+        const dispatchPayload =
+          typeof matchingEvent.payload === 'string'
+            ? JSON.parse(matchingEvent.payload)
+            : (matchingEvent.payload as any);
+
+        if (dispatchPayload.driverId !== driver.id) {
+          throw new ForbiddenException({
+            errorCode: 'OFFER_NOT_ASSIGNED_TO_DRIVER',
+            message:
+              'Calling driver was not offered this replacement dispatch attempt.',
+          });
+        }
       }
+
+      // 5. Update attempt to REJECTED
+      await tx.replacementDispatchAttempt.update({
+        where: { id: attempt.id },
+        data: { status: 'REJECTED' },
+      });
+
+      // 6. Record outbox event
+      await tx.outboxEvent.create({
+        data: {
+          eventType: 'REPLACEMENT_OFFER_REJECTED',
+          aggregateType: 'TRIP_INCIDENT',
+          aggregateId: incident.id,
+          payload: {
+            tripId,
+            incidentId: incident.id,
+            attemptId: attempt.id,
+            attemptNumber: attempt.attemptNumber,
+            driverId: driver.id,
+            rejectedAt: new Date().toISOString(),
+          },
+        },
+      });
 
       const responsePayload = {
         success: true,
@@ -2953,6 +3078,7 @@ export class TripsService {
     const { tripId, incidentId, attemptId, driverId } = payload;
 
     const timeoutResult = await this.prisma.$transaction(async (tx) => {
+      // 1. Lock trip row
       const trips = await tx.$queryRaw<
         Array<{ id: string; status: string }>
       >`
@@ -2961,6 +3087,20 @@ export class TripsService {
 
       if (!trips || trips.length === 0 || trips[0].status !== 'INTERRUPTED') {
         return { shouldCascade: false, reason: 'TRIP_NOT_INTERRUPTED' };
+      }
+
+      // 2. Lock active incident row
+      const incidents = await tx.$queryRaw<
+        Array<{ id: string; status: string }>
+      >`
+        SELECT id, status
+        FROM trip_incidents
+        WHERE id = ${incidentId}::uuid AND status = 'REPORTED'
+        FOR UPDATE;
+      `;
+
+      if (!incidents || incidents.length === 0) {
+        return { shouldCascade: false, reason: 'INCIDENT_NOT_ACTIVE' };
       }
 
       const attempt = await tx.replacementDispatchAttempt.findUnique({
@@ -3037,6 +3177,19 @@ export class TripsService {
       return {
         cascaded: false,
         reason: `Incident is in status ${incident?.status}`,
+      };
+    }
+
+    // Ensure no active replacement offer is already pending
+    const existingActive =
+      await this.prisma.replacementDispatchAttempt.findFirst({
+        where: { tripIncidentId: incidentId, status: 'ACTIVE' },
+      });
+
+    if (existingActive) {
+      return {
+        cascaded: false,
+        reason: `ACTIVE_OFFER_ALREADY_EXISTS (${existingActive.id})`,
       };
     }
 
@@ -3146,14 +3299,25 @@ export class TripsService {
       this.logger.warn(
         `All replacement driver candidates exhausted for trip ${tripId}. Aborting trip.`,
       );
-      await this.abortInterruptedTrip(
-        tripId,
-        'ALL_REPLACEMENT_OFFERS_EXHAUSTED',
-      );
+      const currentTrip = await this.prisma.trip.findUnique({
+        where: { id: tripId },
+        select: { status: true },
+      });
+      if (currentTrip?.status === 'INTERRUPTED') {
+        await this.abortInterruptedTrip(
+          tripId,
+          'ALL_REPLACEMENT_OFFERS_EXHAUSTED',
+        );
+        return {
+          cascaded: false,
+          aborted: true,
+          reason: 'ALL_REPLACEMENT_OFFERS_EXHAUSTED',
+        };
+      }
       return {
         cascaded: false,
-        aborted: true,
-        reason: 'ALL_REPLACEMENT_OFFERS_EXHAUSTED',
+        aborted: false,
+        reason: `Trip is in status '${currentTrip?.status}', skipping abort`,
       };
     }
 
@@ -3169,6 +3333,14 @@ export class TripsService {
       nextCandidate,
       nextAttemptNumber,
     );
+
+    if (!dispatchResult) {
+      return {
+        cascaded: false,
+        aborted: false,
+        reason: 'ACTIVE_OFFER_ALREADY_EXISTS_OR_TRIP_NOT_ELIGIBLE',
+      };
+    }
 
     return {
       cascaded: true,
@@ -3421,6 +3593,23 @@ export class TripsService {
 
       const now = new Date();
 
+      // Ensure only one replacement assignment can ever be created for this incident
+      const existingAssignment =
+        await tx.replacementDriverAssignment.findFirst({
+          where: {
+            tripIncidentId: incident.id,
+            status: 'ASSIGNED',
+          },
+        });
+
+      if (existingAssignment) {
+        throw new ConflictException({
+          errorCode: 'REPLACEMENT_ALREADY_ASSIGNED',
+          message:
+            'A replacement driver has already been assigned to this breakdown incident.',
+        });
+      }
+
       // 6. Record replacement driver assignment
       await tx.replacementDriverAssignment.create({
         data: {
@@ -3629,10 +3818,10 @@ export class TripsService {
         return abortResult;
       }
 
-      if (!['INTERRUPTED', 'IN_PROGRESS'].includes(trip.status)) {
+      if (trip.status !== 'INTERRUPTED') {
         throw new BadRequestException({
           errorCode: 'CANNOT_ABORT_TRIP',
-          message: `Cannot abort trip in status '${trip.status}'. Trip must be 'INTERRUPTED' or 'IN_PROGRESS'.`,
+          message: `Cannot abort trip in status '${trip.status}'. Trip must be 'INTERRUPTED'.`,
         });
       }
 
